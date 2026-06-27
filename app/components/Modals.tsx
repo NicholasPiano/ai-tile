@@ -6,7 +6,7 @@ import { ART_STYLE_GROUPS } from '@/app/lib/artStyles'
 import { buildExtendPrompt } from '@/app/lib/extendPrompt'
 import { buildTileChunkInfo, buildTileInput, ExtensionTileSpec } from '@/app/utils/imageProcessor'
 import { MODELS, maskKey } from '@/app/lib/models'
-import { Direction } from '@/app/lib/app'
+import { Direction, ReferenceImage } from '@/app/lib/app'
 
 export function SettingsDrawer({
   open,
@@ -1135,7 +1135,10 @@ export interface TileExtensionModalProps {
   isGenerating: boolean
   /** Band canvas needed to build the tile input image preview. */
   bandCanvas: HTMLCanvasElement | null
+  /** User-supplied reference images for this tile. */
+  tileReferenceImages: ReferenceImage[]
   onSetTilePrompt: (v: string) => void
+  onSetTileReferenceImages: (v: ReferenceImage[]) => void
   onGenerate: () => void
   onAccept: () => void
   onClose: () => void
@@ -1156,13 +1159,17 @@ export function TileExtensionModal({
   isNextPending,
   isGenerating,
   bandCanvas,
+  tileReferenceImages,
   onSetTilePrompt,
+  onSetTileReferenceImages,
   onGenerate,
   onAccept,
   onClose,
 }: TileExtensionModalProps) {
   const [inputImageUrl, setInputImageUrl] = useState<string | null>(null)
   const [resultDimensions, setResultDimensions] = useState<{ width: number; height: number } | null>(null)
+  /** Tracks which row's hidden file input should be programmatically triggered. */
+  const refImageFileInputRefs = useRef<(HTMLInputElement | null)[]>([])
 
   // Recompute the tile input image whenever the modal opens or the band canvas
   // changes (e.g. after a prior tile is accepted and composited in).
@@ -1307,6 +1314,152 @@ export function TileExtensionModal({
                   opacity: isGenerating ? 0.6 : 1,
                 }}
               />
+            </div>
+
+            {/* Reference images */}
+            <div>
+              <p
+                className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                Reference Images
+              </p>
+
+              {/* Existing rows */}
+              {tileReferenceImages.length > 0 && (
+                <div className="flex flex-col gap-2 mb-2">
+                  {tileReferenceImages.map((ref, rowIdx) => (
+                    <div key={rowIdx} className="flex items-center gap-2">
+                      {/* Hidden file input for this row */}
+                      <input
+                        ref={(el) => { refImageFileInputRefs.current[rowIdx] = el }}
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0]
+                          if (!file) return
+                          const reader = new FileReader()
+                          reader.onload = (ev) => {
+                            const dataUrl = ev.target?.result
+                            if (typeof dataUrl !== 'string') return
+                            const next = tileReferenceImages.map((r, i) =>
+                              i === rowIdx ? { ...r, dataUrl } : r
+                            )
+                            onSetTileReferenceImages(next)
+                          }
+                          reader.readAsDataURL(file)
+                          // Reset input so the same file can be re-selected.
+                          e.target.value = ''
+                        }}
+                      />
+
+                      {/* Square thumbnail / drop zone */}
+                      <div
+                        className="shrink-0 relative overflow-hidden rounded-[var(--radius-sm)] cursor-pointer"
+                        style={{
+                          width: 64,
+                          height: 64,
+                          border: ref.dataUrl
+                            ? '1px solid var(--border-strong)'
+                            : '1.5px dashed var(--border)',
+                          background: 'var(--surface)',
+                          opacity: isGenerating ? 0.6 : 1,
+                        }}
+                        onClick={() => {
+                          if (!isGenerating) refImageFileInputRefs.current[rowIdx]?.click()
+                        }}
+                        onDragOver={(e) => e.preventDefault()}
+                        onDrop={(e) => {
+                          if (isGenerating) return
+                          e.preventDefault()
+                          const file = e.dataTransfer.files[0]
+                          if (!file || !file.type.startsWith('image/')) return
+                          const reader = new FileReader()
+                          reader.onload = (ev) => {
+                            const dataUrl = ev.target?.result
+                            if (typeof dataUrl !== 'string') return
+                            const next = tileReferenceImages.map((r, i) =>
+                              i === rowIdx ? { ...r, dataUrl } : r
+                            )
+                            onSetTileReferenceImages(next)
+                          }
+                          reader.readAsDataURL(file)
+                        }}
+                        title={ref.dataUrl ? 'Click to replace image' : 'Click or drop an image'}
+                      >
+                        {ref.dataUrl ? (
+                          <img
+                            src={ref.dataUrl}
+                            alt={`Reference ${rowIdx + 1}`}
+                            className="w-full h-full object-cover block"
+                            draggable={false}
+                          />
+                        ) : (
+                          <div
+                            className="absolute inset-0 flex items-center justify-center"
+                            style={{ color: 'var(--text-muted)' }}
+                          >
+                            <Icons.Image size={20} />
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Description field */}
+                      <input
+                        type="text"
+                        value={ref.description}
+                        placeholder="Describe this reference (optional)"
+                        disabled={isGenerating}
+                        className="flex-1 rounded-[var(--radius-sm)] px-3 py-2 text-[12px]"
+                        style={{
+                          background: 'var(--surface)',
+                          border: '1px solid var(--border)',
+                          color: 'var(--text)',
+                          outline: 'none',
+                          opacity: isGenerating ? 0.6 : 1,
+                        }}
+                        onChange={(e) => {
+                          const next = tileReferenceImages.map((r, i) =>
+                            i === rowIdx ? { ...r, description: e.target.value } : r
+                          )
+                          onSetTileReferenceImages(next)
+                        }}
+                      />
+
+                      {/* Remove row */}
+                      <button
+                        onClick={() => {
+                          onSetTileReferenceImages(
+                            tileReferenceImages.filter((_, i) => i !== rowIdx)
+                          )
+                        }}
+                        disabled={isGenerating}
+                        className="icon-btn shrink-0"
+                        aria-label="Remove reference image"
+                        title="Remove"
+                      >
+                        <Icons.X size={13} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Add button */}
+              <button
+                onClick={() => {
+                  onSetTileReferenceImages([
+                    ...tileReferenceImages,
+                    { dataUrl: '', description: '' },
+                  ])
+                }}
+                disabled={isGenerating}
+                className="w-full btn btn-ghost text-[12px]"
+                style={{ opacity: isGenerating ? 0.6 : 1 }}
+              >
+                + Add reference image
+              </button>
             </div>
 
             {/* Assembled prompt — collapsible */}

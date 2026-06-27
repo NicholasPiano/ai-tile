@@ -36,6 +36,12 @@ export interface BuildExtendPromptParams {
   layerRole?: string | null
   sceneBrief?: string | null
   attempt?: number
+  /**
+   * Descriptions for user-supplied reference images. When provided, the
+   * prompt labels them so the model understands their role relative to the
+   * tile strip (which is always IMAGE 1).
+   */
+  referenceImages?: { description: string }[]
 }
 
 // ── Art style labels ─────────────────────────────────────────────────────────
@@ -103,6 +109,7 @@ export function buildExtendPrompt(params: BuildExtendPromptParams): string {
     layerRole,
     sceneBrief,
     attempt = 0,
+    referenceImages,
   } = params
 
   const directionDescriptions: Record<string, string> = {
@@ -244,6 +251,19 @@ KEY INSTRUCTIONS:
 
   if (typeof sceneBrief === 'string' && sceneBrief.trim()) {
     prompt += `\n\nSHARED SCENE DIRECTION — maintain this art direction exactly in the new area (palette, lighting, mood, style). Do not drift from it:\n${sceneBrief.trim()}`
+  }
+
+  // Reference images block — only emitted when the caller has attached extra images.
+  // IMAGE 1 is always the tile strip; reference images follow it in order.
+  if (referenceImages && referenceImages.length > 0) {
+    const refLines = referenceImages.map((ref, i) => {
+      const label = `IMAGE ${i + 2}`
+      const note = ref.description.trim()
+        ? ref.description.trim()
+        : 'general style or scene reference'
+      return `- ${label}: ${note}`
+    })
+    prompt += `\n\nREFERENCE IMAGES: In addition to IMAGE 1 (the tile strip above), you have been provided ${referenceImages.length} extra context image${referenceImages.length === 1 ? '' : 's'}:\n${refLines.join('\n')}\nUse these only as visual context or style guidance when filling the blank area. Do not reproduce them literally or copy their exact composition into the extension.`
   }
 
   prompt += `\n\nFINAL OUTPUT: Return the complete image with the blank area filled. The result must look like a single, unified ${artStyle && ART_STYLE_DESCRIPTIONS[artStyle] ? 'artistic work' : 'scene'} with absolutely no visible seams. The boundary should be completely invisible.`

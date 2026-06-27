@@ -11,7 +11,7 @@ import { TileStudio } from '@/app/components/TileStudio'
 import { TopBar } from '@/app/components/TopBar'
 import { ResultActions, VariantSelector } from '@/app/components/VariantSelector'
 import { Workspace, TilingState, TileCellDisplay } from '@/app/components/Workspace'
-import { Candidate, Direction, EXTENSION_PERCENT, MAX_AI_DIMENSION, MAX_TILES_PER_EXTEND, Mode, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, TILE_OVERLAP_PX } from '@/app/lib/app'
+import { Candidate, Direction, EXTENSION_PERCENT, MAX_AI_DIMENSION, MAX_TILES_PER_EXTEND, Mode, ReferenceImage, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, TILE_OVERLAP_PX } from '@/app/lib/app'
 import { findStyleLabel } from '@/app/lib/artStyles'
 import { DEFAULT_MODEL, MODELS, getModelConfig, skipsArtDirectorReview } from '@/app/lib/models'
 import { LAYER_ORDER, LAYER_ROLES, LayerRole, PARALLAX_MAX_AUTO_STEPS, ParallaxLayer, WORKFLOW_ORDER, createDefaultLayers, getRecommendedLayerIndex, getWorkflowPrerequisite } from '@/app/lib/parallax'
@@ -93,6 +93,8 @@ export default function Home() {
     tilePreviews: (string | null)[]
     /** Per non-skipped tile: whether the user has accepted the generated result. */
     tileAccepted: boolean[]
+    /** Per non-skipped tile: user-supplied reference images (may be empty array). */
+    tileReferenceImages: ReferenceImage[][]
     /** Non-skipped index of the tile currently being generated, or null. */
     generatingTileIdx: number | null
   }
@@ -857,6 +859,9 @@ export default function Home() {
       const latestPrompt = pendingTiledPlanRef.current?.tilePrompts[nsIdx] ?? ''
       const effectivePrompt = latestPrompt.trim() || customPrompt.trim() || undefined
       const tileInput = buildTileInput(canvas, tileSpec)
+      const latestRefs = pendingTiledPlanRef.current?.tileReferenceImages[nsIdx] ?? []
+      // Only include rows that have an actual image attached.
+      const populatedRefs = latestRefs.filter((r) => r.dataUrl.length > 0)
       const response = await fetch('/api/extend', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -872,6 +877,7 @@ export default function Home() {
           sceneBrief:
             mode === 'parallax' && sceneBrief.trim() ? sceneBrief.trim() : undefined,
           chunkInfo,
+          referenceImages: populatedRefs.length > 0 ? populatedRefs : undefined,
         }),
       })
       const data = await response.json() as { imageUrl?: string; error?: string }
@@ -1104,6 +1110,7 @@ export default function Home() {
       tilePrompts: new Array<string>(nonSkippedCount).fill(''),
       tilePreviews: new Array<string | null>(nonSkippedCount).fill(null),
       tileAccepted: new Array<boolean>(nonSkippedCount).fill(false),
+      tileReferenceImages: Array.from({ length: nonSkippedCount }, () => [] as ReferenceImage[]),
       generatingTileIdx: null,
     }
 
@@ -4333,12 +4340,21 @@ export default function Home() {
             isNextPending={getNextPendingTileIdx(plan.tileAccepted) === nsIdx}
             isGenerating={plan.generatingTileIdx === nsIdx}
             bandCanvas={bandCanvasRef.current}
+            tileReferenceImages={plan.tileReferenceImages[nsIdx] ?? []}
             onSetTilePrompt={(v) =>
               setPendingTiledPlan((prev) => {
                 if (!prev) return null
                 const next = [...prev.tilePrompts]
                 next[nsIdx] = v
                 return { ...prev, tilePrompts: next }
+              })
+            }
+            onSetTileReferenceImages={(v) =>
+              setPendingTiledPlan((prev) => {
+                if (!prev) return null
+                const next = [...prev.tileReferenceImages]
+                next[nsIdx] = v
+                return { ...prev, tileReferenceImages: next }
               })
             }
             onGenerate={() => void generateTile(nsIdx)}

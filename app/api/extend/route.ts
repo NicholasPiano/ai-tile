@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { buildExtendPrompt } from '@/app/lib/extendPrompt'
+import { ReferenceImage } from '@/app/lib/app'
 
 // Default model when the client doesn't specify one.
 const DEFAULT_MODEL = 'google/gemini-3.1-flash-image-preview'
@@ -81,7 +82,23 @@ export async function POST(request: NextRequest) {
       model,
       layerRole,
       sceneBrief,
-    } = await request.json()
+      referenceImages,
+    } = await request.json() as {
+      expandedCanvas: string
+      direction: string
+      extensionAmount: number
+      customPrompt?: string
+      artStyle?: string
+      chunkInfo?: unknown
+      useFullContext?: boolean
+      extensionInfo?: unknown
+      attempt?: number
+      apiKey?: string
+      model?: string
+      layerRole?: string
+      sceneBrief?: string
+      referenceImages?: ReferenceImage[]
+    }
 
     if (!expandedCanvas || !direction || !extensionAmount) {
       return NextResponse.json(
@@ -115,6 +132,7 @@ export async function POST(request: NextRequest) {
       layerRole: layerRole ?? null,
       sceneBrief: sceneBrief ?? null,
       attempt,
+      referenceImages: referenceImages?.map((r) => ({ description: r.description })),
     })
 
     const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -131,7 +149,13 @@ export async function POST(request: NextRequest) {
           {
             role: 'user',
             content: [
+              // IMAGE 1 — the tile strip to extend (always first).
               { type: 'image_url', image_url: { url: expandedCanvas } },
+              // IMAGE 2, 3, … — optional user-supplied reference images.
+              ...(referenceImages ?? []).map((ref) => ({
+                type: 'image_url',
+                image_url: { url: ref.dataUrl },
+              })),
               { type: 'text', text: prompt },
             ],
           },

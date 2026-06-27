@@ -75,6 +75,19 @@ export const STORAGE_MODEL = 'extender:model'
 
 export type Mode = 'extender' | 'parallax' | 'tile' | 'sprite' | 'props'
 
+/**
+ * A single user-supplied reference image attached to a tile extension call.
+ * The data URL is sent as an additional image_url part in the model request;
+ * the description is relayed in the prompt so the model understands the image's
+ * intended role.
+ */
+export type ReferenceImage = {
+  /** Base-64 data URL of the image (data:image/…;base64,…). */
+  dataUrl: string
+  /** Optional human-readable note about what the image represents. */
+  description: string
+}
+
 export const STORAGE_MODE = 'extender:mode'
 
 /**
