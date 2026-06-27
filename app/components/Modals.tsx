@@ -1162,6 +1162,7 @@ export function TileExtensionModal({
   onClose,
 }: TileExtensionModalProps) {
   const [inputImageUrl, setInputImageUrl] = useState<string | null>(null)
+  const [resultDimensions, setResultDimensions] = useState<{ width: number; height: number } | null>(null)
 
   // Recompute the tile input image whenever the modal opens or the band canvas
   // changes (e.g. after a prior tile is accepted and composited in).
@@ -1176,6 +1177,18 @@ export function TileExtensionModal({
       setInputImageUrl(null)
     }
   }, [open, bandCanvas, tileSpec])
+
+  // Read result image dimensions when the preview changes.
+  useEffect(() => {
+    if (!preview) {
+      setResultDimensions(null)
+      return
+    }
+    const img = new Image()
+    img.onload = () => setResultDimensions({ width: img.naturalWidth, height: img.naturalHeight })
+    img.onerror = () => setResultDimensions(null)
+    img.src = preview
+  }, [preview])
 
   // Close on Escape when not generating.
   useEffect(() => {
@@ -1348,6 +1361,12 @@ export function TileExtensionModal({
                     </div>
                   )}
                 </div>
+                <p
+                  className="mt-1.5 font-mono text-[11px] text-center"
+                  style={{ color: 'var(--text-muted)' }}
+                >
+                  {tileSpec.tileWidth} × {tileSpec.tileHeight}
+                </p>
               </div>
 
               {/* Result image */}
@@ -1394,6 +1413,16 @@ export function TileExtensionModal({
                     </div>
                   )}
                 </div>
+                <p
+                  className="mt-1.5 font-mono text-[11px] text-center"
+                  style={{ color: 'var(--text-muted)' }}
+                >
+                  {resultDimensions
+                    ? `${resultDimensions.width} × ${resultDimensions.height}`
+                    : hasPreview
+                    ? '…'
+                    : '—'}
+                </p>
               </div>
             </div>
 

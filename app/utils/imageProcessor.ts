@@ -1418,8 +1418,6 @@ export interface PlanExtensionTilesParams {
   imageWidth: number
   imageHeight: number
   extensionPercent: number
-  /** Context overlap as % of the image dimension — must match createChunkedExtension. */
-  overlapPercent: number
   maxDimension: number
   tileOverlapPx: number
   maxTiles: number
@@ -1470,9 +1468,9 @@ function planTilingAxis(
 /**
  * Split one band axis with the context strip anchored at coordinate 0.
  *
- * The first extension-adjacent column starts at `contextSize − overlapPx` so
- * its seam-facing edge sits entirely inside the original context strip.
- * Remaining columns continue with standard overlap strides.
+ * The first tile always starts at position 0 (the context-strip origin).
+ * Subsequent tiles stride forward using standard overlap so they never
+ * duplicate a previous tile's position.
  */
 function planContextAtStartAxis(
   bandDim: number,
@@ -1493,12 +1491,15 @@ function planContextAtStartAxis(
     return { count: 1, sizes, positions }
   }
 
-  let nextPos = Math.max(0, contextSize - overlapPx)
+  // Seed nextPos toward the context/extension boundary, but never
+  // place the next tile before the minimum stride from tile 0 — that
+  // would produce two tiles at the same (or overlapping) position when
+  // contextSize ≤ overlapPx.
+  let nextPos = Math.max(sizes[0] - overlapPx, contextSize - overlapPx)
 
   while (coveredEnd < bandDim) {
-    if (positions.length > 1) {
-      nextPos = Math.max(nextPos, coveredEnd - overlapPx)
-    }
+    // Always advance past the last placed tile.
+    nextPos = Math.max(nextPos, coveredEnd - overlapPx)
 
     if (nextPos + maxDimension >= bandDim) {
       const finalWidth = bandDim - nextPos
@@ -1534,6 +1535,22 @@ function mirrorAxisPlan(plan: TilingAxisPlan, bandDim: number): TilingAxisPlan {
 }
 
 /**
+ * Compute the context-strip size for one axis so that the first tile is as
+ * wide as `maxDimension` allows.
+ *
+ * The first tile always starts at band position 0.  To fill it to the
+ * maximum, the context strip should occupy `maxDimension − extensionSize`
+ * pixels.  We cap it at the actual image dimension (can't copy more than the
+ * full image) and use a floor of 25 % of `maxDimension` for very-wide images
+ * where the extension alone nearly reaches the cap.
+ */
+function maxContextSize(imageDimension: number, extensionSize: number, maxDimension: number): number {
+  const ideal = maxDimension - extensionSize
+  const floor = Math.round(maxDimension * 0.25)
+  return Math.min(imageDimension, Math.max(floor, ideal))
+}
+
+/**
  * Plan a tiled full-resolution extension.
  *
  * Splits the extension band into an overlapping grid of tiles ≤ maxDimension².
@@ -1549,16 +1566,19 @@ function mirrorAxisPlan(plan: TilingAxisPlan, bandDim: number): TilingAxisPlan {
  * Because the running band canvas is seeded with the original context strip
  * before the first tile is generated, every tile after the first in each scan
  * axis sees real painted content on its already-processed edges.
+ *
+ * The context-strip size is chosen to pack the first tile to `maxDimension`
+ * (i.e. contextSize = min(imageDimension, maxDimension − extensionSize)), so
+ * the AI always sees the richest possible slice of the original image.
  */
 export function planExtensionTiles(params: PlanExtensionTilesParams): TiledExtensionPlan {
   const {
     direction, imageWidth, imageHeight,
-    extensionPercent, overlapPercent,
+    extensionPercent,
     maxDimension, tileOverlapPx, maxTiles,
   } = params
 
   const extAmt = extensionPercent / 100
-  const ovlAmt = overlapPercent / 100
 
   let bandWidth: number
   let bandHeight: number
@@ -1566,13 +1586,13 @@ export function planExtensionTiles(params: PlanExtensionTilesParams): TiledExten
   let extensionSize: number
 
   if (direction === 'down' || direction === 'up') {
-    contextSize  = Math.round(imageHeight * ovlAmt)
     extensionSize = Math.round(imageHeight * extAmt)
+    contextSize   = maxContextSize(imageHeight, extensionSize, maxDimension)
     bandWidth    = imageWidth
     bandHeight   = contextSize + extensionSize
   } else {
-    contextSize  = Math.round(imageWidth * ovlAmt)
     extensionSize = Math.round(imageWidth * extAmt)
+    contextSize   = maxContextSize(imageWidth, extensionSize, maxDimension)
     bandWidth    = contextSize + extensionSize
     bandHeight   = imageHeight
   }
