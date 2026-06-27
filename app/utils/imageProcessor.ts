@@ -1384,7 +1384,7 @@ export interface ExtensionTileSpec {
   /** Top-left of this tile in band-canvas coordinates. */
   bandX: number
   bandY: number
-  /** Actual pixel size of this tile (last tile in a row/col may be narrower). */
+  /** Actual pixel size of this tile (±1 px when the band does not divide evenly). */
   tileWidth: number
   tileHeight: number
   /**
@@ -1425,11 +1425,122 @@ export interface PlanExtensionTilesParams {
   maxTiles: number
 }
 
+/** Sizes and start positions for one axis of the extension-band tile grid. */
+interface TilingAxisPlan {
+  count: number
+  sizes: number[]
+  positions: number[]
+}
+
+/**
+ * Split one band axis into overlapping tiles of nearly equal size.
+ *
+ * Picks the minimum tile count so each tile stays ≤ maxDimension, then
+ * distributes length so `count` tiles with `(count − 1)` fixed overlaps
+ * exactly cover `bandDim`.
+ */
+function planTilingAxis(
+  bandDim: number,
+  maxDimension: number,
+  overlapPx: number,
+): TilingAxisPlan {
+  if (bandDim <= maxDimension) {
+    return { count: 1, sizes: [bandDim], positions: [0] }
+  }
+
+  const maxStride = Math.max(1, maxDimension - overlapPx)
+  const count = Math.max(1, Math.ceil((bandDim - overlapPx) / maxStride))
+  const totalSize = bandDim + (count - 1) * overlapPx
+  const baseSize = Math.floor(totalSize / count)
+  const extraTiles = totalSize % count
+
+  const sizes: number[] = []
+  for (let i = 0; i < count; i++) {
+    sizes.push(baseSize + (i < extraTiles ? 1 : 0))
+  }
+
+  const positions: number[] = [0]
+  for (let i = 1; i < count; i++) {
+    positions.push(positions[i - 1] + sizes[i - 1] - overlapPx)
+  }
+
+  return { count, sizes, positions }
+}
+
+/**
+ * Split one band axis with the context strip anchored at coordinate 0.
+ *
+ * The first extension-adjacent column starts at `contextSize − overlapPx` so
+ * its seam-facing edge sits entirely inside the original context strip.
+ * Remaining columns continue with standard overlap strides.
+ */
+function planContextAtStartAxis(
+  bandDim: number,
+  contextSize: number,
+  maxDimension: number,
+  overlapPx: number,
+): TilingAxisPlan {
+  if (bandDim <= maxDimension) {
+    return { count: 1, sizes: [bandDim], positions: [0] }
+  }
+
+  const positions: number[] = [0]
+  const sizes: number[] = [Math.min(maxDimension, bandDim)]
+  let coveredEnd = sizes[0]
+
+  if (coveredEnd >= bandDim) {
+    sizes[0] = bandDim
+    return { count: 1, sizes, positions }
+  }
+
+  let nextPos = Math.max(0, contextSize - overlapPx)
+
+  while (coveredEnd < bandDim) {
+    if (positions.length > 1) {
+      nextPos = Math.max(nextPos, coveredEnd - overlapPx)
+    }
+
+    if (nextPos + maxDimension >= bandDim) {
+      const finalWidth = bandDim - nextPos
+      if (finalWidth <= 0) {
+        break
+      }
+      positions.push(nextPos)
+      sizes.push(finalWidth)
+      break
+    }
+
+    positions.push(nextPos)
+    sizes.push(maxDimension)
+    coveredEnd = nextPos + maxDimension
+    nextPos = coveredEnd - overlapPx
+  }
+
+  return { count: sizes.length, sizes, positions }
+}
+
+/** Mirror a tile grid so a context-at-start plan becomes context-at-end. */
+function mirrorAxisPlan(plan: TilingAxisPlan, bandDim: number): TilingAxisPlan {
+  const mirrored = plan.positions.map((pos, i) => ({
+    pos: bandDim - pos - plan.sizes[i],
+    size: plan.sizes[i],
+  }))
+  mirrored.sort((a, b) => a.pos - b.pos)
+  return {
+    count: mirrored.length,
+    positions: mirrored.map((entry) => entry.pos),
+    sizes: mirrored.map((entry) => entry.size),
+  }
+}
+
 /**
  * Plan a tiled full-resolution extension.
  *
- * Splits the extension band into an overlapping grid of tiles ≤ maxDimension²
- * and returns them in context-to-extension scan order:
+ * Splits the extension band into an overlapping grid of tiles ≤ maxDimension².
+ * On the extension axis, columns/rows are aligned to the context boundary so
+ * the first extension tile's seam edge sits inside the original context strip.
+ * The cross axis uses equal-sized tiles. Returns tiles in context-to-extension
+ * scan order:
  *   down  → rows top-to-bottom,    cols left-to-right
  *   up    → rows bottom-to-top,    cols left-to-right
  *   right → cols left-to-right,    rows top-to-bottom
@@ -1466,13 +1577,23 @@ export function planExtensionTiles(params: PlanExtensionTilesParams): TiledExten
     bandHeight   = imageHeight
   }
 
-  const tileW   = Math.min(maxDimension, bandWidth)
-  const tileH   = Math.min(maxDimension, bandHeight)
-  const strideX = Math.max(1, tileW - tileOverlapPx)
-  const strideY = Math.max(1, tileH - tileOverlapPx)
+  const isHorizontalExt = direction === 'left' || direction === 'right'
+  const contextAtStartPlan = (bandDim: number): TilingAxisPlan =>
+    planContextAtStartAxis(bandDim, contextSize, maxDimension, tileOverlapPx)
 
-  const cols = tileW >= bandWidth  ? 1 : Math.ceil((bandWidth  - tileW) / strideX) + 1
-  const rows = tileH >= bandHeight ? 1 : Math.ceil((bandHeight - tileH) / strideY) + 1
+  const xPlan = isHorizontalExt
+    ? (direction === 'right'
+      ? contextAtStartPlan(bandWidth)
+      : mirrorAxisPlan(contextAtStartPlan(bandWidth), bandWidth))
+    : planTilingAxis(bandWidth, maxDimension, tileOverlapPx)
+
+  const yPlan = isHorizontalExt
+    ? planTilingAxis(bandHeight, maxDimension, tileOverlapPx)
+    : (direction === 'down'
+      ? contextAtStartPlan(bandHeight)
+      : mirrorAxisPlan(contextAtStartPlan(bandHeight), bandHeight))
+  const cols = xPlan.count
+  const rows = yPlan.count
 
   if (rows * cols > maxTiles) {
     throw new Error(
@@ -1494,10 +1615,10 @@ export function planExtensionTiles(params: PlanExtensionTilesParams): TiledExten
 
   for (const row of rowOrder) {
     for (const col of colOrder) {
-      const bandX        = col * strideX
-      const bandY        = row * strideY
-      const actualTileW  = Math.min(tileW, bandWidth  - bandX)
-      const actualTileH  = Math.min(tileH, bandHeight - bandY)
+      const bandX       = xPlan.positions[col]
+      const bandY       = yPlan.positions[row]
+      const actualTileW = xPlan.sizes[col]
+      const actualTileH = yPlan.sizes[row]
 
       // Compute the gray (blank) region within this tile in tile-local coords,
       // based on the initial band state from initBandCanvas().
@@ -1537,10 +1658,10 @@ export function planExtensionTiles(params: PlanExtensionTilesParams): TiledExten
         tileWidth: actualTileW, tileHeight: actualTileH,
         blankRegion,
         featherOverlap: {
-          top:    topPrev ? Math.max(0, tileH - strideY) : 0,
-          bottom: botPrev ? Math.max(0, tileH - strideY) : 0,
-          left:   lftPrev ? Math.max(0, tileW - strideX) : 0,
-          right:  rgtPrev ? Math.max(0, tileW - strideX) : 0,
+          top:    topPrev ? tileOverlapPx : 0,
+          bottom: botPrev ? tileOverlapPx : 0,
+          left:   lftPrev ? tileOverlapPx : 0,
+          right:  rgtPrev ? tileOverlapPx : 0,
         },
       })
 

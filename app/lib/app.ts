@@ -50,8 +50,19 @@ export const MAX_AI_DIMENSION = 1536
  * Each tile's input includes this many already-generated pixels from its
  * processed neighbors so the AI continues the scene coherently, and the
  * compositor feathers the join over this width.
+ *
+ * With context-aligned tiling, this also controls how many pixels of the
+ * original image the first extension tile sees — larger values give the model
+ * more real-image context at the context boundary.
  */
-export const TILE_OVERLAP_PX = 192
+export const TILE_OVERLAP_PX = 384
+
+/**
+ * Context strip as a percentage of the image dimension sent to the AI.
+ * This overlap is how much of the existing image each tile sees as context —
+ * higher values give the model more of the original scene to continue from.
+ */
+export const CONTEXT_OVERLAP_PERCENT = 50
 
 /**
  * Hard cap on the total number of API calls per tiled extension to guard

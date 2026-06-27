@@ -11,7 +11,7 @@ import { TileStudio } from '@/app/components/TileStudio'
 import { TopBar } from '@/app/components/TopBar'
 import { ResultActions, VariantSelector } from '@/app/components/VariantSelector'
 import { Workspace, TilingState, TileCellDisplay } from '@/app/components/Workspace'
-import { Candidate, Direction, EXTENSION_PERCENT, MAX_AI_DIMENSION, MAX_TILES_PER_EXTEND, Mode, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, TILE_OVERLAP_PX } from '@/app/lib/app'
+import { Candidate, CONTEXT_OVERLAP_PERCENT, Direction, EXTENSION_PERCENT, MAX_AI_DIMENSION, MAX_TILES_PER_EXTEND, Mode, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, TILE_OVERLAP_PX } from '@/app/lib/app'
 import { findStyleLabel } from '@/app/lib/artStyles'
 import { DEFAULT_MODEL, MODELS, getModelConfig, skipsArtDirectorReview } from '@/app/lib/models'
 import { LAYER_ORDER, LAYER_ROLES, LayerRole, PARALLAX_MAX_AUTO_STEPS, ParallaxLayer, WORKFLOW_ORDER, createDefaultLayers, getRecommendedLayerIndex, getWorkflowPrerequisite } from '@/app/lib/parallax'
@@ -1033,7 +1033,7 @@ export default function Home() {
       imageWidth: dims.width,
       imageHeight: dims.height,
       extensionPercent: EXTENSION_PERCENT,
-      overlapPercent: 40,
+      overlapPercent: CONTEXT_OVERLAP_PERCENT,
       maxDimension: MAX_AI_DIMENSION,
       tileOverlapPx: TILE_OVERLAP_PX,
       maxTiles: MAX_TILES_PER_EXTEND,
