@@ -203,6 +203,102 @@ export function getCanvasAlign(direction: 'up' | 'down' | 'left' | 'right'): Ima
   }
 }
 
+/**
+ * Scale an image down so its longest side is at most `maxDim` pixels,
+ * preserving aspect ratio. Returns a JPEG data URL (quality 0.85) so the
+ * payload stays small when used as a scene-overview reference attachment.
+ * If the image is already within the limit it is returned as-is (PNG).
+ */
+export function scaleImageToFit(imageDataUrl: string, maxDim: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.crossOrigin = 'anonymous'
+    img.onload = () => {
+      const { width, height } = img
+      if (width <= maxDim && height <= maxDim) {
+        resolve(imageDataUrl)
+        return
+      }
+      const scale = Math.min(maxDim / width, maxDim / height)
+      const targetWidth = Math.round(width * scale)
+      const targetHeight = Math.round(height * scale)
+      const canvas = document.createElement('canvas')
+      canvas.width = targetWidth
+      canvas.height = targetHeight
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        resolve(imageDataUrl)
+        return
+      }
+      ctx.drawImage(img, 0, 0, targetWidth, targetHeight)
+      resolve(canvas.toDataURL('image/jpeg', 0.85))
+    }
+    img.onerror = () => reject(new Error('Failed to load image for scaling'))
+    img.src = imageDataUrl
+  })
+}
+
+/** Fraction of the source image kept for the extension-adjacent edge overview. */
+const SCENE_OVERVIEW_EDGE_FRACTION = 0.35
+
+/**
+ * Build a small reference thumbnail from the extension-adjacent edge of the
+ * source image. Unlike a full-scene overview, this strip shows only what sits
+ * at the boundary being extended — enough for palette/mood context without
+ * giving the model a complete scene to copy wholesale into the tile output.
+ */
+export function buildSceneOverviewForExtension(
+  imageDataUrl: string,
+  direction: 'up' | 'down' | 'left' | 'right',
+  maxDim: number = 384,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.crossOrigin = 'anonymous'
+    img.onload = () => {
+      const { width, height } = img
+      let sx = 0
+      let sy = 0
+      let sw = width
+      let sh = height
+
+      switch (direction) {
+        case 'right':
+          sw = Math.max(1, Math.round(width * SCENE_OVERVIEW_EDGE_FRACTION))
+          sx = width - sw
+          break
+        case 'left':
+          sw = Math.max(1, Math.round(width * SCENE_OVERVIEW_EDGE_FRACTION))
+          break
+        case 'down':
+          sh = Math.max(1, Math.round(height * SCENE_OVERVIEW_EDGE_FRACTION))
+          sy = height - sh
+          break
+        case 'up':
+          sh = Math.max(1, Math.round(height * SCENE_OVERVIEW_EDGE_FRACTION))
+          break
+      }
+
+      const scale = Math.min(1, maxDim / Math.max(sw, sh))
+      const outW = Math.max(1, Math.round(sw * scale))
+      const outH = Math.max(1, Math.round(sh * scale))
+
+      const canvas = document.createElement('canvas')
+      canvas.width = outW
+      canvas.height = outH
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        resolve(imageDataUrl)
+        return
+      }
+      ctx.drawImage(img, sx, sy, sw, sh, 0, 0, outW, outH)
+      resolve(canvas.toDataURL('image/jpeg', 0.85))
+    }
+    img.onerror = () => reject(new Error('Failed to load image for scene overview'))
+    img.src = imageDataUrl
+  })
+}
+
 /** Resize image to exact dimensions with explicit alignment (cover + crop). */
 export function normalizeImageToSize(
   imageDataUrl: string,
@@ -1821,6 +1917,83 @@ export function buildTileInput(
   return tile.toDataURL('image/jpeg', 0.95)
 }
 
+/** Red used for future-tile regions on the planning map. */
+const PLANNING_MAP_FUTURE_COLOR = '#FF0000'
+
+/**
+ * Build a scaled-down planning map of the full extension band for phase 1.
+ *
+ * The map shows three visually distinct regions so the model understands the
+ * global composition context before filling the current tile:
+ *
+ *   - Real pixels (context strip + already-accepted tiles) — copied from the
+ *     running band canvas so the model sees an accurate current state.
+ *   - Current tile's blank region — EXTENSION_BLANK_COLOR (#B0B0B0), the grey
+ *     area the model must fill during phase 1.
+ *   - Future tiles' blank regions (not yet accepted) — PLANNING_MAP_FUTURE_COLOR
+ *     (#FF0000), explicitly marked as "do not fill, handled later".
+ *
+ * The entire band is scaled down to fit within `maxDim` pixels on the longest
+ * edge before adding the colour overlays, so the image stays small and fast.
+ */
+export function buildTilePlanningMap(
+  bandCanvas: HTMLCanvasElement,
+  allTileSpecs: ExtensionTileSpec[],
+  currentTileSpec: ExtensionTileSpec,
+  acceptedMask: boolean[],
+  maxDim = 512,
+): { mapDataUrl: string; mapWidth: number; mapHeight: number } {
+  const bw = bandCanvas.width
+  const bh = bandCanvas.height
+
+  // Scale factor to fit within maxDim on the longest edge.
+  const scale = Math.min(1, maxDim / Math.max(bw, bh))
+  const outW  = Math.max(1, Math.round(bw * scale))
+  const outH  = Math.max(1, Math.round(bh * scale))
+
+  const map = document.createElement('canvas')
+  map.width  = outW
+  map.height = outH
+  const ctx = map.getContext('2d')
+  if (!ctx) {
+    return { mapDataUrl: bandCanvas.toDataURL('image/jpeg', 0.85), mapWidth: bw, mapHeight: bh }
+  }
+
+  // Draw the full band (contains real pixels + grey blanks from un-accepted tiles).
+  ctx.drawImage(bandCanvas, 0, 0, bw, bh, 0, 0, outW, outH)
+
+  // Paint future tiles' blank regions red (do this before grey so the current
+  // tile overrides any overlap, though tile specs should not overlap).
+  ctx.fillStyle = PLANNING_MAP_FUTURE_COLOR
+  for (let i = 0; i < allTileSpecs.length; i++) {
+    const spec = allTileSpecs[i]
+    if (spec === currentTileSpec) continue
+    if (acceptedMask[i]) continue
+    // Paint the blank region for this unprocessed future tile.
+    const br = spec.blankRegion
+    if (br.width === 0 || br.height === 0) continue
+    // Convert from tile-local coords to band coords, then scale.
+    const bx = Math.round((spec.bandX + br.x) * scale)
+    const by = Math.round((spec.bandY + br.y) * scale)
+    const bw2 = Math.max(1, Math.round(br.width  * scale))
+    const bh2 = Math.max(1, Math.round(br.height * scale))
+    ctx.fillRect(bx, by, bw2, bh2)
+  }
+
+  // Paint the current tile's blank region grey (the fill target for phase 1).
+  ctx.fillStyle = EXTENSION_BLANK_COLOR
+  const cur = currentTileSpec.blankRegion
+  if (cur.width > 0 && cur.height > 0) {
+    const cx = Math.round((currentTileSpec.bandX + cur.x) * scale)
+    const cy = Math.round((currentTileSpec.bandY + cur.y) * scale)
+    const cw = Math.max(1, Math.round(cur.width  * scale))
+    const ch = Math.max(1, Math.round(cur.height * scale))
+    ctx.fillRect(cx, cy, cw, ch)
+  }
+
+  return { mapDataUrl: map.toDataURL('image/jpeg', 0.90), mapWidth: outW, mapHeight: outH }
+}
+
 /**
  * Build a per-pixel alpha mask for blending a tile into the running band.
  *
@@ -1877,11 +2050,18 @@ export async function compositeTileResult(
   bandCanvas: HTMLCanvasElement,
   tileResultDataUrl: string,
   tileSpec: ExtensionTileSpec,
+  direction: 'up' | 'down' | 'left' | 'right',
 ): Promise<void> {
   const { bandX, bandY, tileWidth, tileHeight, featherOverlap } = tileSpec
 
-  // Normalise AI output to exact tile dimensions (model may return slightly off)
-  const normalized = await normalizeImageToSize(tileResultDataUrl, tileWidth, tileHeight)
+  // Normalise AI output to exact tile dimensions (model may return slightly off).
+  // Anchor to the context edge so the preserved strip stays pixel-aligned.
+  const normalized = await normalizeImageToSize(
+    tileResultDataUrl,
+    tileWidth,
+    tileHeight,
+    getChunkAlign(direction),
+  )
   const tileImg    = await loadImageElement(normalized)
 
   const bandCtx = bandCanvas.getContext('2d')

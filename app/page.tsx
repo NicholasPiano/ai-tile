@@ -19,7 +19,7 @@ import { PROP_BATCH, PROP_BATCH_COLS, PROP_BATCH_H, PROP_BATCH_ROWS, PROP_BATCH_
 import { SPRITE_ANIMATIONS, SPRITE_FRAME_COUNT, SPRITE_FRAME_SIZE, SPRITE_GRID_COLS, SPRITE_GRID_ROWS, SPRITE_SHEET_H, SPRITE_SHEET_W, SPRITE_STRIP_H, SPRITE_STRIP_W, SpriteAnimType, SpriteFrame, SpriteSheet, createEmptySpriteSheet } from '@/app/lib/sprite'
 import { BODY_PLANS, BodyPlan, isAirborneAnim } from '@/app/lib/bodyPlans'
 import { CORNER_GRAFTS, ENABLE_CORNER_RECONCILE, TILESET_ATLAS_EXTRUDE_PX, TILESET_BY_ROLE, TILESET_COLS, TILESET_PADDED_SHEET_H, TILESET_PADDED_SHEET_W, TILESET_PADDED_STRIDE, TILESET_ROWS, TILESET_SHEET_H, TILESET_SHEET_W, TILESET_SLOTS, TILESET_TILE_SIZE, TILE_TEMPLATE_CELL, TILE_TEMPLATE_COLS, TILE_TEMPLATE_H, TILE_TEMPLATE_MASK, TILE_TEMPLATE_ROWS, TILE_TEMPLATE_SAMPLES, TILE_TEMPLATE_W, TileSetRole, TileSetSlot, alignAiOutputToTemplate, applyFeatheredRoleMask, buildTileSheetGuideDataUrl, createEmptyTileSet, rebuildCornerTile, reconcileAllCorners, templateRoleForCell } from '@/app/lib/tileset'
-import { alignSpriteFramesToBaseline, applyFullContextResult, buildTileChunkInfo, buildTileInput, centerSpriteFramesHorizontally, ChunkInfo, chromaKeyToAlpha, compositeTileResult, createChunkedExtension, createFullContextExtension, ExtensionTileSpec, getImageDimensions, harmonizeHorizontalSeams, initBandCanvas, isolatePrimarySpriteComponent, isAiExtensionUnfilled, isTileResultUnfilled, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, measureSeamResidual, normalizeSpriteFrameScale, planExtensionTiles, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk, TiledExtensionPlan } from '@/app/utils/imageProcessor'
+import { alignSpriteFramesToBaseline, applyFullContextResult, buildTileChunkInfo, buildTileInput, buildTilePlanningMap, centerSpriteFramesHorizontally, ChunkInfo, chromaKeyToAlpha, compositeTileResult, createChunkedExtension, createFullContextExtension, ExtensionTileSpec, getChunkAlign, getImageDimensions, harmonizeHorizontalSeams, initBandCanvas, isolatePrimarySpriteComponent, isAiExtensionUnfilled, isTileResultUnfilled, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, measureSeamResidual, normalizeImageToSize, normalizeSpriteFrameScale, planExtensionTiles, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk, TiledExtensionPlan } from '@/app/utils/imageProcessor'
 import { SubjectBounds, drawPoseGuideSheet, measureSubjectBounds } from '@/app/utils/poseRig'
 import JSZip from 'jszip'
 
@@ -91,6 +91,8 @@ export default function Home() {
     tilePrompts: string[]
     /** Per non-skipped tile: result data URL after API call, or null. */
     tilePreviews: (string | null)[]
+    /** Per non-skipped tile: phase-1 planning result data URL, or null. */
+    tilePlanningPreviews: (string | null)[]
     /** Per non-skipped tile: whether the user has accepted the generated result. */
     tileAccepted: boolean[]
     /** Per non-skipped tile: user-supplied reference images (may be empty array). */
@@ -830,6 +832,17 @@ export default function Home() {
    * Generate a single tile. Only the next unaccepted tile in scan order can be
    * generated; calling this for any other index is a no-op so the band UI can
    * safely call it on click without guards.
+   *
+   * For multi-tile extensions the generation is two-phase:
+   *   Phase 1 — planning map: the full band is scaled down with a grey area for
+   *     the current tile and red areas for future tiles. The model fills grey to
+   *     produce a low-res composition guide.
+   *   Phase 2 — refinement: the existing full-res tile strip is sent together
+   *     with the planning guide as IMAGE 2. The model fills the tile at full res.
+   * Single-tile extensions skip phase 1 (no red future tiles, no global context
+   * benefit) and proceed directly with the existing extend prompt.
+   * Alpha-keyed parallax layers also skip phase 1 to avoid colour confusion with
+   * the magenta key colour.
    */
   const generateTile = useCallback(async (nsIdx: number) => {
     const plan = pendingTiledPlanRef.current
@@ -851,33 +864,46 @@ export default function Home() {
     const { direction, nonSkippedCount, layerRole } = plan
     const chunkInfo = buildTileChunkInfo(tileSpec, direction, nsIdx, nonSkippedCount)
 
+    // Two-phase only makes sense when there are multiple tiles AND the layer is
+    // not magenta-keyed (coloured map + magenta would confuse the model).
+    const isKeyedLayer = !!layerRole && layerRole !== 'sky'
+    const useTwoPhase = nonSkippedCount > 1 && !isKeyedLayer
+
     setPendingTiledPlan((prev) =>
       prev ? { ...prev, generatingTileIdx: nsIdx } : null
     )
 
-    const callApi = async (): Promise<string> => {
-      const latestPrompt = pendingTiledPlanRef.current?.tilePrompts[nsIdx] ?? ''
-      const effectivePrompt = latestPrompt.trim() || customPrompt.trim() || undefined
-      const tileInput = buildTileInput(canvas, tileSpec)
-      const latestRefs = pendingTiledPlanRef.current?.tileReferenceImages[nsIdx] ?? []
-      // Only include rows that have an actual image attached.
-      const populatedRefs = latestRefs.filter((r) => r.dataUrl.length > 0)
+    const callApi = async (
+      expandedCanvas: string,
+      opts: {
+        phase?: 'plan' | 'refine'
+        planningResult?: string
+        planningTileIndex?: number
+        planningTileCount?: number
+        populatedRefs: Array<{ dataUrl: string; description: string }>
+        effectivePrompt: string | undefined
+      }
+    ): Promise<string> => {
       const response = await fetch('/api/extend', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          expandedCanvas: tileInput,
+          expandedCanvas,
           direction,
           extensionAmount: EXTENSION_PERCENT,
-          customPrompt: effectivePrompt,
+          customPrompt: opts.effectivePrompt,
           artStyle: artStyle !== 'none' ? artStyle : undefined,
           apiKey: apiKey || undefined,
           model: selectedModel,
           layerRole,
           sceneBrief:
             mode === 'parallax' && sceneBrief.trim() ? sceneBrief.trim() : undefined,
-          chunkInfo,
-          referenceImages: populatedRefs.length > 0 ? populatedRefs : undefined,
+          chunkInfo: opts.phase === 'plan' ? undefined : chunkInfo,
+          referenceImages: opts.populatedRefs.length > 0 ? opts.populatedRefs : undefined,
+          phase: opts.phase,
+          planningResult: opts.planningResult,
+          planningTileIndex: opts.planningTileIndex,
+          planningTileCount: opts.planningTileCount,
         }),
       })
       const data = await response.json() as { imageUrl?: string; error?: string }
@@ -890,13 +916,67 @@ export default function Home() {
     }
 
     try {
-      let raw = await callApi()
+      const latestPrompt = pendingTiledPlanRef.current?.tilePrompts[nsIdx] ?? ''
+      const effectivePrompt = latestPrompt.trim() || customPrompt.trim() || undefined
+      const latestRefs = pendingTiledPlanRef.current?.tileReferenceImages[nsIdx] ?? []
+      const populatedRefs = latestRefs.filter((r) => r.dataUrl.length > 0)
+
+      const tileAlign = getChunkAlign(direction)
+      const normaliseTileResult = (dataUrl: string) =>
+        normalizeImageToSize(dataUrl, tileSpec.tileWidth, tileSpec.tileHeight, tileAlign)
+
+      let planningGuide: string | undefined
+
+      if (useTwoPhase) {
+        // Phase 1 — planning map
+        const { mapDataUrl, mapWidth, mapHeight } = buildTilePlanningMap(
+          canvas,
+          plan.nonSkippedTileSpecs,
+          tileSpec,
+          plan.tileAccepted,
+        )
+
+        const rawPlan = await callApi(mapDataUrl, {
+          phase: 'plan',
+          populatedRefs,
+          effectivePrompt,
+          planningTileIndex: nsIdx,
+          planningTileCount: nonSkippedCount,
+        })
+
+        // Normalize to exact map dimensions before phase 2.
+        planningGuide = await normalizeImageToSize(rawPlan, mapWidth, mapHeight)
+
+        // Store for UI preview.
+        setPendingTiledPlan((prev) => {
+          if (!prev) return null
+          const next = [...prev.tilePlanningPreviews]
+          next[nsIdx] = planningGuide as string
+          return { ...prev, tilePlanningPreviews: next }
+        })
+      }
+
+      // Phase 2 (or single-phase) — full-res refinement
+      const tileInput = buildTileInput(canvas, tileSpec)
+      let raw = await normaliseTileResult(await callApi(tileInput, {
+        phase: 'refine',
+        planningResult: planningGuide,
+        populatedRefs,
+        effectivePrompt,
+      }))
+
       const unfilled = await isTileResultUnfilled(raw, tileSpec)
       if (unfilled) {
         // eslint-disable-next-line no-console
         console.warn(`⚠️ Tile ${nsIdx + 1} appears unfilled — retrying once`)
-        raw = await callApi()
+        raw = await normaliseTileResult(await callApi(tileInput, {
+          phase: 'refine',
+          planningResult: planningGuide,
+          populatedRefs,
+          effectivePrompt,
+        }))
       }
+
       setPendingTiledPlan((prev) => {
         if (!prev) return null
         const next = [...prev.tilePreviews]
@@ -940,7 +1020,7 @@ export default function Home() {
     if (!canvas) return
 
     try {
-      await compositeTileResult(canvas, preview, tileSpec)
+      await compositeTileResult(canvas, preview, tileSpec, plan.direction)
     } catch (err) {
       setError((err as Error).message || 'Failed to composite tile')
       return
@@ -1109,6 +1189,7 @@ export default function Home() {
       imageHeight: dims.height,
       tilePrompts: new Array<string>(nonSkippedCount).fill(''),
       tilePreviews: new Array<string | null>(nonSkippedCount).fill(null),
+      tilePlanningPreviews: new Array<string | null>(nonSkippedCount).fill(null),
       tileAccepted: new Array<boolean>(nonSkippedCount).fill(false),
       tileReferenceImages: Array.from({ length: nonSkippedCount }, () => [] as ReferenceImage[]),
       generatingTileIdx: null,
@@ -4337,6 +4418,7 @@ export default function Home() {
             sceneBrief={mode === 'parallax' ? sceneBrief : undefined}
             nonSkippedCount={plan.nonSkippedCount}
             preview={plan.tilePreviews[nsIdx] ?? null}
+            planningPreview={plan.tilePlanningPreviews[nsIdx] ?? null}
             isNextPending={getNextPendingTileIdx(plan.tileAccepted) === nsIdx}
             isGenerating={plan.generatingTileIdx === nsIdx}
             bandCanvas={bandCanvasRef.current}

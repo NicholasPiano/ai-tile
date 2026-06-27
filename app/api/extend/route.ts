@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { buildExtendPrompt } from '@/app/lib/extendPrompt'
+import { buildExtendPrompt, buildPlanningPrompt } from '@/app/lib/extendPrompt'
 import { ReferenceImage } from '@/app/lib/app'
 
 // Default model when the client doesn't specify one.
@@ -83,6 +83,11 @@ export async function POST(request: NextRequest) {
       layerRole,
       sceneBrief,
       referenceImages,
+      // Two-phase fields
+      phase,
+      planningTileIndex,
+      planningTileCount,
+      planningResult,
     } = await request.json() as {
       expandedCanvas: string
       direction: string
@@ -98,6 +103,14 @@ export async function POST(request: NextRequest) {
       layerRole?: string
       sceneBrief?: string
       referenceImages?: ReferenceImage[]
+      /** Phase 1 = planning map pass; phase 2 = refine pass (default). */
+      phase?: 'plan' | 'refine'
+      /** Tile index within the extension, needed by the planning prompt. */
+      planningTileIndex?: number
+      /** Total non-skipped tile count, needed by the planning prompt. */
+      planningTileCount?: number
+      /** Data URL of the phase-1 result, injected as IMAGE 2 in the refine pass. */
+      planningResult?: string
     }
 
     if (!expandedCanvas || !direction || !extensionAmount) {
@@ -121,19 +134,59 @@ export async function POST(request: NextRequest) {
     }
 
     const modelId = (typeof model === 'string' && model.trim()) ? model.trim() : DEFAULT_MODEL
+    const hasPlanningResult = typeof planningResult === 'string' && planningResult.length > 0
 
-    const prompt = buildExtendPrompt({
-      direction,
-      chunkInfo: chunkInfo ?? null,
-      useFullContext: !!useFullContext,
-      extensionInfo: extensionInfo ?? null,
-      customPrompt: customPrompt ?? null,
-      artStyle: artStyle ?? null,
-      layerRole: layerRole ?? null,
-      sceneBrief: sceneBrief ?? null,
-      attempt,
-      referenceImages: referenceImages?.map((r) => ({ description: r.description })),
-    })
+    // ── Build prompt ─────────────────────────────────────────────────────────
+    let prompt: string
+    if (phase === 'plan') {
+      // Phase 1: planning map — uses a dedicated minimal prompt.
+      prompt = buildPlanningPrompt({
+        direction: direction as 'up' | 'down' | 'left' | 'right',
+        tileIndex: planningTileIndex ?? 0,
+        tileCount: planningTileCount ?? 1,
+        customPrompt: customPrompt ?? null,
+        artStyle: artStyle ?? null,
+        sceneBrief: sceneBrief ?? null,
+        referenceImages: referenceImages?.map((r) => ({ description: r.description })),
+      })
+    } else {
+      // Phase 2 (default): full extend prompt, optionally with planning guide.
+      prompt = buildExtendPrompt({
+        direction: direction as 'up' | 'down' | 'left' | 'right',
+        chunkInfo: (chunkInfo as Parameters<typeof buildExtendPrompt>[0]['chunkInfo']) ?? null,
+        useFullContext: !!useFullContext,
+        extensionInfo: (extensionInfo as Parameters<typeof buildExtendPrompt>[0]['extensionInfo']) ?? null,
+        customPrompt: customPrompt ?? null,
+        artStyle: artStyle ?? null,
+        layerRole: layerRole ?? null,
+        sceneBrief: sceneBrief ?? null,
+        attempt,
+        referenceImages: referenceImages?.map((r) => ({ description: r.description })),
+        hasPlanningGuide: hasPlanningResult,
+      })
+    }
+
+    // ── Assemble message content ──────────────────────────────────────────────
+    type ImagePart = { type: 'image_url'; image_url: { url: string } }
+    type TextPart  = { type: 'text'; text: string }
+    type ContentPart = ImagePart | TextPart
+
+    const content: ContentPart[] = [
+      // IMAGE 1 — working canvas (tile strip or planning map).
+      { type: 'image_url', image_url: { url: expandedCanvas } },
+    ]
+
+    if (phase !== 'plan' && hasPlanningResult) {
+      // IMAGE 2 — phase-1 composition guide (refine pass only).
+      content.push({ type: 'image_url', image_url: { url: planningResult as string } })
+    }
+
+    // IMAGE 3+ (refine) or IMAGE 2+ (plan) — user-supplied reference images.
+    for (const ref of referenceImages ?? []) {
+      content.push({ type: 'image_url', image_url: { url: ref.dataUrl } })
+    }
+
+    content.push({ type: 'text', text: prompt })
 
     const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
@@ -145,21 +198,7 @@ export async function POST(request: NextRequest) {
       },
       body: JSON.stringify({
         model: modelId,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              // IMAGE 1 — the tile strip to extend (always first).
-              { type: 'image_url', image_url: { url: expandedCanvas } },
-              // IMAGE 2, 3, … — optional user-supplied reference images.
-              ...(referenceImages ?? []).map((ref) => ({
-                type: 'image_url',
-                image_url: { url: ref.dataUrl },
-              })),
-              { type: 'text', text: prompt },
-            ],
-          },
-        ],
+        messages: [{ role: 'user', content }],
         max_tokens: 2000,
         temperature: attempt === 0 ? 0.3 : attempt === 1 ? 0.5 : 0.7,
       }),

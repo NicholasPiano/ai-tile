@@ -242,6 +242,10 @@ function TilingBand({
                     top: `${imgTopFrac * 100}%`,
                     width: `${imgWidthFrac * 100}%`,
                     height: `${imgHeightFrac * 100}%`,
+                    // Override Tailwind preflight (max-width: 100%; height: auto) so
+                    // imgWidthFrac/imgHeightFrac can exceed 100% for extension clipping.
+                    maxWidth: 'none',
+                    objectFit: 'fill',
                     display: 'block',
                     pointerEvents: 'none',
                   }}

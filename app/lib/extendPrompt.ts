@@ -38,9 +38,29 @@ export interface BuildExtendPromptParams {
   attempt?: number
   /**
    * Descriptions for user-supplied reference images. When provided, the
-   * prompt labels them so the model understands their role relative to the
-   * tile strip (which is always IMAGE 1).
+   * prompt switches to multi-image mode and labels them so the model
+   * understands their role relative to the tile strip (IMAGE 1).
    */
+  referenceImages?: { description: string }[]
+  /**
+   * When set, a phase-1 planning result is attached as an extra image.  The
+   * prompt inserts a block that identifies this image and explains its role
+   * as a low-res composition guide — not a pixel source.
+   *
+   * The label index accounts for IMAGE 1 (tile strip) already being taken;
+   * the caller is responsible for injecting the planning result image at the
+   * correct position in the API message.
+   */
+  hasPlanningGuide?: boolean
+}
+
+export interface BuildPlanningPromptParams {
+  direction: 'up' | 'down' | 'left' | 'right'
+  tileIndex: number
+  tileCount: number
+  customPrompt?: string | null
+  artStyle?: string | null
+  sceneBrief?: string | null
   referenceImages?: { description: string }[]
 }
 
@@ -97,6 +117,11 @@ export const ART_STYLE_DESCRIPTIONS: Record<string, string> = {
  * This is the canonical source of truth for prompt text; the /api/extend
  * route and the client-side TileExtensionModal both call this function so
  * they always produce identical strings.
+ *
+ * Prompt mode matrix:
+ *   No refs, no custom prompt  →  single-image, pure continuation, "do NOT introduce new subjects"
+ *   No refs, custom prompt     →  single-image, SCENE CONTINUITY + USER DIRECTION, "do NOT introduce new subjects"
+ *   With user refs             →  multi-image preamble, IMAGE 1 is working canvas, refs guide new allowed content
  */
 export function buildExtendPrompt(params: BuildExtendPromptParams): string {
   const {
@@ -110,6 +135,7 @@ export function buildExtendPrompt(params: BuildExtendPromptParams): string {
     sceneBrief,
     attempt = 0,
     referenceImages,
+    hasPlanningGuide,
   } = params
 
   const directionDescriptions: Record<string, string> = {
@@ -123,17 +149,38 @@ export function buildExtendPrompt(params: BuildExtendPromptParams): string {
   const isFullContext = !!useFullContext
   const isChunked = !isFullContext && !!chunkInfo
 
+  // Multi-image mode activates when the user has supplied reference images OR
+  // a planning guide is present (both add extra images after the tile strip).
+  const hasRefs = !!(referenceImages && referenceImages.length > 0)
+  const hasExtras = hasRefs || !!hasPlanningGuide
+
+  // Planning guide is IMAGE 2 when present; user refs follow after it.
+  const refImageOffset = hasPlanningGuide ? 2 : 1
+
+  const multiImagePreamble = hasExtras
+    ? `MULTI-IMAGE REQUEST — IMAGE ROLES:
+- IMAGE 1: your WORKING CANVAS — the tile strip you must modify and return. This is the only image that determines your output dimensions and content.
+- IMAGE 2, 3, …: REFERENCE ONLY — style or content guides supplied by the user. Do NOT return them. Do NOT paste, resize, composite, or substitute them for your output.
+
+`
+    : ''
+
+  // Wording switches between single-image and multi-image requests.
+  const workingImage = hasExtras ? 'IMAGE 1' : 'this image'
+  const layoutLabel = hasExtras ? 'IMAGE 1' : 'THIS IMAGE'
+  const outputImage = hasExtras ? 'IMAGE 1 with the gray area filled' : 'the complete image with the blank area filled'
+
   let prompt: string
 
   if (isFullContext) {
-    prompt = `OUTPAINTING TASK: You are extending an image ${direction === 'left' || direction === 'right' ? 'HORIZONTALLY' : 'VERTICALLY'} on the ${dirDesc}.
+    prompt = `${multiImagePreamble}OUTPAINTING TASK: You are extending ${workingImage} ${direction === 'left' || direction === 'right' ? 'HORIZONTALLY' : 'VERTICALLY'} on the ${dirDesc}.
 
-The input is a single image. The ${dirDesc} portion of the canvas is filled with solid LIGHT GRAY (#B0B0B0). This gray area is the empty space you must fill with realistic scene content.
+${hasExtras ? 'IMAGE 1 has' : 'The input is a single image. The'} ${dirDesc} portion of the canvas is filled with solid LIGHT GRAY (#B0B0B0). This gray area is the empty space you must fill with realistic scene content.
 
 YOUR TASK:
-1. Generate a complete output image at the SAME pixel dimensions as the input.
+1. Generate a complete output image at the SAME pixel dimensions as ${workingImage}.
 2. Replace EVERY gray pixel with photorealistic content that continues the existing scene naturally.
-3. Keep the non-gray (already-painted) pixels exactly as they appear in the input.
+3. Keep the non-gray (already-painted) pixels exactly as they appear${hasExtras ? ' in IMAGE 1' : ' in the input'}.
 
 EXTENSION RULES:
 - The blank area is on the ${dirDesc} side (${direction === 'up' ? 'ABOVE' : direction === 'down' ? 'BELOW' : direction === 'left' ? 'LEFT OF' : 'RIGHT OF'} the existing content).
@@ -141,7 +188,7 @@ EXTENSION RULES:
 - Match exact color temperature, lighting direction, saturation, contrast, and art style of the existing pixels.
 - The seam between original and new content must be invisible — no color shift, brightness jump, or texture discontinuity.
 
-CRITICAL: If you return the image unchanged with the gray area still present, the task has failed. Every gray pixel MUST be replaced.`
+CRITICAL: If you return ${workingImage} unchanged with the gray area still present, the task has failed. Every gray pixel MUST be replaced.`
   } else if (isChunked && chunkInfo) {
     const isHorizDir = direction === 'left' || direction === 'right'
     const contextPx = isHorizDir ? chunkInfo.chunkWidth : chunkInfo.chunkHeight
@@ -159,21 +206,20 @@ CRITICAL: If you return the image unchanged with the gray area still present, th
       : direction === 'right' ? 'to the right (further right of the current view)'
       : 'to the left (further left of the current view)'
 
-    prompt = `You are an expert at seamlessly extending images. You have been given a ${isHorizDir ? 'vertical' : 'horizontal'} strip of an image to extend.
+    prompt = `${multiImagePreamble}You are an expert at seamlessly extending images. You have been given a ${isHorizDir ? 'vertical' : 'horizontal'} strip${hasExtras ? ' (IMAGE 1)' : ''} of an image to extend.
 
-PIXEL LAYOUT OF THIS IMAGE:
+PIXEL LAYOUT OF ${layoutLabel}:
 - ${contextSide.toUpperCase()} ${contextPx}px → EXISTING scene content. You must preserve these pixels EXACTLY unchanged.
 - ${dirDesc.toUpperCase()} ${extPx}px → Solid light gray (#B0B0B0). This is the ONLY area you must fill.
 
 YOUR TASK:
 1. Replace every gray pixel in the ${dirDesc} ${extPx}px area with new scene content.
-2. The new content must show what would appear ${movingDir} — it is NEW territory beyond the current frame, NOT a copy or repetition of what is already visible.
-3. Do NOT repeat, mirror, or duplicate any element visible in the existing ${contextPx}px area.
-4. Match the perspective, lighting, color palette, and art style of the existing content exactly.
-5. Make the transition between existing and new content completely invisible — no seam, color shift, or brightness jump.
-6. Keep every pixel in the existing ${contextPx}px area pixel-perfect and unchanged.`
+2. The new content must show what would appear ${movingDir} — it is NEW territory beyond the current frame.
+3. Match the perspective, lighting, color palette, and art style of the existing content exactly.
+4. Make the transition between existing and new content completely invisible — no seam, color shift, or brightness jump.
+5. Keep every pixel in the existing ${contextPx}px area pixel-perfect and unchanged.`
   } else {
-    prompt = `You are an expert at seamlessly extending images. This image has a light gray blank area on the ${dirDesc} that needs to be filled naturally.
+    prompt = `${multiImagePreamble}You are an expert at seamlessly extending images. ${hasExtras ? 'IMAGE 1 has' : 'This image has'} a light gray blank area on the ${dirDesc} that needs to be filled naturally.
 
 KEY INSTRUCTIONS:
 1. Analyze the existing content carefully - note colors, patterns, textures, lighting
@@ -192,35 +238,41 @@ KEY INSTRUCTIONS:
     prompt += `\n   - The style should blend naturally with the existing content at the boundary`
   }
 
-  // Custom prompt or natural continuation
+  // Continuity constraints are always present, anchoring the extension to the
+  // strip regardless of whether the user added a custom prompt.
+  const continuityNumber = artStyle ? '8' : '6'
+  prompt += `\n\n${continuityNumber}. SCENE CONTINUITY (always required):`
+  prompt += `\n   - Stay strictly within the genre, setting, environment, and subject matter of the existing image`
+  // When user reference images are present the model is expected to draw from
+  // them for new subjects; suppress the "no new subjects" rule in that case.
+  if (!hasRefs) {
+    prompt += `\n   - Do NOT introduce new subjects, objects, creatures, or thematic elements that are not already implied by the scene`
+  }
+  prompt += `\n   - Continue the existing physics consistently: same lighting direction, same time of day, same weather, same atmosphere, same scale, same perspective`
+  prompt += `\n   - Avoid mechanical repetition — small natural variation in textures and shapes is good (e.g., slightly different cloud forms, organic terrain undulation, varied foliage)`
+  prompt += `\n   - The new area should look like more of the same environment a real camera would capture if panned/tilted in that direction — nothing more, nothing less`
+  prompt += `\n   - Match exact color, brightness, contrast, and saturation at the boundary`
+
+  // Custom prompt is an additional directive, not a replacement for continuity.
   if (customPrompt) {
-    const instructionNumber = artStyle ? '7' : '6'
-    prompt += `\n\n${instructionNumber}. USER'S SPECIFIC REQUEST FOR THE NEW EXTENDED AREA: "${customPrompt}"`
+    const requestNumber = artStyle ? '9' : '7'
+    prompt += `\n\n${requestNumber}. USER DIRECTION — apply this within the continuity rules above: "${customPrompt}"`
     if (isChunked) {
       prompt += `\n   IMPORTANT - PARTIAL STRIP CONTEXT:`
-      prompt += `\n   - You only see an edge strip, not the full image - extrapolate naturally from visible content`
+      prompt += `\n   - You only see an edge strip, not the full image — extrapolate naturally from visible content`
       prompt += `\n   - The user's request applies ONLY to the new ${direction === 'up' ? 'upper' : direction === 'down' ? 'lower' : direction === 'left' ? 'left' : 'right'} area (the light gray blank space)`
       prompt += `\n   - Blend and integrate smoothly with the visible edge content`
+      if (!artStyle) {
+        prompt += `\n   - Maintain perfect style, color, and lighting consistency`
+      }
     } else if (isFullContext) {
       prompt += `\n   IMPORTANT - FULL SCENE CONTEXT:`
-      prompt += `\n   - You can see the entire scene - use it to place elements correctly`
+      prompt += `\n   - You can see the entire scene — use it to place elements correctly`
       prompt += `\n   - The user's request applies ONLY to the new ${direction === 'up' ? 'upper' : direction === 'down' ? 'lower' : direction === 'left' ? 'left' : 'right'} area (the light gray blank space)`
       prompt += `\n   - Blend and integrate smoothly with the existing scene`
     } else {
       prompt += `\n   - Incorporate this request while maintaining seamless blending`
     }
-    if (!artStyle) {
-      prompt += `\n   - Maintain perfect style, color, and lighting consistency`
-    }
-  } else {
-    const instructionNumber = artStyle ? '7' : '6'
-    prompt += `\n\n${instructionNumber}. NATURAL SCENE CONTINUATION:`
-    prompt += `\n   - Stay strictly within the genre, setting, environment, and subject matter of the existing image`
-    prompt += `\n   - Do NOT introduce new subjects, objects, creatures, or thematic elements that are not already implied by the scene`
-    prompt += `\n   - Continue the existing physics consistently: same lighting direction, same time of day, same weather, same atmosphere, same scale, same perspective`
-    prompt += `\n   - Avoid mechanical repetition — small natural variation in textures and shapes is good (e.g., slightly different cloud forms, organic terrain undulation, varied foliage)`
-    prompt += `\n   - The new area should look like more of the same environment a real camera would capture if panned/tilted in that direction — nothing more, nothing less`
-    prompt += `\n   - Match exact color, brightness, contrast, and saturation at the boundary`
   }
 
   // Parallax layer instructions
@@ -253,23 +305,28 @@ KEY INSTRUCTIONS:
     prompt += `\n\nSHARED SCENE DIRECTION — maintain this art direction exactly in the new area (palette, lighting, mood, style). Do not drift from it:\n${sceneBrief.trim()}`
   }
 
-  // Reference images block — only emitted when the caller has attached extra images.
-  // IMAGE 1 is always the tile strip; reference images follow it in order.
-  if (referenceImages && referenceImages.length > 0) {
+  // Reference images block — only present when user has supplied refs.
+  // IMAGE 1 is always the tile strip; planning guide (if present) takes IMAGE 2;
+  // user refs start at IMAGE (refImageOffset + 1).
+  if (hasRefs && referenceImages) {
     const refLines = referenceImages.map((ref, i) => {
-      const label = `IMAGE ${i + 2}`
-      const note = ref.description.trim()
-        ? ref.description.trim()
-        : 'general style or scene reference'
+      const label = `IMAGE ${refImageOffset + 1 + i}`
+      const note = ref.description.trim() ? ref.description.trim() : 'general style or scene reference'
       return `- ${label}: ${note}`
     })
-    prompt += `\n\nREFERENCE IMAGES: In addition to IMAGE 1 (the tile strip above), you have been provided ${referenceImages.length} extra context image${referenceImages.length === 1 ? '' : 's'}:\n${refLines.join('\n')}\nUse these only as visual context or style guidance when filling the blank area. Do not reproduce them literally or copy their exact composition into the extension.`
+    prompt += `\n\nREFERENCE IMAGES: In addition to IMAGE 1 (the tile strip), you have been provided ${referenceImages.length} user reference image${referenceImages.length === 1 ? '' : 's'}:\n${refLines.join('\n')}\nUse these to inform the style, mood, and content of the new area. The non-gray pixels in IMAGE 1 remain your primary guide for continuity — blend any reference-inspired content seamlessly with what is already visible in IMAGE 1.`
   }
 
-  prompt += `\n\nFINAL OUTPUT: Return the complete image with the blank area filled. The result must look like a single, unified ${artStyle && ART_STYLE_DESCRIPTIONS[artStyle] ? 'artistic work' : 'scene'} with absolutely no visible seams. The boundary should be completely invisible.`
+  // Planning guide block — emitted after user refs so numbering is clean.
+  if (hasPlanningGuide) {
+    const guideLabel = `IMAGE 2`
+    prompt += `\n\nCOMPOSITION GUIDE (${guideLabel}): A low-resolution planning image was generated in a prior pass. It shows a suggested composition for the grey area of IMAGE 1. Use it as a layout and mood reference only — do NOT copy its pixels. Your output must match the full-resolution colour, texture, and edge continuity of IMAGE 1's existing pixels. Do NOT use the dimensions of ${guideLabel} for your output.`
+  }
+
+  prompt += `\n\nFINAL OUTPUT: Return ${outputImage}. The result must look like a single, unified ${artStyle && ART_STYLE_DESCRIPTIONS[artStyle] ? 'artistic work' : 'scene'} with absolutely no visible seams. The boundary should be completely invisible.`
 
   if (extensionInfo?.newWidth && extensionInfo?.newHeight) {
-    prompt += `\n\nOUTPUT DIMENSIONS: Return the image at exactly ${extensionInfo.newWidth}x${extensionInfo.newHeight} pixels. Do NOT crop, letterbox, or change the aspect ratio. Fill every pixel of the light gray extension area — no gray or white pixels should remain.`
+    prompt += `\n\nOUTPUT DIMENSIONS: Return ${outputImage} at exactly ${extensionInfo.newWidth}x${extensionInfo.newHeight} pixels. Do NOT crop, letterbox, or change the aspect ratio. Fill every pixel of the light gray extension area — no gray or white pixels should remain.`
   } else if (isChunked && chunkInfo) {
     const chunkW =
       chunkInfo.direction === 'left' || chunkInfo.direction === 'right'
@@ -279,7 +336,8 @@ KEY INSTRUCTIONS:
       chunkInfo.direction === 'up' || chunkInfo.direction === 'down'
         ? chunkInfo.chunkHeight + chunkInfo.extensionSize
         : chunkInfo.originalHeight
-    prompt += `\n\nOUTPUT DIMENSIONS: Return the image at exactly ${chunkW}x${chunkH} pixels — the same dimensions as the input image. Fill every gray pixel in the blank area. Do NOT return a different size or aspect ratio.`
+    const dimTarget = hasExtras ? 'IMAGE 1' : 'the input image'
+    prompt += `\n\nOUTPUT DIMENSIONS: Return ${outputImage} at exactly ${chunkW}x${chunkH} pixels — the same dimensions as ${dimTarget}.${hasExtras ? ' Do NOT use the dimensions of any reference image.' : ''} Fill every gray pixel in the blank area. Do NOT return a different size or aspect ratio.`
 
     if (typeof chunkInfo.tileIndex === 'number' && typeof chunkInfo.tileCount === 'number') {
       prompt += `\n\nTILE CONTEXT: This is tile ${chunkInfo.tileIndex + 1} of ${chunkInfo.tileCount} in a larger extension. Any non-gray edge shows content from an already-finished neighbour tile — continue the scene seamlessly across every such edge. Do NOT repeat or mirror content from the existing (non-gray) portions of this or any adjacent tile.`
@@ -289,6 +347,90 @@ KEY INSTRUCTIONS:
   // Suppress unused `attempt` lint warning — kept for future temperature-based
   // adjustments (same pattern the route uses).
   void attempt
+
+  return prompt
+}
+
+// ── Phase-1 planning prompt ────────────────────────────────────────────────
+
+/**
+ * Build the prompt for phase 1 of a two-phase tile generation.
+ *
+ * Phase 1 receives a scaled planning map of the full extension band:
+ *   - Real pixels from the context strip and already-accepted tiles.
+ *   - Grey (#B0B0B0) for the blank region of the current tile.
+ *   - Red (#FF0000) for blank regions of future tiles (not yet generated).
+ *
+ * The model must fill only the grey area and leave everything else untouched.
+ * Its output is a low-resolution composition guide used in phase 2.
+ */
+export function buildPlanningPrompt(params: BuildPlanningPromptParams): string {
+  const {
+    direction,
+    tileIndex,
+    tileCount,
+    customPrompt,
+    artStyle,
+    sceneBrief,
+    referenceImages,
+  } = params
+
+  const hasRefs = !!(referenceImages && referenceImages.length > 0)
+
+  const preamble = hasRefs
+    ? `MULTI-IMAGE REQUEST — IMAGE ROLES:
+- IMAGE 1: your WORKING CANVAS — the planning map described below.
+- IMAGE 2, 3, …: REFERENCE ONLY — style or content guides. Do NOT return them.
+
+`
+    : ''
+
+  let prompt = `${preamble}PLANNING TASK: You are generating a low-resolution composition plan for tile ${tileIndex + 1} of ${tileCount} in a multi-tile image extension.
+
+You have been given a scaled-down planning map of the full extension band. The map uses three colour regions:
+- GREY (#B0B0B0): the blank area for THIS tile — the only region you must fill.
+- RED (#FF0000): blank areas reserved for FUTURE tiles (generated later) — leave these exactly as red.
+- All other pixels: real scene content (already painted) — preserve these exactly unchanged.
+
+YOUR TASK:
+1. Fill EVERY grey pixel with scene content that fits naturally into the overall composition.
+2. Leave all red pixels exactly as red (#FF0000) — do NOT fill or modify them.
+3. Preserve all non-grey, non-red pixels exactly as they appear.
+4. Return the image at the SAME pixel dimensions as the input map.
+
+COMPOSITION RULES:
+- The grey area is on the ${direction === 'up' ? 'top' : direction === 'down' ? 'bottom' : direction === 'left' ? 'left' : 'right'} side.
+- Continue the existing scene naturally — same horizon, lighting direction, atmosphere, and scale.
+- Do NOT introduce subjects or thematic elements that would conflict with the red (future) regions.
+- Keep the composition balanced: the red areas will be filled by other tiles in a consistent style.
+- This is a planning sketch — focus on correct layout and tonal composition over fine detail.`
+
+  if (artStyle && ART_STYLE_DESCRIPTIONS[artStyle]) {
+    prompt += `\n\nARTISTIC STYLE: ${ART_STYLE_DESCRIPTIONS[artStyle]}.`
+  }
+
+  if (customPrompt) {
+    prompt += `\n\nUSER DIRECTION for the grey area: "${customPrompt}"`
+  }
+
+  if (typeof sceneBrief === 'string' && sceneBrief.trim()) {
+    prompt += `\n\nSHARED SCENE DIRECTION:\n${sceneBrief.trim()}`
+  }
+
+  if (hasRefs && referenceImages) {
+    const refLines = referenceImages.map((ref, i) => {
+      const label = `IMAGE ${i + 2}`
+      const note = ref.description.trim() ? ref.description.trim() : 'general style or scene reference'
+      return `- ${label}: ${note}`
+    })
+    prompt += `\n\nREFERENCE IMAGES:\n${refLines.join('\n')}\nUse these for style and content guidance when filling the grey area.`
+  }
+
+  prompt += `\n\nCRITICAL OUTPUT RULES:
+- Return the complete image at the SAME dimensions as the input map.
+- Every grey (#B0B0B0) pixel must be replaced with scene content.
+- Every red (#FF0000) pixel must remain exactly red.
+- No seam, colour shift, or brightness jump at the grey↔real boundary.`
 
   return prompt
 }

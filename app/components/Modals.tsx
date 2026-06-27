@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Icons } from '@/app/components/icons'
 import { ART_STYLE_GROUPS } from '@/app/lib/artStyles'
-import { buildExtendPrompt } from '@/app/lib/extendPrompt'
+import { buildExtendPrompt, buildPlanningPrompt } from '@/app/lib/extendPrompt'
 import { buildTileChunkInfo, buildTileInput, ExtensionTileSpec } from '@/app/utils/imageProcessor'
 import { MODELS, maskKey } from '@/app/lib/models'
 import { Direction, ReferenceImage } from '@/app/lib/app'
@@ -1129,6 +1129,8 @@ export interface TileExtensionModalProps {
   nonSkippedCount: number
   /** Latest generated result for this tile, or null if not yet generated. */
   preview: string | null
+  /** Phase-1 planning guide result, or null if two-phase not yet complete. */
+  planningPreview: string | null
   /** True when this is the next tile in scan order (Retry/Accept enabled). */
   isNextPending: boolean
   /** True while the API call for this tile is in-flight. */
@@ -1156,6 +1158,7 @@ export function TileExtensionModal({
   sceneBrief,
   nonSkippedCount,
   preview,
+  planningPreview,
   isNextPending,
   isGenerating,
   bandCanvas,
@@ -1213,6 +1216,10 @@ export function TileExtensionModal({
   // exactly what will be sent.
   const chunkInfo = buildTileChunkInfo(tileSpec, direction, nsIdx, nonSkippedCount)
   const effectivePrompt = tilePrompt.trim() || globalPrompt.trim() || undefined
+  const populatedRefs = tileReferenceImages.filter((r) => r.dataUrl.length > 0)
+  const isKeyedLayer = !!layerRole && layerRole !== 'sky'
+  const showTwoPhase = nonSkippedCount > 1 && !isKeyedLayer
+
   const assembledPrompt = buildExtendPrompt({
     direction,
     chunkInfo,
@@ -1221,7 +1228,21 @@ export function TileExtensionModal({
     artStyle: artStyle !== 'none' ? artStyle : null,
     layerRole: layerRole ?? null,
     sceneBrief: sceneBrief ?? null,
+    referenceImages: populatedRefs.map((r) => ({ description: r.description })),
+    hasPlanningGuide: showTwoPhase,
   })
+
+  const planningPromptText = showTwoPhase
+    ? buildPlanningPrompt({
+        direction,
+        tileIndex: nsIdx,
+        tileCount: nonSkippedCount,
+        customPrompt: effectivePrompt ?? null,
+        artStyle: artStyle !== 'none' ? artStyle : null,
+        sceneBrief: sceneBrief ?? null,
+        referenceImages: populatedRefs.map((r) => ({ description: r.description })),
+      })
+    : null
 
   const canAct = isNextPending && !isGenerating
   const hasPreview = preview !== null
@@ -1470,6 +1491,33 @@ export function TileExtensionModal({
               >
                 Full assembled prompt ▸
               </summary>
+              {planningPromptText && (
+                <>
+                  <p
+                    className="mt-2 mb-1 text-[10px] uppercase tracking-wider"
+                    style={{ color: 'var(--text-muted)' }}
+                  >
+                    Phase 1 — Planning
+                  </p>
+                  <pre
+                    className="overflow-auto rounded-[var(--radius-sm)] p-3 text-[10px] leading-relaxed whitespace-pre-wrap"
+                    style={{
+                      background: 'var(--surface)',
+                      border: '1px solid var(--border)',
+                      color: 'var(--text-secondary)',
+                      maxHeight: 140,
+                    }}
+                  >
+                    {planningPromptText}
+                  </pre>
+                  <p
+                    className="mt-2 mb-1 text-[10px] uppercase tracking-wider"
+                    style={{ color: 'var(--text-muted)' }}
+                  >
+                    Phase 2 — Refinement
+                  </p>
+                </>
+              )}
               <pre
                 className="mt-2 overflow-auto rounded-[var(--radius-sm)] p-3 text-[10px] leading-relaxed whitespace-pre-wrap"
                 style={{
@@ -1484,14 +1532,14 @@ export function TileExtensionModal({
             </details>
 
             {/* Images row */}
-            <div className="flex gap-4">
+            <div className="flex gap-3">
               {/* Input image */}
               <div className="flex-1 min-w-0">
                 <p
                   className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
                   style={{ color: 'var(--text-muted)' }}
                 >
-                  Input to API
+                  Input
                 </p>
                 <div
                   className="checker relative overflow-hidden rounded-[var(--radius-sm)]"
@@ -1521,6 +1569,60 @@ export function TileExtensionModal({
                   {tileSpec.tileWidth} × {tileSpec.tileHeight}
                 </p>
               </div>
+
+              {/* Planning guide — only shown when two-phase is active */}
+              {showTwoPhase && (
+                <div className="flex-1 min-w-0">
+                  <p
+                    className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
+                    style={{ color: 'var(--text-muted)' }}
+                  >
+                    Plan guide
+                  </p>
+                  <div
+                    className="checker relative overflow-hidden rounded-[var(--radius-sm)]"
+                    style={{
+                      border: '1px solid var(--border)',
+                      aspectRatio: '1 / 1',
+                      background: 'var(--surface)',
+                    }}
+                  >
+                    {isGenerating && !planningPreview && (
+                      <div className="absolute inset-0 flex items-center justify-center">
+                        <Icons.Spinner size={16} />
+                      </div>
+                    )}
+                    {isGenerating && !planningPreview && (
+                      <div
+                        className="absolute inset-0 animate-pulse"
+                        style={{ background: 'rgba(80,80,130,0.3)' }}
+                      />
+                    )}
+                    {planningPreview && (
+                      <img
+                        src={planningPreview}
+                        alt="Planning guide"
+                        className="w-full h-full object-contain block"
+                        draggable={false}
+                      />
+                    )}
+                    {!isGenerating && !planningPreview && (
+                      <div
+                        className="absolute inset-0 flex items-center justify-center text-[11px]"
+                        style={{ color: 'var(--text-muted)' }}
+                      >
+                        —
+                      </div>
+                    )}
+                  </div>
+                  <p
+                    className="mt-1.5 text-[11px] text-center"
+                    style={{ color: 'var(--text-muted)' }}
+                  >
+                    {isGenerating && !planningPreview ? 'Planning…' : planningPreview ? 'Done' : '—'}
+                  </p>
+                </div>
+              )}
 
               {/* Result image */}
               <div className="flex-1 min-w-0">
@@ -1574,6 +1676,8 @@ export function TileExtensionModal({
                     ? `${resultDimensions.width} × ${resultDimensions.height}`
                     : hasPreview
                     ? '…'
+                    : isGenerating && showTwoPhase && planningPreview
+                    ? 'Refining…'
                     : '—'}
                 </p>
               </div>
@@ -1599,7 +1703,7 @@ export function TileExtensionModal({
                   {isGenerating ? (
                     <>
                       <Icons.Spinner size={13} />
-                      Generating…
+                      {showTwoPhase && !planningPreview ? 'Planning…' : 'Generating…'}
                     </>
                   ) : (
                     <>↺ {hasPreview ? 'Retry' : 'Generate'}</>
