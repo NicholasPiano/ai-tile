@@ -37,6 +37,28 @@ export type Candidate = {
 
 export const EXTENSION_PERCENT = 38
 
+/**
+ * Maximum pixel dimension (width or height) sent to the AI in a single call.
+ * Images/chunks larger than this are scaled before the API call and the result
+ * is scaled back up.  Tiled extends use full-res tiles that individually fit
+ * within this cap instead of downscaling.
+ */
+export const MAX_AI_DIMENSION = 1536
+
+/**
+ * Overlap in pixels between adjacent tiles in a tiled extension.
+ * Each tile's input includes this many already-generated pixels from its
+ * processed neighbors so the AI continues the scene coherently, and the
+ * compositor feathers the join over this width.
+ */
+export const TILE_OVERLAP_PX = 192
+
+/**
+ * Hard cap on the total number of API calls per tiled extension to guard
+ * against accidental runaway cost on very large images.
+ */
+export const MAX_TILES_PER_EXTEND = 24
+
 // ─────────────────────────────────────────────────────────────────────────────
 // OpenRouter integration — BYOK (bring your own key) for open-source friendliness
 // ─────────────────────────────────────────────────────────────────────────────

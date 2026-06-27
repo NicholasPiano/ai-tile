@@ -3,7 +3,10 @@
 import { useEffect, useRef, useState } from 'react'
 import { Icons } from '@/app/components/icons'
 import { ART_STYLE_GROUPS } from '@/app/lib/artStyles'
+import { buildExtendPrompt } from '@/app/lib/extendPrompt'
+import { buildTileChunkInfo, buildTileInput, ExtensionTileSpec } from '@/app/utils/imageProcessor'
 import { MODELS, maskKey } from '@/app/lib/models'
+import { Direction } from '@/app/lib/app'
 
 export function SettingsDrawer({
   open,
@@ -203,6 +206,16 @@ export function SettingsDrawer({
             >
               Extensions are 38% of the current image dimension. For larger
               extensions, click an edge again after accepting.
+            </p>
+            <p
+              className="mt-3 text-[12px] leading-relaxed"
+              style={{ color: 'var(--text-secondary)' }}
+            >
+              <strong>Tiled mode</strong> activates automatically for large
+              images whose extension band exceeds 1 536 px. The band is split
+              into full-resolution overlapping tiles generated sequentially, so
+              each tile sees its already-painted neighbours as context. Tiled
+              extensions produce a single result (no 3-variant selection).
             </p>
             <p
               className="mt-3 text-[11px]"
@@ -710,6 +723,727 @@ export function ErrorToast({ message, onClose }: { message: string; onClose: () 
         </button>
       </div>
     </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TiledPlanModal (legacy) — kept for reference; superseded by TileExtensionModal
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Minimal per-cell data for the band-grid visualisation. */
+export interface TilePlanCell {
+  row: number
+  col: number
+  bandX: number
+  bandY: number
+  tileWidth: number
+  tileHeight: number
+  isSkipped: boolean
+  /** -1 when isSkipped, otherwise index into tilePreviews / tilePrompts. */
+  nonSkippedIndex: number
+}
+
+export interface TiledPlanModalProps {
+  open: boolean
+  direction: 'up' | 'down' | 'left' | 'right'
+  bandWidth: number
+  bandHeight: number
+  contextSize: number
+  extensionSize: number
+  cells: TilePlanCell[]
+  nonSkippedCount: number
+  tilePrompts: string[]
+  onSetTilePrompt: (idx: number, prompt: string) => void
+  tilePreviews: (string | null)[]
+  /** Non-skipped index of the tile currently being processed, or null. */
+  currentTileIdx: number | null
+  awaitingApproval: boolean
+  approveEachTile: boolean
+  onToggleApprove: (v: boolean) => void
+  generating: boolean
+  onGenerate: () => void
+  onContinue: () => void
+  onRegenerate: () => void
+  onCancel: () => void
+}
+
+const MAX_GRID_W = 560
+const MAX_GRID_H = 200
+
+export function TiledPlanModal({
+  open,
+  direction,
+  bandWidth,
+  bandHeight,
+  contextSize,
+  extensionSize,
+  cells,
+  nonSkippedCount,
+  tilePrompts,
+  onSetTilePrompt,
+  tilePreviews,
+  currentTileIdx,
+  awaitingApproval,
+  approveEachTile,
+  onToggleApprove,
+  generating,
+  onGenerate,
+  onContinue,
+  onRegenerate,
+  onCancel,
+}: TiledPlanModalProps) {
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !generating) onCancel()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, generating, onCancel])
+
+  if (!open) return null
+
+  const scale = Math.min(MAX_GRID_W / bandWidth, MAX_GRID_H / bandHeight, 1)
+  const previewW = Math.round(bandWidth * scale)
+  const previewH = Math.round(bandHeight * scale)
+
+  const dirArrow: Record<string, string> = {
+    up: '↑', down: '↓', left: '←', right: '→',
+  }
+
+  const nonSkippedCells = cells.filter((c) => !c.isSkipped)
+  const currentCell = currentTileIdx !== null ? nonSkippedCells[currentTileIdx] : null
+
+  return (
+    <>
+      <div
+        className="fixed inset-0 z-50 anim-fade flex items-center justify-center p-4"
+        style={{ background: 'rgba(0,0,0,0.72)' }}
+        onClick={() => { if (!generating) onCancel() }}
+      />
+      <div
+        className="fixed inset-0 z-50 flex items-center justify-center p-4 pointer-events-none"
+      >
+        <div
+          className="pointer-events-auto flex w-full max-w-[640px] flex-col anim-slide-up rounded-[var(--radius)]"
+          style={{
+            background: 'var(--bg-elev)',
+            border: '1px solid var(--border-strong)',
+            maxHeight: '90vh',
+            overflowY: 'auto',
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* ── Header ──────────────────────────────────────────────── */}
+          <div
+            className="flex h-12 shrink-0 items-center justify-between border-b px-5"
+            style={{ borderColor: 'var(--border)' }}
+          >
+            <div className="flex items-center gap-2">
+              <span className="text-[13px] font-semibold">Tiled Extension</span>
+              <span
+                className="text-[12px]"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                {dirArrow[direction]} {direction} · {bandWidth}×{bandHeight}
+              </span>
+            </div>
+            {!generating && (
+              <button onClick={onCancel} className="icon-btn" aria-label="Close">
+                <Icons.X size={14} />
+              </button>
+            )}
+          </div>
+
+          {/* ── Summary bar ─────────────────────────────────────────── */}
+          <div
+            className="px-5 pt-3 pb-1 text-[11px]"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            {nonSkippedCount} tile{nonSkippedCount !== 1 ? 's' : ''} to generate
+            {' · '}ctx {contextSize}px
+            {' · '}ext {extensionSize}px
+            {generating && currentTileIdx !== null && (
+              <span
+                className="ml-2 font-medium"
+                style={{ color: 'var(--accent)' }}
+              >
+                Tile {currentTileIdx + 1} / {nonSkippedCount}
+              </span>
+            )}
+          </div>
+
+          {/* ── Band grid ───────────────────────────────────────────── */}
+          <div className="px-5 pt-3 pb-4">
+            <div
+              style={{
+                position: 'relative',
+                width: previewW,
+                height: previewH,
+                margin: '0 auto',
+                borderRadius: 4,
+                overflow: 'hidden',
+                background: 'var(--surface)',
+                border: '1px solid var(--border)',
+              }}
+            >
+              {cells.map((cell) => {
+                const ns = cell.nonSkippedIndex
+                const preview = ns >= 0 ? (tilePreviews[ns] ?? null) : null
+                const isCurrent = ns === currentTileIdx
+                const isDone = preview !== null
+                const isAwaiting = isCurrent && awaitingApproval
+                const isGenerating = isCurrent && !awaitingApproval && generating
+
+                const cellW = cell.tileWidth * scale
+                const cellH = cell.tileHeight * scale
+                const showLabel = cellW > 28 && cellH > 18
+
+                let borderColor = 'var(--border)'
+                if (isAwaiting) borderColor = 'var(--accent)'
+                else if (isGenerating) borderColor = 'var(--accent)'
+                else if (isDone) borderColor = 'var(--border-strong)'
+
+                let bg = 'rgba(140,140,160,0.18)'
+                if (cell.isSkipped) bg = 'rgba(80,200,120,0.1)'
+                else if (isDone) bg = 'transparent'
+                else if (isGenerating) bg = 'rgba(120,120,255,0.12)'
+
+                return (
+                  <div
+                    key={`${cell.row}-${cell.col}`}
+                    style={{
+                      position: 'absolute',
+                      left: Math.round(cell.bandX * scale),
+                      top: Math.round(cell.bandY * scale),
+                      width: Math.round(cellW),
+                      height: Math.round(cellH),
+                      boxSizing: 'border-box',
+                      border: `1px ${cell.isSkipped || isDone ? 'solid' : 'dashed'} ${borderColor}`,
+                      backgroundColor: isDone ? 'transparent' : bg,
+                      backgroundImage: isDone ? `url(${preview})` : 'none',
+                      backgroundSize: 'cover',
+                      backgroundPosition: 'center',
+                      transition: 'border-color 0.25s',
+                      boxShadow: isAwaiting ? `0 0 0 2px var(--accent)` : 'none',
+                    }}
+                  >
+                    {showLabel && (
+                      <span
+                        style={{
+                          position: 'absolute',
+                          top: 2,
+                          left: 3,
+                          fontSize: 8,
+                          lineHeight: 1,
+                          color: isDone ? 'rgba(255,255,255,0.85)' : 'var(--text-muted)',
+                          textShadow: isDone ? '0 0 4px rgba(0,0,0,0.8)' : 'none',
+                          pointerEvents: 'none',
+                        }}
+                      >
+                        {cell.isSkipped
+                          ? 'CTX'
+                          : isAwaiting
+                          ? '?'
+                          : isGenerating
+                          ? '…'
+                          : isDone
+                          ? '✓'
+                          : `${ns + 1}`}
+                      </span>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+
+          {/* ── Per-tile prompts (pre-generation only) ──────────────── */}
+          {!generating && !awaitingApproval && nonSkippedCount > 0 && (
+            <div
+              className="border-t px-5 pt-4 pb-3"
+              style={{ borderColor: 'var(--border)' }}
+            >
+              <p
+                className="mb-2 text-[11px] uppercase tracking-wider"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                Per-tile prompt overrides
+              </p>
+              <div
+                className="space-y-1.5 overflow-y-auto"
+                style={{ maxHeight: 148 }}
+              >
+                {nonSkippedCells.map((cell, idx) => (
+                  <div key={`prompt-${idx}`} className="flex items-center gap-2">
+                    <span
+                      className="shrink-0 text-[11px] tabular-nums"
+                      style={{ color: 'var(--text-muted)', width: 60 }}
+                    >
+                      r{cell.row}×c{cell.col}
+                    </span>
+                    <input
+                      type="text"
+                      value={tilePrompts[idx] ?? ''}
+                      onChange={(e) => onSetTilePrompt(idx, e.target.value)}
+                      placeholder="Leave blank to use global prompt"
+                      className="min-w-0 flex-1 rounded-[var(--radius-sm)] px-2.5 py-1 text-[12px]"
+                      style={{
+                        background: 'var(--surface)',
+                        border: '1px solid var(--border)',
+                        color: 'var(--text)',
+                        outline: 'none',
+                      }}
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* ── Approval panel ──────────────────────────────────────── */}
+          {awaitingApproval && currentTileIdx !== null && currentCell != null && (
+            <div
+              className="border-t px-5 pt-4 pb-5"
+              style={{ borderColor: 'var(--border)' }}
+            >
+              <div className="mb-3 flex items-baseline gap-2">
+                <span className="text-[13px] font-semibold">
+                  Tile {currentTileIdx + 1} / {nonSkippedCount}
+                </span>
+                <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                  r{currentCell.row}×c{currentCell.col}
+                  {' · '}
+                  {currentCell.tileWidth}×{currentCell.tileHeight}
+                </span>
+              </div>
+
+              <input
+                type="text"
+                value={tilePrompts[currentTileIdx] ?? ''}
+                onChange={(e) => onSetTilePrompt(currentTileIdx, e.target.value)}
+                placeholder="Override prompt for regeneration…"
+                className="mb-3 w-full rounded-[var(--radius-sm)] px-3 py-2 text-[12px]"
+                style={{
+                  background: 'var(--surface)',
+                  border: '1px solid var(--border)',
+                  color: 'var(--text)',
+                  outline: 'none',
+                }}
+              />
+
+              <div className="flex gap-2">
+                <button onClick={onRegenerate} className="btn btn-ghost">
+                  ↺ Regenerate
+                </button>
+                <button onClick={onContinue} className="btn btn-primary">
+                  → Continue
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* ── Footer ──────────────────────────────────────────────── */}
+          {!awaitingApproval && (
+            <div
+              className="flex shrink-0 items-center justify-between border-t px-5 py-3"
+              style={{ borderColor: 'var(--border)' }}
+            >
+              {/* Approve-each-tile toggle */}
+              <div
+                className="flex rounded-[var(--radius-sm)] p-0.5"
+                style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
+              >
+                {(['pre-approve', 'approve-each'] as const).map((mode) => {
+                  const active = mode === 'approve-each' ? approveEachTile : !approveEachTile
+                  const label = mode === 'pre-approve' ? 'Pre-approve' : 'Approve each tile'
+                  return (
+                    <button
+                      key={mode}
+                      onClick={() => onToggleApprove(mode === 'approve-each')}
+                      disabled={generating}
+                      className="rounded px-3 py-1 text-[12px] transition-colors"
+                      style={{
+                        background: active ? 'var(--accent-bg, rgba(99,102,241,0.15))' : 'transparent',
+                        color: active ? 'var(--accent, #6366f1)' : 'var(--text-muted)',
+                        fontWeight: active ? 600 : 400,
+                        border: 'none',
+                        cursor: generating ? 'default' : 'pointer',
+                      }}
+                    >
+                      {label}
+                    </button>
+                  )
+                })}
+              </div>
+
+              <div className="flex gap-2">
+                <button
+                  onClick={onCancel}
+                  disabled={generating && currentTileIdx !== null}
+                  className="btn btn-ghost"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={onGenerate}
+                  disabled={generating}
+                  className="btn btn-primary"
+                >
+                  {generating ? (
+                    <>
+                      <Icons.Spinner size={13} />
+                      Generating…
+                    </>
+                  ) : (
+                    <>
+                      <Icons.Sparkle size={13} />
+                      {`Generate ${nonSkippedCount} tile${nonSkippedCount !== 1 ? 's' : ''}`}
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TileExtensionModal — per-tile prompt / input image / result view
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface TileExtensionModalProps {
+  open: boolean
+  nsIdx: number
+  tileSpec: ExtensionTileSpec
+  direction: Direction
+  /** The per-tile prompt override (may be empty = use global). */
+  tilePrompt: string
+  globalPrompt: string
+  artStyle: string
+  layerRole?: string
+  sceneBrief?: string
+  nonSkippedCount: number
+  /** Latest generated result for this tile, or null if not yet generated. */
+  preview: string | null
+  /** True when this is the next tile in scan order (Retry/Accept enabled). */
+  isNextPending: boolean
+  /** True while the API call for this tile is in-flight. */
+  isGenerating: boolean
+  /** Band canvas needed to build the tile input image preview. */
+  bandCanvas: HTMLCanvasElement | null
+  onSetTilePrompt: (v: string) => void
+  onGenerate: () => void
+  onAccept: () => void
+  onClose: () => void
+}
+
+export function TileExtensionModal({
+  open,
+  nsIdx,
+  tileSpec,
+  direction,
+  tilePrompt,
+  globalPrompt,
+  artStyle,
+  layerRole,
+  sceneBrief,
+  nonSkippedCount,
+  preview,
+  isNextPending,
+  isGenerating,
+  bandCanvas,
+  onSetTilePrompt,
+  onGenerate,
+  onAccept,
+  onClose,
+}: TileExtensionModalProps) {
+  const [inputImageUrl, setInputImageUrl] = useState<string | null>(null)
+
+  // Recompute the tile input image whenever the modal opens or the band canvas
+  // changes (e.g. after a prior tile is accepted and composited in).
+  useEffect(() => {
+    if (!open || !bandCanvas) {
+      setInputImageUrl(null)
+      return
+    }
+    try {
+      setInputImageUrl(buildTileInput(bandCanvas, tileSpec))
+    } catch {
+      setInputImageUrl(null)
+    }
+  }, [open, bandCanvas, tileSpec])
+
+  // Close on Escape when not generating.
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !isGenerating) onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, isGenerating, onClose])
+
+  if (!open) return null
+
+  // Build the assembled prompt the model will receive so the user can see
+  // exactly what will be sent.
+  const chunkInfo = buildTileChunkInfo(tileSpec, direction, nsIdx, nonSkippedCount)
+  const effectivePrompt = tilePrompt.trim() || globalPrompt.trim() || undefined
+  const assembledPrompt = buildExtendPrompt({
+    direction,
+    chunkInfo,
+    useFullContext: false,
+    customPrompt: effectivePrompt ?? null,
+    artStyle: artStyle !== 'none' ? artStyle : null,
+    layerRole: layerRole ?? null,
+    sceneBrief: sceneBrief ?? null,
+  })
+
+  const canAct = isNextPending && !isGenerating
+  const hasPreview = preview !== null
+
+  const dirArrow: Record<string, string> = { up: '↑', down: '↓', left: '←', right: '→' }
+
+  return (
+    <>
+      {/* Backdrop */}
+      <div
+        className="fixed inset-0 z-50 anim-fade"
+        style={{ background: 'rgba(0,0,0,0.72)' }}
+        onClick={() => { if (!isGenerating) onClose() }}
+      />
+
+      {/* Panel */}
+      <div className="fixed inset-0 z-50 flex items-center justify-center p-4 pointer-events-none">
+        <div
+          className="pointer-events-auto flex w-full max-w-[700px] flex-col anim-slide-up rounded-[var(--radius)]"
+          style={{
+            background: 'var(--bg-elev)',
+            border: '1px solid var(--border-strong)',
+            maxHeight: '90vh',
+            overflowY: 'auto',
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* ── Header ──────────────────────────────────────────────── */}
+          <div
+            className="flex h-12 shrink-0 items-center justify-between border-b px-5"
+            style={{ borderColor: 'var(--border)' }}
+          >
+            <div className="flex items-center gap-2">
+              <span className="text-[13px] font-semibold">
+                Tile {nsIdx + 1} / {nonSkippedCount}
+              </span>
+              <span className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
+                {dirArrow[direction]} {direction}
+                {' · '}r{tileSpec.row}×c{tileSpec.col}
+                {' · '}
+                {tileSpec.tileWidth}×{tileSpec.tileHeight}
+              </span>
+              {!isNextPending && (
+                <span
+                  className="rounded-full px-2 py-0.5 text-[11px]"
+                  style={{
+                    background: 'var(--surface)',
+                    color: 'var(--text-muted)',
+                    border: '1px solid var(--border)',
+                  }}
+                >
+                  Awaiting prior tile
+                </span>
+              )}
+            </div>
+            {!isGenerating && (
+              <button onClick={onClose} className="icon-btn" aria-label="Close">
+                <Icons.X size={14} />
+              </button>
+            )}
+          </div>
+
+          {/* ── Body ────────────────────────────────────────────────── */}
+          <div className="flex flex-col gap-5 px-5 pt-5 pb-6">
+
+            {/* Prompt override */}
+            <div>
+              <p
+                className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                Prompt override
+              </p>
+              <input
+                type="text"
+                value={tilePrompt}
+                onChange={(e) => onSetTilePrompt(e.target.value)}
+                placeholder={
+                  globalPrompt.trim()
+                    ? `Using global: "${globalPrompt.trim().slice(0, 60)}"`
+                    : 'Leave blank — natural scene continuation'
+                }
+                disabled={isGenerating}
+                className="w-full rounded-[var(--radius-sm)] px-3 py-2 text-[12px]"
+                style={{
+                  background: 'var(--surface)',
+                  border: '1px solid var(--border)',
+                  color: 'var(--text)',
+                  outline: 'none',
+                  opacity: isGenerating ? 0.6 : 1,
+                }}
+              />
+            </div>
+
+            {/* Assembled prompt — collapsible */}
+            <details>
+              <summary
+                className="cursor-pointer select-none text-[11px] uppercase tracking-wider font-medium"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                Full assembled prompt ▸
+              </summary>
+              <pre
+                className="mt-2 overflow-auto rounded-[var(--radius-sm)] p-3 text-[10px] leading-relaxed whitespace-pre-wrap"
+                style={{
+                  background: 'var(--surface)',
+                  border: '1px solid var(--border)',
+                  color: 'var(--text-secondary)',
+                  maxHeight: 180,
+                }}
+              >
+                {assembledPrompt}
+              </pre>
+            </details>
+
+            {/* Images row */}
+            <div className="flex gap-4">
+              {/* Input image */}
+              <div className="flex-1 min-w-0">
+                <p
+                  className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
+                  style={{ color: 'var(--text-muted)' }}
+                >
+                  Input to API
+                </p>
+                <div
+                  className="checker relative overflow-hidden rounded-[var(--radius-sm)]"
+                  style={{
+                    border: '1px solid var(--border)',
+                    aspectRatio: `${tileSpec.tileWidth} / ${tileSpec.tileHeight}`,
+                    background: 'var(--surface)',
+                  }}
+                >
+                  {inputImageUrl ? (
+                    <img
+                      src={inputImageUrl}
+                      alt="Tile input"
+                      className="w-full h-full object-contain block"
+                      draggable={false}
+                    />
+                  ) : (
+                    <div className="absolute inset-0 flex items-center justify-center">
+                      <Icons.Spinner size={16} />
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Result image */}
+              <div className="flex-1 min-w-0">
+                <p
+                  className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
+                  style={{ color: 'var(--text-muted)' }}
+                >
+                  Result
+                </p>
+                <div
+                  className="checker relative overflow-hidden rounded-[var(--radius-sm)]"
+                  style={{
+                    border: `1px solid ${hasPreview ? 'var(--border-strong)' : 'var(--border)'}`,
+                    aspectRatio: `${tileSpec.tileWidth} / ${tileSpec.tileHeight}`,
+                    background: 'var(--surface)',
+                  }}
+                >
+                  {isGenerating && !hasPreview && (
+                    <div className="absolute inset-0 flex items-center justify-center">
+                      <Icons.Spinner size={16} />
+                    </div>
+                  )}
+                  {isGenerating && !hasPreview && (
+                    <div
+                      className="absolute inset-0 animate-pulse"
+                      style={{ background: 'rgba(80,80,130,0.3)' }}
+                    />
+                  )}
+                  {hasPreview && preview && (
+                    <img
+                      src={preview}
+                      alt="Tile result"
+                      className="w-full h-full object-contain block"
+                      draggable={false}
+                    />
+                  )}
+                  {!isGenerating && !hasPreview && (
+                    <div
+                      className="absolute inset-0 flex items-center justify-center text-[11px]"
+                      style={{ color: 'var(--text-muted)' }}
+                    >
+                      Not generated yet
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Actions */}
+            <div className="flex items-center justify-between">
+              <button
+                onClick={onClose}
+                disabled={isGenerating}
+                className="btn btn-ghost"
+              >
+                Close
+              </button>
+
+              <div className="flex gap-2">
+                <button
+                  onClick={onGenerate}
+                  disabled={!canAct}
+                  className="btn btn-ghost"
+                  title={!isNextPending ? 'Accept prior tiles first' : undefined}
+                >
+                  {isGenerating ? (
+                    <>
+                      <Icons.Spinner size={13} />
+                      Generating…
+                    </>
+                  ) : (
+                    <>↺ {hasPreview ? 'Retry' : 'Generate'}</>
+                  )}
+                </button>
+
+                <button
+                  onClick={onAccept}
+                  disabled={!canAct || !hasPreview}
+                  className="btn btn-primary"
+                  title={
+                    !isNextPending
+                      ? 'Accept prior tiles first'
+                      : !hasPreview
+                      ? 'Generate this tile first'
+                      : undefined
+                  }
+                >
+                  → Accept
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </>
   )
 }
 

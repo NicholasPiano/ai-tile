@@ -1336,7 +1336,11 @@ export interface ChunkInfo {
   extensionSize: number
   sourceX: number
   sourceY: number
-  scale?: number // Downscale factor applied before sending to AI (1 = full resolution)
+  scale?: number
+  /** When this chunk is one tile of a tiled extension, its 0-based index. */
+  tileIndex?: number
+  /** Total tile count when this is part of a tiled extension. */
+  tileCount?: number
 }
 
 export function getImageDimensions(dataUrl: string): Promise<{ width: number; height: number }> {
@@ -1346,6 +1350,468 @@ export function getImageDimensions(dataUrl: string): Promise<{ width: number; he
     img.onerror = () => reject(new Error('Failed to load image'))
     img.src = dataUrl
   })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tiled full-resolution extension
+//
+// When a band (context strip + blank extension area) would exceed MAX_AI_DIMENSION
+// in either axis, these helpers split it into an overlapping grid of tiles that
+// each fit within the limit.  Tiles are generated sequentially in
+// context→extension scan order so every tile sees already-painted neighbor
+// pixels as real content — the primary seam-coherence mechanism.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Per-edge feather widths (px) when compositing a tile into the running band. */
+export interface TileFeatherOverlap {
+  top: number
+  bottom: number
+  left: number
+  right: number
+}
+
+/**
+ * One tile in the extension grid.  Carries its position in the band canvas,
+ * its pixel dimensions, the sub-rect that was originally gray (the part the
+ * AI must fill), and which edges face already-processed neighbors (used to
+ * build the 2D separable feather mask at composite time).
+ */
+export interface ExtensionTileSpec {
+  row: number
+  col: number
+  totalRows: number
+  totalCols: number
+  /** Top-left of this tile in band-canvas coordinates. */
+  bandX: number
+  bandY: number
+  /** Actual pixel size of this tile (last tile in a row/col may be narrower). */
+  tileWidth: number
+  tileHeight: number
+  /**
+   * Sub-rect within the tile (tile-local coords) that was EXTENSION_BLANK_COLOR
+   * in the initial band canvas.  Zero-area means the tile is pure context —
+   * skip the API call, the band is already correct from initBandCanvas().
+   */
+  blankRegion: { x: number; y: number; width: number; height: number }
+  /**
+   * For each edge: overlap px with an already-processed neighbor.
+   * 0 = no feathering on that edge.  Drives the 2D separable feather mask.
+   */
+  featherOverlap: TileFeatherOverlap
+}
+
+/** Result of planExtensionTiles(). */
+export interface TiledExtensionPlan {
+  /** Tiles sorted in the order they must be generated. */
+  tiles: ExtensionTileSpec[]
+  bandWidth: number
+  bandHeight: number
+  /**
+   * Synthetic ChunkInfo describing the whole assembled band as a single chunk.
+   * Pass unchanged to stitchExtendedChunk() after all tiles are composited.
+   */
+  bandChunkInfo: ChunkInfo
+}
+
+export interface PlanExtensionTilesParams {
+  direction: 'up' | 'down' | 'left' | 'right'
+  imageWidth: number
+  imageHeight: number
+  extensionPercent: number
+  /** Context overlap as % of the image dimension — must match createChunkedExtension. */
+  overlapPercent: number
+  maxDimension: number
+  tileOverlapPx: number
+  maxTiles: number
+}
+
+/**
+ * Plan a tiled full-resolution extension.
+ *
+ * Splits the extension band into an overlapping grid of tiles ≤ maxDimension²
+ * and returns them in context-to-extension scan order:
+ *   down  → rows top-to-bottom,    cols left-to-right
+ *   up    → rows bottom-to-top,    cols left-to-right
+ *   right → cols left-to-right,    rows top-to-bottom
+ *   left  → cols right-to-left,    rows top-to-bottom
+ *
+ * Because the running band canvas is seeded with the original context strip
+ * before the first tile is generated, every tile after the first in each scan
+ * axis sees real painted content on its already-processed edges.
+ */
+export function planExtensionTiles(params: PlanExtensionTilesParams): TiledExtensionPlan {
+  const {
+    direction, imageWidth, imageHeight,
+    extensionPercent, overlapPercent,
+    maxDimension, tileOverlapPx, maxTiles,
+  } = params
+
+  const extAmt = extensionPercent / 100
+  const ovlAmt = overlapPercent / 100
+
+  let bandWidth: number
+  let bandHeight: number
+  let contextSize: number
+  let extensionSize: number
+
+  if (direction === 'down' || direction === 'up') {
+    contextSize  = Math.round(imageHeight * ovlAmt)
+    extensionSize = Math.round(imageHeight * extAmt)
+    bandWidth    = imageWidth
+    bandHeight   = contextSize + extensionSize
+  } else {
+    contextSize  = Math.round(imageWidth * ovlAmt)
+    extensionSize = Math.round(imageWidth * extAmt)
+    bandWidth    = contextSize + extensionSize
+    bandHeight   = imageHeight
+  }
+
+  const tileW   = Math.min(maxDimension, bandWidth)
+  const tileH   = Math.min(maxDimension, bandHeight)
+  const strideX = Math.max(1, tileW - tileOverlapPx)
+  const strideY = Math.max(1, tileH - tileOverlapPx)
+
+  const cols = tileW >= bandWidth  ? 1 : Math.ceil((bandWidth  - tileW) / strideX) + 1
+  const rows = tileH >= bandHeight ? 1 : Math.ceil((bandHeight - tileH) / strideY) + 1
+
+  if (rows * cols > maxTiles) {
+    throw new Error(
+      `Tiled extension requires ${rows * cols} tiles (${rows} rows × ${cols} cols), ` +
+      `exceeding the limit of ${maxTiles}. Reduce image size or increase MAX_TILES_PER_EXTEND.`,
+    )
+  }
+
+  // Build scan order arrays
+  const rowOrder = direction === 'up'
+    ? Array.from({ length: rows }, (_, i) => rows - 1 - i)
+    : Array.from({ length: rows }, (_, i) => i)
+  const colOrder = direction === 'left'
+    ? Array.from({ length: cols }, (_, i) => cols - 1 - i)
+    : Array.from({ length: cols }, (_, i) => i)
+
+  const processedSet = new Set<string>()
+  const tiles: ExtensionTileSpec[] = []
+
+  for (const row of rowOrder) {
+    for (const col of colOrder) {
+      const bandX        = col * strideX
+      const bandY        = row * strideY
+      const actualTileW  = Math.min(tileW, bandWidth  - bandX)
+      const actualTileH  = Math.min(tileH, bandHeight - bandY)
+
+      // Compute the gray (blank) region within this tile in tile-local coords,
+      // based on the initial band state from initBandCanvas().
+      let blankRegion: { x: number; y: number; width: number; height: number }
+      switch (direction) {
+        case 'down': {
+          const gy = Math.max(0, contextSize - bandY)
+          blankRegion = { x: 0, y: gy, width: actualTileW, height: Math.max(0, actualTileH - gy) }
+          break
+        }
+        case 'up': {
+          const gyEnd = Math.min(actualTileH, Math.max(0, extensionSize - bandY))
+          blankRegion = { x: 0, y: 0, width: actualTileW, height: gyEnd }
+          break
+        }
+        case 'right': {
+          const gx = Math.max(0, contextSize - bandX)
+          blankRegion = { x: gx, y: 0, width: Math.max(0, actualTileW - gx), height: actualTileH }
+          break
+        }
+        case 'left': {
+          const gxEnd = Math.min(actualTileW, Math.max(0, extensionSize - bandX))
+          blankRegion = { x: 0, y: 0, width: gxEnd, height: actualTileH }
+          break
+        }
+      }
+
+      // Feather overlap: edges facing tiles already processed in scan order.
+      const topPrev = processedSet.has(`${row - 1},${col}`)
+      const botPrev = processedSet.has(`${row + 1},${col}`)
+      const lftPrev = processedSet.has(`${row},${col - 1}`)
+      const rgtPrev = processedSet.has(`${row},${col + 1}`)
+
+      tiles.push({
+        row, col, totalRows: rows, totalCols: cols,
+        bandX, bandY,
+        tileWidth: actualTileW, tileHeight: actualTileH,
+        blankRegion,
+        featherOverlap: {
+          top:    topPrev ? Math.max(0, tileH - strideY) : 0,
+          bottom: botPrev ? Math.max(0, tileH - strideY) : 0,
+          left:   lftPrev ? Math.max(0, tileW - strideX) : 0,
+          right:  rgtPrev ? Math.max(0, tileW - strideX) : 0,
+        },
+      })
+
+      processedSet.add(`${row},${col}`)
+    }
+  }
+
+  // Synthetic ChunkInfo for the final stitchExtendedChunk() call.
+  const bandChunkInfo: ChunkInfo = {
+    direction,
+    originalWidth:  imageWidth,
+    originalHeight: imageHeight,
+    chunkWidth:  direction === 'left' || direction === 'right' ? contextSize : imageWidth,
+    chunkHeight: direction === 'up'   || direction === 'down'  ? contextSize : imageHeight,
+    extensionSize,
+    sourceX: direction === 'right' ? imageWidth  - contextSize : 0,
+    sourceY: direction === 'down'  ? imageHeight - contextSize : 0,
+    scale: 1,
+  }
+
+  return { tiles, bandWidth, bandHeight, bandChunkInfo }
+}
+
+/**
+ * Initialise the running band canvas.
+ *
+ * Creates a bandWidth × bandHeight canvas filled with EXTENSION_BLANK_COLOR,
+ * then copies the context strip (the overlap region the AI will use as
+ * continuation seed) from the source image:
+ *   down  — bottom contextSize rows → band top
+ *   up    — top    contextSize rows → band bottom
+ *   right — right  contextSize cols → band left
+ *   left  — left   contextSize cols → band right
+ */
+export function initBandCanvas(
+  sourceImageDataUrl: string,
+  direction: 'up' | 'down' | 'left' | 'right',
+  bandWidth: number,
+  bandHeight: number,
+  contextSize: number,
+): Promise<HTMLCanvasElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.crossOrigin = 'anonymous'
+    img.onload = () => {
+      const canvas = document.createElement('canvas')
+      canvas.width  = bandWidth
+      canvas.height = bandHeight
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        reject(new Error('Failed to get band canvas context'))
+        return
+      }
+
+      ctx.fillStyle = EXTENSION_BLANK_COLOR
+      ctx.fillRect(0, 0, bandWidth, bandHeight)
+
+      switch (direction) {
+        case 'down':
+          // Bottom contextSize rows of source → top of band
+          ctx.drawImage(img, 0, img.height - contextSize, img.width, contextSize,
+            0, 0, bandWidth, contextSize)
+          break
+        case 'up':
+          // Top contextSize rows of source → bottom of band
+          ctx.drawImage(img, 0, 0, img.width, contextSize,
+            0, bandHeight - contextSize, bandWidth, contextSize)
+          break
+        case 'right':
+          // Right contextSize cols of source → left of band
+          ctx.drawImage(img, img.width - contextSize, 0, contextSize, img.height,
+            0, 0, contextSize, bandHeight)
+          break
+        case 'left':
+          // Left contextSize cols of source → right of band
+          ctx.drawImage(img, 0, 0, contextSize, img.height,
+            bandWidth - contextSize, 0, contextSize, bandHeight)
+          break
+      }
+
+      resolve(canvas)
+    }
+    img.onerror = () => reject(new Error('Failed to load source image for band canvas init'))
+    img.src = sourceImageDataUrl
+  })
+}
+
+/**
+ * Build the ChunkInfo descriptor for a single tile of a tiled extension.
+ *
+ * Extracted from the executeTiledPlan loop so page.tsx and the
+ * TileExtensionModal can both derive the exact same ChunkInfo without
+ * duplicating logic.
+ */
+export function buildTileChunkInfo(
+  tileSpec: ExtensionTileSpec,
+  direction: 'up' | 'down' | 'left' | 'right',
+  nsIdx: number,
+  nonSkippedCount: number,
+): ChunkInfo {
+  const blankR = tileSpec.blankRegion
+  const isHorizExt = direction === 'left' || direction === 'right'
+  return {
+    direction,
+    originalWidth: tileSpec.tileWidth,
+    originalHeight: tileSpec.tileHeight,
+    chunkWidth: isHorizExt ? blankR.x : tileSpec.tileWidth,
+    chunkHeight: isHorizExt ? tileSpec.tileHeight : blankR.y,
+    extensionSize: isHorizExt ? blankR.width : blankR.height,
+    sourceX: blankR.x,
+    sourceY: blankR.y,
+    scale: 1,
+    tileIndex: nsIdx,
+    tileCount: nonSkippedCount,
+  }
+}
+
+/**
+ * Crop the tile's region from the running band canvas and return it as a
+ * full-resolution JPEG suitable for the /api/extend endpoint.
+ *
+ * At call time the band already contains real pixels for all tiles processed
+ * before this one in scan order, so the AI sees context on those edges and
+ * gray only in the region it must fill.
+ */
+export function buildTileInput(
+  bandCanvas: HTMLCanvasElement,
+  tileSpec: ExtensionTileSpec,
+): string {
+  const { bandX, bandY, tileWidth, tileHeight } = tileSpec
+  const tile = document.createElement('canvas')
+  tile.width  = tileWidth
+  tile.height = tileHeight
+  const ctx = tile.getContext('2d')
+  if (!ctx) throw new Error('Failed to get tile input canvas context')
+  ctx.drawImage(bandCanvas, bandX, bandY, tileWidth, tileHeight, 0, 0, tileWidth, tileHeight)
+  return tile.toDataURL('image/jpeg', 0.95)
+}
+
+/**
+ * Build a per-pixel alpha mask for blending a tile into the running band.
+ *
+ * Uses a 2D separable ramp: alpha(x,y) = hRamp(x) × vRamp(y).
+ * Each ramp rises from 0 at the feathered edge to 1 at featherOverlap pixels
+ * in, then stays at 1.  The product means the shared corner of two feathered
+ * edges approaches 0, so the existing band (where both neighbors already
+ * agree) dominates — exactly what is needed for interior tiles.
+ */
+function buildTileFeatherMask(
+  tileWidth: number,
+  tileHeight: number,
+  featherOverlap: TileFeatherOverlap,
+): HTMLCanvasElement {
+  const canvas = document.createElement('canvas')
+  canvas.width  = tileWidth
+  canvas.height = tileHeight
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return canvas
+
+  const imageData = ctx.createImageData(tileWidth, tileHeight)
+  const d = imageData.data
+
+  for (let y = 0; y < tileHeight; y++) {
+    let vAlpha = 1
+    if (featherOverlap.top    > 0) vAlpha = Math.min(vAlpha, y / featherOverlap.top)
+    if (featherOverlap.bottom > 0) vAlpha = Math.min(vAlpha, (tileHeight - 1 - y) / featherOverlap.bottom)
+    vAlpha = Math.max(0, Math.min(1, vAlpha))
+
+    for (let x = 0; x < tileWidth; x++) {
+      let hAlpha = 1
+      if (featherOverlap.left  > 0) hAlpha = Math.min(hAlpha, x / featherOverlap.left)
+      if (featherOverlap.right > 0) hAlpha = Math.min(hAlpha, (tileWidth - 1 - x) / featherOverlap.right)
+      hAlpha = Math.max(0, Math.min(1, hAlpha))
+
+      const alpha = Math.round(hAlpha * vAlpha * 255)
+      const idx = (y * tileWidth + x) * 4
+      d[idx] = 255; d[idx + 1] = 255; d[idx + 2] = 255; d[idx + 3] = alpha
+    }
+  }
+
+  ctx.putImageData(imageData, 0, 0)
+  return canvas
+}
+
+/**
+ * Composite one AI tile result into the running band canvas.
+ *
+ * Applies the 2D separable feather mask so the tile blends with any
+ * already-processed neighbors along shared overlap edges.  Tiles with no
+ * processed neighbors are drawn opaquely (first tile, no-op blending).
+ */
+export async function compositeTileResult(
+  bandCanvas: HTMLCanvasElement,
+  tileResultDataUrl: string,
+  tileSpec: ExtensionTileSpec,
+): Promise<void> {
+  const { bandX, bandY, tileWidth, tileHeight, featherOverlap } = tileSpec
+
+  // Normalise AI output to exact tile dimensions (model may return slightly off)
+  const normalized = await normalizeImageToSize(tileResultDataUrl, tileWidth, tileHeight)
+  const tileImg    = await loadImageElement(normalized)
+
+  const bandCtx = bandCanvas.getContext('2d')
+  if (!bandCtx) throw new Error('Failed to get band canvas context for composite')
+
+  const hasFeather =
+    featherOverlap.top > 0 || featherOverlap.bottom > 0 ||
+    featherOverlap.left > 0 || featherOverlap.right > 0
+
+  if (!hasFeather) {
+    // First tile or no processed neighbors — paint directly
+    bandCtx.drawImage(tileImg, bandX, bandY)
+    return
+  }
+
+  // Apply 2D feather mask to the tile on an offscreen canvas
+  const mask      = buildTileFeatherMask(tileWidth, tileHeight, featherOverlap)
+  const offscreen = document.createElement('canvas')
+  offscreen.width  = tileWidth
+  offscreen.height = tileHeight
+  const offCtx    = offscreen.getContext('2d')
+  if (!offCtx) throw new Error('Failed to get offscreen tile canvas context')
+
+  offCtx.drawImage(tileImg, 0, 0)
+  offCtx.globalCompositeOperation = 'destination-in'
+  offCtx.drawImage(mask, 0, 0)
+
+  // source-over: masked tile fades to transparent at feathered edges so the
+  // already-composited band content shows through the overlap region
+  bandCtx.drawImage(offscreen, bandX, bandY)
+}
+
+/**
+ * Quick check: is the tile result still mostly unfilled (gray / white)?
+ * Samples the centre 20×20 pixels of the blank region.
+ * Returns false if blankRegion has zero area (pure-context tile).
+ */
+export async function isTileResultUnfilled(
+  tileResultDataUrl: string,
+  tileSpec: ExtensionTileSpec,
+): Promise<boolean> {
+  const { blankRegion } = tileSpec
+  if (blankRegion.width === 0 || blankRegion.height === 0) return false
+
+  const img    = await loadImageElement(tileResultDataUrl)
+  const canvas = document.createElement('canvas')
+  canvas.width  = img.width
+  canvas.height = img.height
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return false
+  ctx.drawImage(img, 0, 0)
+
+  const sampleW = Math.min(20, blankRegion.width)
+  const sampleH = Math.min(20, blankRegion.height)
+  const sampleX = blankRegion.x + Math.floor((blankRegion.width  - sampleW) / 2)
+  const sampleY = blankRegion.y + Math.floor((blankRegion.height - sampleH) / 2)
+
+  const data = ctx.getImageData(
+    Math.max(0, Math.min(sampleX, img.width  - sampleW)),
+    Math.max(0, Math.min(sampleY, img.height - sampleH)),
+    sampleW, sampleH,
+  ).data
+
+  let blankCount = 0
+  const total    = sampleW * sampleH
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i], g = data[i + 1], b = data[i + 2]
+    if (Math.abs(r - 176) < 30 && Math.abs(g - 176) < 30 && Math.abs(b - 176) < 30) blankCount++
+    else if (r > 200 && g > 200 && b > 200) blankCount++
+  }
+  return total > 0 && blankCount / total > 0.5
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

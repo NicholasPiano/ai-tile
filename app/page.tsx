@@ -3,15 +3,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { CommandBar } from '@/app/components/CommandBar'
 import { EmptyState } from '@/app/components/EmptyState'
-import { ApiKeyModal, ErrorToast, GenerateModal, SettingsDrawer, Toggle } from '@/app/components/Modals'
+import { ApiKeyModal, ErrorToast, GenerateModal, SettingsDrawer, TileExtensionModal, Toggle } from '@/app/components/Modals'
 import { ParallaxStudio } from '@/app/components/ParallaxStudio'
 import { PropStudio } from '@/app/components/PropStudio'
 import { SpriteStudio } from '@/app/components/SpriteStudio'
 import { TileStudio } from '@/app/components/TileStudio'
 import { TopBar } from '@/app/components/TopBar'
 import { ResultActions, VariantSelector } from '@/app/components/VariantSelector'
-import { Workspace } from '@/app/components/Workspace'
-import { Candidate, Direction, EXTENSION_PERCENT, Mode, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL } from '@/app/lib/app'
+import { Workspace, TilingState, TileCellDisplay } from '@/app/components/Workspace'
+import { Candidate, Direction, EXTENSION_PERCENT, MAX_AI_DIMENSION, MAX_TILES_PER_EXTEND, Mode, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, TILE_OVERLAP_PX } from '@/app/lib/app'
 import { findStyleLabel } from '@/app/lib/artStyles'
 import { DEFAULT_MODEL, MODELS, getModelConfig, skipsArtDirectorReview } from '@/app/lib/models'
 import { LAYER_ORDER, LAYER_ROLES, LayerRole, PARALLAX_MAX_AUTO_STEPS, ParallaxLayer, WORKFLOW_ORDER, createDefaultLayers, getRecommendedLayerIndex, getWorkflowPrerequisite } from '@/app/lib/parallax'
@@ -19,7 +19,7 @@ import { PROP_BATCH, PROP_BATCH_COLS, PROP_BATCH_H, PROP_BATCH_ROWS, PROP_BATCH_
 import { SPRITE_ANIMATIONS, SPRITE_FRAME_COUNT, SPRITE_FRAME_SIZE, SPRITE_GRID_COLS, SPRITE_GRID_ROWS, SPRITE_SHEET_H, SPRITE_SHEET_W, SPRITE_STRIP_H, SPRITE_STRIP_W, SpriteAnimType, SpriteFrame, SpriteSheet, createEmptySpriteSheet } from '@/app/lib/sprite'
 import { BODY_PLANS, BodyPlan, isAirborneAnim } from '@/app/lib/bodyPlans'
 import { CORNER_GRAFTS, ENABLE_CORNER_RECONCILE, TILESET_ATLAS_EXTRUDE_PX, TILESET_BY_ROLE, TILESET_COLS, TILESET_PADDED_SHEET_H, TILESET_PADDED_SHEET_W, TILESET_PADDED_STRIDE, TILESET_ROWS, TILESET_SHEET_H, TILESET_SHEET_W, TILESET_SLOTS, TILESET_TILE_SIZE, TILE_TEMPLATE_CELL, TILE_TEMPLATE_COLS, TILE_TEMPLATE_H, TILE_TEMPLATE_MASK, TILE_TEMPLATE_ROWS, TILE_TEMPLATE_SAMPLES, TILE_TEMPLATE_W, TileSetRole, TileSetSlot, alignAiOutputToTemplate, applyFeatheredRoleMask, buildTileSheetGuideDataUrl, createEmptyTileSet, rebuildCornerTile, reconcileAllCorners, templateRoleForCell } from '@/app/lib/tileset'
-import { alignSpriteFramesToBaseline, applyFullContextResult, centerSpriteFramesHorizontally, chromaKeyToAlpha, createChunkedExtension, createFullContextExtension, getImageDimensions, harmonizeHorizontalSeams, isolatePrimarySpriteComponent, isAiExtensionUnfilled, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, measureSeamResidual, normalizeSpriteFrameScale, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk } from '@/app/utils/imageProcessor'
+import { alignSpriteFramesToBaseline, applyFullContextResult, buildTileChunkInfo, buildTileInput, centerSpriteFramesHorizontally, ChunkInfo, chromaKeyToAlpha, compositeTileResult, createChunkedExtension, createFullContextExtension, ExtensionTileSpec, getImageDimensions, harmonizeHorizontalSeams, initBandCanvas, isolatePrimarySpriteComponent, isAiExtensionUnfilled, isTileResultUnfilled, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, measureSeamResidual, normalizeSpriteFrameScale, planExtensionTiles, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk, TiledExtensionPlan } from '@/app/utils/imageProcessor'
 import { SubjectBounds, drawPoseGuideSheet, measureSubjectBounds } from '@/app/utils/poseRig'
 import JSZip from 'jszip'
 
@@ -65,6 +65,65 @@ export default function Home() {
   const [customPrompt, setCustomPrompt] = useState('')
   const [artStyle, setArtStyle] = useState('none')
   const [debugMode, setDebugMode] = useState(false)
+
+  // ── Tiled extension plan ────────────────────────────────────────────────────
+  /**
+   * Describes a pending tiled extension displayed in the band UI. Generation
+   * is initiated tile-by-tile via the per-tile modal rather than auto-looping.
+   */
+  type PendingTiledPlan = {
+    plan: TiledExtensionPlan
+    direction: Direction
+    sourceImage: string
+    layerRole: LayerRole | undefined
+    cells: TileCellDisplay[]
+    nonSkippedCount: number
+    /** Non-skipped tile specs in scan order (pre-filtered from plan.tiles). */
+    nonSkippedTileSpecs: ExtensionTileSpec[]
+    bandWidth: number
+    bandHeight: number
+    contextSize: number
+    extensionSize: number
+    /** Source image pixel dimensions (needed by TilingBand for tile positioning). */
+    imageWidth: number
+    imageHeight: number
+    /** Per non-skipped tile: optional prompt override (empty = use global). */
+    tilePrompts: string[]
+    /** Per non-skipped tile: result data URL after API call, or null. */
+    tilePreviews: (string | null)[]
+    /** Per non-skipped tile: whether the user has accepted the generated result. */
+    tileAccepted: boolean[]
+    /** Non-skipped index of the tile currently being generated, or null. */
+    generatingTileIdx: number | null
+  }
+
+  const [pendingTiledPlan, setPendingTiledPlan] = useState<PendingTiledPlan | null>(null)
+
+  /**
+   * Ref that always mirrors `pendingTiledPlan` so that async tile handlers
+   * can read the latest user edits (e.g. updated per-tile prompts) without
+   * stale-closure issues.
+   */
+  const pendingTiledPlanRef = useRef<PendingTiledPlan | null>(null)
+  useEffect(() => {
+    pendingTiledPlanRef.current = pendingTiledPlan
+  }, [pendingTiledPlan])
+
+  /** Running band canvas — seeded from the source image context strip in
+   * handleExtend and updated by compositeTileResult after each accepted tile. */
+  const bandCanvasRef = useRef<HTMLCanvasElement | null>(null)
+
+  /** Non-skipped index of the tile whose modal is currently open, or null. */
+  const [activeTileModalIdx, setActiveTileModalIdx] = useState<number | null>(null)
+
+  /** Returns the index of the first non-accepted tile, or null if all done. */
+  function getNextPendingTileIdx(accepted: boolean[]): number | null {
+    for (let i = 0; i < accepted.length; i++) {
+      if (!accepted[i]) return i
+    }
+    return null
+  }
+  // ───────────────────────────────────────────────────────────────────────────
 
   // Mode: which top-level tool the user is in. Persisted to localStorage so a
   // game designer doesn't have to re-pick parallax every visit.
@@ -766,6 +825,177 @@ export default function Home() {
   )
 
   /**
+   * Generate a single tile. Only the next unaccepted tile in scan order can be
+   * generated; calling this for any other index is a no-op so the band UI can
+   * safely call it on click without guards.
+   */
+  const generateTile = useCallback(async (nsIdx: number) => {
+    const plan = pendingTiledPlanRef.current
+    if (!plan) return
+
+    // Tile 0 (the first tile) has no prior tile — it is always immediately
+    // actionable in a fresh plan. Tiles 1+ must wait for the preceding tile
+    // to be accepted before generation can proceed (scan order).
+    const nextPendingIdx = getNextPendingTileIdx(plan.tileAccepted)
+    if (nsIdx > 0 && nsIdx !== nextPendingIdx) return
+    if (nsIdx === 0 && plan.tileAccepted[0]) return  // already accepted, nothing to do
+    if (plan.generatingTileIdx !== null) return
+
+    const tileSpec = plan.nonSkippedTileSpecs[nsIdx]
+    if (!tileSpec) return
+    const canvas = bandCanvasRef.current
+    if (!canvas) return
+
+    const { direction, nonSkippedCount, layerRole } = plan
+    const chunkInfo = buildTileChunkInfo(tileSpec, direction, nsIdx, nonSkippedCount)
+
+    setPendingTiledPlan((prev) =>
+      prev ? { ...prev, generatingTileIdx: nsIdx } : null
+    )
+
+    const callApi = async (): Promise<string> => {
+      const latestPrompt = pendingTiledPlanRef.current?.tilePrompts[nsIdx] ?? ''
+      const effectivePrompt = latestPrompt.trim() || customPrompt.trim() || undefined
+      const tileInput = buildTileInput(canvas, tileSpec)
+      const response = await fetch('/api/extend', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          expandedCanvas: tileInput,
+          direction,
+          extensionAmount: EXTENSION_PERCENT,
+          customPrompt: effectivePrompt,
+          artStyle: artStyle !== 'none' ? artStyle : undefined,
+          apiKey: apiKey || undefined,
+          model: selectedModel,
+          layerRole,
+          sceneBrief:
+            mode === 'parallax' && sceneBrief.trim() ? sceneBrief.trim() : undefined,
+          chunkInfo,
+        }),
+      })
+      const data = await response.json() as { imageUrl?: string; error?: string }
+      if (!response.ok) {
+        const err = new Error(data.error || 'Failed to extend image tile') as Error & { status?: number }
+        err.status = response.status
+        throw err
+      }
+      return data.imageUrl as string
+    }
+
+    try {
+      let raw = await callApi()
+      const unfilled = await isTileResultUnfilled(raw, tileSpec)
+      if (unfilled) {
+        // eslint-disable-next-line no-console
+        console.warn(`⚠️ Tile ${nsIdx + 1} appears unfilled — retrying once`)
+        raw = await callApi()
+      }
+      setPendingTiledPlan((prev) => {
+        if (!prev) return null
+        const next = [...prev.tilePreviews]
+        next[nsIdx] = raw
+        return { ...prev, tilePreviews: next, generatingTileIdx: null }
+      })
+    } catch (err) {
+      const e = err as Error & { status?: number }
+      setError(e.message || 'Tile generation failed')
+      if (e.status === 401) {
+        setApiKeyRequired(true)
+        setShowApiKeyModal(true)
+      }
+      setPendingTiledPlan((prev) =>
+        prev ? { ...prev, generatingTileIdx: null } : null
+      )
+    }
+  }, [apiKey, selectedModel, mode, sceneBrief, customPrompt, artStyle])
+
+  /**
+   * Accept the generated result for a tile, composite it into the band canvas,
+   * then (once all tiles are accepted) stitch the final image.
+   * Only the next pending tile in scan order can be accepted.
+   */
+  const acceptTile = useCallback(async (nsIdx: number) => {
+    const plan = pendingTiledPlanRef.current
+    if (!plan) return
+
+    // Tile 0 can always be accepted if it has a preview and hasn't been
+    // accepted yet. Subsequent tiles enforce scan order.
+    const nextPendingIdx = getNextPendingTileIdx(plan.tileAccepted)
+    if (nsIdx > 0 && nsIdx !== nextPendingIdx) return
+    if (nsIdx === 0 && plan.tileAccepted[0]) return  // already accepted
+
+    const preview = plan.tilePreviews[nsIdx]
+    if (!preview) return
+
+    const tileSpec = plan.nonSkippedTileSpecs[nsIdx]
+    if (!tileSpec) return
+    const canvas = bandCanvasRef.current
+    if (!canvas) return
+
+    try {
+      await compositeTileResult(canvas, preview, tileSpec)
+    } catch (err) {
+      setError((err as Error).message || 'Failed to composite tile')
+      return
+    }
+
+    const newAccepted = [...plan.tileAccepted]
+    newAccepted[nsIdx] = true
+
+    setPendingTiledPlan((prev) =>
+      prev ? { ...prev, tileAccepted: newAccepted } : null
+    )
+    // Keep ref in sync immediately so generateTile reads the right state.
+    if (pendingTiledPlanRef.current) {
+      pendingTiledPlanRef.current = { ...pendingTiledPlanRef.current, tileAccepted: newAccepted }
+    }
+
+    // eslint-disable-next-line no-console
+    console.log(`✅ Tile ${nsIdx + 1} accepted`)
+
+    if (!newAccepted.every(Boolean)) return
+
+    // All tiles accepted: stitch band into the final image.
+    setActiveTileModalIdx(null)
+    setProgressMsg('Stitching…')
+
+    try {
+      const bandDataUrl = canvas.toDataURL('image/png')
+      const stitched = await stitchExtendedChunk(
+        plan.sourceImage,
+        bandDataUrl,
+        plan.plan.bandChunkInfo,
+        debugMode
+      )
+      const isKeyedLayer = !!plan.layerRole && plan.layerRole !== 'sky'
+      if (isKeyedLayer) {
+        const keyed = await chromaKeyToAlpha(stitched)
+        adoptCandidates([{ imageUrl: keyed, rawImageUrl: stitched, score: 0, attempt: 1 }])
+      } else {
+        adoptCandidates([{ imageUrl: stitched, score: 0, attempt: 1 }])
+      }
+      // eslint-disable-next-line no-console
+      console.log('🏁 Tiled extend complete')
+      setPendingTiledPlan(null)
+      bandCanvasRef.current = null
+    } catch (err) {
+      setError((err as Error).message || 'Failed to stitch extension')
+    } finally {
+      setProgressMsg(null)
+    }
+  }, [debugMode, adoptCandidates])
+
+  /** Cancel the current tiled extension plan and reset all related state. */
+  const cancelTiledPlan = useCallback(() => {
+    setPendingTiledPlan(null)
+    bandCanvasRef.current = null
+    setActiveTileModalIdx(null)
+    setProgressMsg(null)
+    setActiveDirection(null)
+  }, [])
+
+  /**
    * Resolve which image (and which layer role, if any) the next extension
    * should operate on. In parallax mode the source is the active layer's
    * raw (un-keyed) image so the AI sees the magenta key consistently; in
@@ -786,67 +1016,126 @@ export default function Home() {
     return { sourceImage: selectedImage }
   }
 
+  /**
+   * Build and activate a tiled extension plan from `sourceImage`.
+   * Shared by `handleExtend` (uses current image) and `handleRegenerate`
+   * (uses pre-extension image).
+   */
+  const startTiledPlan = useCallback(async (
+    sourceImage: string,
+    direction: Direction,
+    layerRole: LayerRole | undefined,
+    dims: { width: number; height: number },
+  ) => {
+    const isHorizontal = direction === 'left' || direction === 'right'
+    const plan = planExtensionTiles({
+      direction,
+      imageWidth: dims.width,
+      imageHeight: dims.height,
+      extensionPercent: EXTENSION_PERCENT,
+      overlapPercent: 40,
+      maxDimension: MAX_AI_DIMENSION,
+      tileOverlapPx: TILE_OVERLAP_PX,
+      maxTiles: MAX_TILES_PER_EXTEND,
+    })
+
+    const extensionSize = plan.bandChunkInfo.extensionSize
+    // Context is the overlap strip (overlapPercent), not "image size minus extension".
+    const contextSize = isHorizontal
+      ? plan.bandWidth - extensionSize
+      : plan.bandHeight - extensionSize
+
+    // Minimum extension-area dimension for a tile to be treated as non-skipped.
+    // Tiles whose "new content" region is smaller than half the tile overlap are
+    // effectively invisible in the band (< a few % of the extension height/width)
+    // and their content is fully covered by the adjacent tile's overlap anyway.
+    const MIN_BLANK_PX = Math.round(TILE_OVERLAP_PX / 2)
+
+    const cells: TileCellDisplay[] = []
+    const nonSkippedTileSpecs: ExtensionTileSpec[] = []
+    let nsIdx = 0
+    for (const t of plan.tiles) {
+      // For vertical extensions the "progress" dimension is height; for
+      // horizontal it is width. Skip tiles with zero OR negligible extension area.
+      const blankProgress = isHorizontal ? t.blankRegion.width : t.blankRegion.height
+      const isSkipped = blankProgress < MIN_BLANK_PX
+      cells.push({
+        row: t.row,
+        col: t.col,
+        bandX: t.bandX,
+        bandY: t.bandY,
+        tileWidth: t.tileWidth,
+        tileHeight: t.tileHeight,
+        isSkipped,
+        nonSkippedIndex: isSkipped ? -1 : nsIdx++,
+      })
+      if (!isSkipped) {
+        nonSkippedTileSpecs.push(t)
+      }
+    }
+    const nonSkippedCount = nsIdx
+
+    const canvas = await initBandCanvas(
+      sourceImage,
+      direction,
+      plan.bandWidth,
+      plan.bandHeight,
+      contextSize
+    )
+    bandCanvasRef.current = canvas
+
+    const newPlan: PendingTiledPlan = {
+      plan,
+      direction,
+      sourceImage,
+      layerRole,
+      cells,
+      nonSkippedCount,
+      nonSkippedTileSpecs,
+      bandWidth: plan.bandWidth,
+      bandHeight: plan.bandHeight,
+      contextSize,
+      extensionSize,
+      imageWidth: dims.width,
+      imageHeight: dims.height,
+      tilePrompts: new Array<string>(nonSkippedCount).fill(''),
+      tilePreviews: new Array<string | null>(nonSkippedCount).fill(null),
+      tileAccepted: new Array<boolean>(nonSkippedCount).fill(false),
+      generatingTileIdx: null,
+    }
+
+    pendingTiledPlanRef.current = newPlan
+    setPendingTiledPlan(newPlan)
+  }, [])
+
   const handleExtend = async (direction: Direction) => {
     if (loading) return
     if (!ensureCanGenerate()) return
     const { sourceImage, layerRole } = resolveExtendSource()
     if (!sourceImage) return
+    if (!currentImageDimensions) return
+
     setError(null)
-    setLoading(true)
-    setProgressMsg(`Extending ${direction}…`)
     setActiveDirection(direction)
     setImageBeforeExtension(sourceImage)
     setLastExtensionParams({ direction, customPrompt, artStyle, layerRole })
 
-    try {
-      const candidates = await runExtend(
-        direction,
-        sourceImage,
-        customPrompt,
-        artStyle,
-        layerRole
-      )
-      adoptCandidates(candidates)
-    } catch (err) {
-      const e = err as Error & { status?: number }
-      setError(e.message || 'An error occurred')
-      setActiveDirection(null)
-      if (e.status === 401) {
-        setApiKeyRequired(true)
-        setShowApiKeyModal(true)
-      }
-    } finally {
-      setLoading(false)
-      setProgressMsg(null)
-    }
+    await startTiledPlan(sourceImage, direction, layerRole, currentImageDimensions)
   }
 
   const handleRegenerate = async () => {
     if (!lastExtensionParams || !imageBeforeExtension || loading) return
     if (!ensureCanGenerate()) return
+    if (!currentImageDimensions) return
+
+    const { direction, layerRole } = lastExtensionParams
     setError(null)
-    setLoading(true)
-    setProgressMsg(`Regenerating ${lastExtensionParams.direction}…`)
-    try {
-      const candidates = await runExtend(
-        lastExtensionParams.direction,
-        imageBeforeExtension,
-        lastExtensionParams.customPrompt,
-        lastExtensionParams.artStyle,
-        lastExtensionParams.layerRole
-      )
-      adoptCandidates(candidates)
-    } catch (err) {
-      const e = err as Error & { status?: number }
-      setError(e.message || 'An error occurred')
-      if (e.status === 401) {
-        setApiKeyRequired(true)
-        setShowApiKeyModal(true)
-      }
-    } finally {
-      setLoading(false)
-      setProgressMsg(null)
-    }
+    setActiveDirection(direction)
+    // Re-enter the tiled extend flow from the pre-extension image (not the
+    // accepted result) so the plan baseline is unchanged.
+    setLastExtensionParams({ direction, customPrompt, artStyle, layerRole })
+
+    await startTiledPlan(imageBeforeExtension, direction, layerRole, currentImageDimensions)
   }
 
   const cycleVariant = (delta: 1 | -1) => {
@@ -3956,6 +4245,26 @@ export default function Home() {
           }
           variantSelector={variantSelectorEl}
           resultActions={resultActionsEl}
+          tilingState={
+            pendingTiledPlan
+              ? ({
+                  direction: pendingTiledPlan.direction,
+                  bandWidth: pendingTiledPlan.bandWidth,
+                  bandHeight: pendingTiledPlan.bandHeight,
+                  contextSize: pendingTiledPlan.contextSize,
+                  extensionSize: pendingTiledPlan.extensionSize,
+                  imageWidth: pendingTiledPlan.imageWidth,
+                  imageHeight: pendingTiledPlan.imageHeight,
+                  cells: pendingTiledPlan.cells,
+                  tilePreviews: pendingTiledPlan.tilePreviews,
+                  tileAccepted: pendingTiledPlan.tileAccepted,
+                  generatingTileIdx: pendingTiledPlan.generatingTileIdx,
+                  nextPendingTileIdx: getNextPendingTileIdx(pendingTiledPlan.tileAccepted),
+                } satisfies TilingState)
+              : null
+          }
+          onTileClick={(nsIdx) => setActiveTileModalIdx(nsIdx)}
+          onTileCancel={cancelTiledPlan}
         />
       )}
 
@@ -3999,6 +4308,42 @@ export default function Home() {
         onChange={handleImageUpload}
         className="hidden"
       />
+
+      {pendingTiledPlan && activeTileModalIdx !== null && (() => {
+        const nsIdx = activeTileModalIdx
+        const plan = pendingTiledPlan
+        const tileSpec = plan.nonSkippedTileSpecs[nsIdx]
+        if (!tileSpec) return null
+        return (
+          <TileExtensionModal
+            open
+            nsIdx={nsIdx}
+            tileSpec={tileSpec}
+            direction={plan.direction}
+            tilePrompt={plan.tilePrompts[nsIdx] ?? ''}
+            globalPrompt={customPrompt}
+            artStyle={artStyle}
+            layerRole={plan.layerRole}
+            sceneBrief={mode === 'parallax' ? sceneBrief : undefined}
+            nonSkippedCount={plan.nonSkippedCount}
+            preview={plan.tilePreviews[nsIdx] ?? null}
+            isNextPending={getNextPendingTileIdx(plan.tileAccepted) === nsIdx}
+            isGenerating={plan.generatingTileIdx === nsIdx}
+            bandCanvas={bandCanvasRef.current}
+            onSetTilePrompt={(v) =>
+              setPendingTiledPlan((prev) => {
+                if (!prev) return null
+                const next = [...prev.tilePrompts]
+                next[nsIdx] = v
+                return { ...prev, tilePrompts: next }
+              })
+            }
+            onGenerate={() => void generateTile(nsIdx)}
+            onAccept={() => void acceptTile(nsIdx)}
+            onClose={() => setActiveTileModalIdx(null)}
+          />
+        )
+      })()}
 
       <SettingsDrawer
         open={showSettings}

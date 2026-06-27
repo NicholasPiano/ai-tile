@@ -67,9 +67,17 @@ in the top bar:
 
 - **Click an edge → extend in that direction.** Spatial controls on the image,
   no dialog-tree UX.
-- **Best-of-3 variant picker.** Every extension generates up to 3 candidates,
+- **Best-of-3 variant picker.** Every *sub-threshold* horizontal extension generates up to 3 candidates,
   sorted by seam quality. Cycle through them with `← →` and pick the one
-  you like before accepting.
+  you like before accepting.  Tiled extensions (large images) produce a single
+  result — see below.
+- **Tiled full-resolution outpainting.** When an extension region exceeds the AI
+  dimension cap (1 536 px), the band is automatically split into an overlapping
+  grid of full-resolution tiles generated sequentially.  Each tile sees its
+  already-painted neighbours as context so the AI continues the scene coherently,
+  and a 2D separable feather mask blends overlapping edges for invisible seams.
+  Progress shows as *Tile N/M · Xs*.  Tiled mode returns one result (no variant
+  picker) to keep cost proportional.
 - **Poisson-blended seams.** Uses gradient-domain image editing (Pérez et al.
   2003) with mask-grow + replicate-padded Gauss-Seidel iterations to make the
   AI-original boundary mathematically invisible.
