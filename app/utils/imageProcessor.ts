@@ -1918,13 +1918,150 @@ export function buildTileInput(
 }
 
 /**
- * Build the composite IMAGE 1 sent to the phase-2 refine API call.
+ * Draw a softened planning guide into the tile blank region.
  *
- * Same pixel dimensions as buildTileInput, but the grey blank region is
- * replaced by the low-resolution planning slice scaled to fit.  The model
- * therefore receives:
- *   - High-resolution context strip → preserve exactly.
- *   - Low-resolution extension preview → render at full quality.
+ * Low-res plan slices are heavily upscaled into the blank area; drawing them
+ * sharp leaves visible blocks that the model copies as cartoon/8-bit output.
+ * A blur proportional to the upscale factor keeps layout and colour hints
+ * while removing pixel-grid structure the model should not replicate.
+ */
+export function drawSoftenedPlanningGuide(
+  ctx: CanvasRenderingContext2D,
+  sliceImg: HTMLImageElement,
+  blankRegion: { x: number; y: number; width: number; height: number },
+): void {
+  const scale = Math.max(
+    blankRegion.width / Math.max(1, sliceImg.naturalWidth),
+    blankRegion.height / Math.max(1, sliceImg.naturalHeight),
+  )
+  const blurPx = scale > 1.25
+    ? Math.min(48, Math.max(8, Math.round(scale * 1.5)))
+    : 0
+
+  const guide = document.createElement('canvas')
+  guide.width = blankRegion.width
+  guide.height = blankRegion.height
+  const gctx = guide.getContext('2d')
+  if (!gctx) {
+    ctx.drawImage(
+      sliceImg,
+      0, 0, sliceImg.naturalWidth, sliceImg.naturalHeight,
+      blankRegion.x, blankRegion.y, blankRegion.width, blankRegion.height,
+    )
+    return
+  }
+
+  gctx.imageSmoothingEnabled = true
+  gctx.imageSmoothingQuality = 'high'
+  if (blurPx > 0) {
+    gctx.filter = `blur(${blurPx}px)`
+  }
+  gctx.drawImage(sliceImg, 0, 0, blankRegion.width, blankRegion.height)
+  gctx.filter = 'none'
+
+  ctx.drawImage(guide, blankRegion.x, blankRegion.y)
+}
+
+/**
+ * Restore accepted-neighbour pixels that overlap with the current tile's blank
+ * region after the plan guide has been drawn over the full blank area.
+ *
+ * When a tile is part of a multi-tile grid some accepted neighbours share rows
+ * or columns with the current tile's blank region (e.g. the tile directly above
+ * in the same column).  Those pixels are already correct in the band canvas
+ * from step 1, but step 2 (drawing the plan guide over the full blankRegion)
+ * overwrites them.  This function redraws just those intersections from the
+ * band canvas so the model sees high-res content where it is available.
+ */
+function restoreAcceptedNeighbourOverlaps(
+  ctx: CanvasRenderingContext2D,
+  bandCanvas: HTMLCanvasElement,
+  tileSpec: ExtensionTileSpec,
+  allTileSpecs: ExtensionTileSpec[],
+  tileAccepted: boolean[],
+): void {
+  const { bandX, bandY, blankRegion } = tileSpec
+  // Blank region in band coordinates.
+  const curBandX = bandX + blankRegion.x
+  const curBandY = bandY + blankRegion.y
+  const curBandR = curBandX + blankRegion.width
+  const curBandB = curBandY + blankRegion.height
+
+  for (let i = 0; i < allTileSpecs.length; i++) {
+    if (!tileAccepted[i]) continue
+    const nb = allTileSpecs[i]
+    // Skip self (identity check by position).
+    if (nb.bandX === tileSpec.bandX && nb.bandY === tileSpec.bandY) continue
+
+    const nbBandX = nb.bandX + nb.blankRegion.x
+    const nbBandY = nb.bandY + nb.blankRegion.y
+    const nbBandR = nbBandX + nb.blankRegion.width
+    const nbBandB = nbBandY + nb.blankRegion.height
+
+    // Intersection in band coordinates.
+    const ix = Math.max(curBandX, nbBandX)
+    const iy = Math.max(curBandY, nbBandY)
+    const ir = Math.min(curBandR, nbBandR)
+    const ib = Math.min(curBandB, nbBandB)
+
+    if (ir <= ix || ib <= iy) continue
+
+    // Convert intersection to tile-local destination coordinates.
+    const dstX = ix - bandX
+    const dstY = iy - bandY
+    const w = ir - ix
+    const h = ib - iy
+
+    ctx.drawImage(bandCanvas, ix, iy, w, h, dstX, dstY, w, h)
+  }
+}
+
+/**
+ * Composite a tile input image with a softened planning guide in the blank region.
+ * Used by the tile modal preview; same treatment as the API composite.
+ *
+ * Pass `allTileSpecs` + `tileAccepted` and a live `bandCanvas` so that
+ * accepted-neighbour overlaps can be restored with high-res pixels after the
+ * plan guide is drawn.
+ */
+export function compositeTileInputWithPlanning(
+  inputImageUrl: string,
+  tileSpec: ExtensionTileSpec,
+  planningSlice: string,
+  bandCanvas?: HTMLCanvasElement | null,
+  allTileSpecs?: ExtensionTileSpec[],
+  tileAccepted?: boolean[],
+): Promise<string> {
+  return Promise.all([loadImageElement(inputImageUrl), loadImageElement(planningSlice)])
+    .then(([inputImg, sliceImg]) => {
+      const { tileWidth, tileHeight, blankRegion } = tileSpec
+      const composite = document.createElement('canvas')
+      composite.width = tileWidth
+      composite.height = tileHeight
+      const ctx = composite.getContext('2d')
+      if (!ctx) {
+        return planningSlice
+      }
+      ctx.drawImage(inputImg, 0, 0)
+      drawSoftenedPlanningGuide(ctx, sliceImg, blankRegion)
+      // Restore high-res pixels from accepted neighbours that overlap the blank region.
+      if (bandCanvas && allTileSpecs && tileAccepted) {
+        restoreAcceptedNeighbourOverlaps(ctx, bandCanvas, tileSpec, allTileSpecs, tileAccepted)
+      }
+      return composite.toDataURL('image/png')
+    })
+    .catch(() => planningSlice)
+}
+
+/**
+ * Build the composite IMAGE 1 sent to the Phase 3 refine API call.
+ *
+ * Layout:
+ *   - High-res context strip from the band canvas (preserved exactly).
+ *   - Softened low-res plan guide in the blank region (layout hint only).
+ *   - High-res pixels from accepted neighbour tiles restored on top of the
+ *     plan guide wherever they overlap the current tile's blank region
+ *     (e.g. the tile directly above in the same column).
  *
  * Falls back to the plain tile input if the planning slice fails to load.
  */
@@ -1932,6 +2069,8 @@ export function buildTileSliceComposite(
   bandCanvas: HTMLCanvasElement,
   tileSpec: ExtensionTileSpec,
   planningSlice: string,
+  allTileSpecs?: ExtensionTileSpec[],
+  tileAccepted?: boolean[],
 ): Promise<string> {
   return new Promise((resolve) => {
     const { bandX, bandY, tileWidth, tileHeight, blankRegion } = tileSpec
@@ -1945,20 +2084,23 @@ export function buildTileSliceComposite(
       return
     }
 
-    // Draw the full tile from the band canvas as the base layer.
-    // This gives us the high-res context strip and the grey blank area.
+    // Step 1: full tile from band canvas (context strip + real pixels from
+    // any accepted tiles that overlap, grey for everything else).
     ctx.drawImage(bandCanvas, bandX, bandY, tileWidth, tileHeight, 0, 0, tileWidth, tileHeight)
 
-    // Load the planning slice and draw it scaled into the blank region,
-    // replacing the grey pixels with the low-res composition preview.
     const sliceImg = new Image()
     sliceImg.onload = () => {
-      ctx.drawImage(
-        sliceImg,
-        0, 0, sliceImg.naturalWidth, sliceImg.naturalHeight,
-        blankRegion.x, blankRegion.y, blankRegion.width, blankRegion.height,
-      )
-      resolve(composite.toDataURL('image/jpeg', 0.95))
+      // Step 2: softened plan guide over the full blank region (overwrites
+      // any accepted-neighbour pixels that landed inside blankRegion).
+      drawSoftenedPlanningGuide(ctx, sliceImg, blankRegion)
+
+      // Step 3: restore accepted-neighbour overlaps with high-res pixels so
+      // the model sees real content where it is already available.
+      if (allTileSpecs && tileAccepted) {
+        restoreAcceptedNeighbourOverlaps(ctx, bandCanvas, tileSpec, allTileSpecs, tileAccepted)
+      }
+
+      resolve(composite.toDataURL('image/png'))
     }
     sliceImg.onerror = () => resolve(buildTileInput(bandCanvas, tileSpec))
     sliceImg.src = planningSlice
@@ -2000,7 +2142,7 @@ export function buildGlobalPlanningMap(
   imageHeight: number,
   contextSize: number,
   extensionSize: number,
-  maxDim = 512,
+  maxDim = 1024,
 ): Promise<{
   mapDataUrl: string
   mapWidth: number

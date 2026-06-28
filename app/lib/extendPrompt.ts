@@ -44,9 +44,10 @@ export interface BuildExtendPromptParams {
   referenceImages?: { description: string }[]
   /**
    * When true, IMAGE 1 is the baked tile-slice composite: the extension area
-   * already contains the low-resolution planning preview rather than solid
-   * grey. The prompt frames the task as rendering that low-res preview at full
-   * resolution, rather than free-form extension into grey space.
+   * already contains the low-resolution composition plan rather than solid
+   * grey. The prompt frames the task as rendering a sharp high-resolution
+   * version of that plan — same composition, full native detail — not a
+   * stylised or upscaled low-res look.
    *
    * User reference images follow immediately as IMAGE 2, 3, … — there is no
    * separate IMAGE slot for a planning guide.
@@ -178,7 +179,7 @@ export function buildExtendPrompt(params: BuildExtendPromptParams): string {
   const workingImage = hasExtras ? 'IMAGE 1' : 'this image'
   const layoutLabel = hasExtras ? 'IMAGE 1' : 'THIS IMAGE'
   const outputImage = hasBakedPlanning
-    ? (hasExtras ? 'IMAGE 1 with the extension area rendered at full resolution' : 'the complete image with the extension area rendered at full resolution')
+    ? (hasExtras ? 'IMAGE 1 with the extension area rendered as a sharp high-resolution version of the plan' : 'the complete image with the extension area rendered as a sharp high-resolution version of the plan')
     : (hasExtras ? 'IMAGE 1 with the gray area filled' : 'the complete image with the blank area filled')
 
   let prompt: string
@@ -212,19 +213,36 @@ CRITICAL: If you return ${workingImage} unchanged with the gray area still prese
       : 'right'
 
     if (hasBakedPlanning) {
-      // The extension area is pre-filled with a low-res planning preview.
-      // Frame the task as super-resolution of that preview, not free invention.
-      prompt = `${multiImagePreamble}You are an expert image renderer. You have been given a ${isHorizDir ? 'vertical' : 'horizontal'} strip${hasExtras ? ' (IMAGE 1)' : ''} where the extension area already contains a low-resolution composition preview.
+      // The extension area is pre-filled with a softened low-res composition plan.
+      // Frame the task as faithful high-resolution rendering of that plan.
+      prompt = `${multiImagePreamble}You are an expert image renderer. You have been given a ${isHorizDir ? 'vertical' : 'horizontal'} strip${hasExtras ? ' (IMAGE 1)' : ''} where the extension area contains a SOFTENED COMPOSITION PLAN — layout and colour guidance only, NOT the target look.
 
 PIXEL LAYOUT OF ${layoutLabel}:
-- ${contextSide.toUpperCase()} ${contextPx}px → HIGH-RESOLUTION existing scene content. Preserve these pixels EXACTLY — pixel-perfect, no changes whatsoever.
-- ${dirDesc.toUpperCase()} ${extPx}px → LOW-RESOLUTION composition preview showing the planned extension. Render this area at full resolution.
+- ${contextSide.toUpperCase()} ${contextPx}px → HIGH-RESOLUTION existing scene content. This is your STYLE REFERENCE. Preserve these pixels EXACTLY — pixel-perfect, no changes whatsoever.
+- ${dirDesc.toUpperCase()} ${extPx}px → SOFTENED composition plan (may look blurry or blocky). IGNORE its pixel structure. Your job is to render this area as a sharp high-resolution continuation of the ${contextSide} strip.
 
 YOUR TASK:
 1. Preserve EVERY pixel in the ${contextSide} ${contextPx}px high-resolution area exactly as-is — do not alter them in any way.
-2. Render the ${dirDesc} ${extPx}px area at full resolution: match the composition, subjects, spatial layout, and colour relationships shown in the low-resolution preview, but add the full detail, sharpness, and texture quality expected at native resolution.
-3. Match the colour palette, lighting direction, and atmosphere of the high-resolution portion exactly.
-4. Make the boundary between the high-resolution and rendered areas completely invisible — no seam, colour shift, or brightness jump.`
+2. Study the ${contextSide} high-resolution strip for rendering style: texture density, edge sharpness, colour depth, shading model, and level of realism. The extension MUST match this exactly.
+3. Render the ${dirDesc} ${extPx}px area using the plan ONLY for composition (where things go, general shapes, colour masses):
+   - Same subjects, spatial layout, and proportions as the plan.
+   - Full native-resolution detail, texture, and anti-aliasing matching the ${contextSide} strip.
+   - Do NOT copy the plan's blur, blockiness, flat colours, or simplified rendering.
+4. Make the boundary between the high-resolution and rendered areas completely invisible — no seam, colour shift, or brightness jump.
+
+STYLE AUTHORITY (critical):
+- The high-resolution ${contextSide} context strip is the SOLE authority for how the extension should look.
+- The plan defines WHAT to show, not HOW to render it.
+- Output must look like the same photograph, render, or artwork continued at full quality — as if captured at the same resolution as the context strip.
+
+FORBIDDEN OUTPUTS (unless the context strip already uses that exact style):
+- Cartoon, anime, chibi, or illustration-simplified rendering
+- Pixel art, 8-bit, 16-bit, or retro-game aesthetics
+- Flat shading, posterization, banding, or limited colour palettes
+- Visible upscaled blocks, chunky pixels, or mosaic artifacts
+- Clip-art, vector-icon, or children's-book simplification
+
+A result that looks like an upscaled, cartoonified, or pixelated version of the plan is a FAILURE.`
     } else {
       const movingDir =
         direction === 'down' ? 'downward (further below the current view)'
@@ -257,12 +275,16 @@ KEY INSTRUCTIONS:
 6. Preserve the exact style, quality, and atmosphere of the existing content`
   }
 
-  // Art style block
+  // Art style block — when rendering from a baked plan, never cartoonify;
+  // the high-res context strip always wins on fidelity.
   if (artStyle && ART_STYLE_DESCRIPTIONS[artStyle]) {
     prompt += `\n\n7. ARTISTIC STYLE: Create the extended area in ${ART_STYLE_DESCRIPTIONS[artStyle]}`
     prompt += `\n   - Apply this style consistently to the new content`
     prompt += `\n   - Ensure smooth transition from original to styled extension`
     prompt += `\n   - The style should blend naturally with the existing content at the boundary`
+    if (hasBakedPlanning) {
+      prompt += `\n   - Match the DETAIL LEVEL and rendering fidelity of the high-resolution context strip — do NOT simplify into cartoon or pixel-art aesthetics unless the context strip already uses them`
+    }
   }
 
   // Continuity constraints are always present, anchoring the extension to the
@@ -287,7 +309,11 @@ KEY INSTRUCTIONS:
     if (isChunked) {
       prompt += `\n   IMPORTANT - PARTIAL STRIP CONTEXT:`
       prompt += `\n   - You only see an edge strip, not the full image — extrapolate naturally from visible content`
-      prompt += `\n   - The user's request applies ONLY to the new ${direction === 'up' ? 'upper' : direction === 'down' ? 'lower' : direction === 'left' ? 'left' : 'right'} area (the light gray blank space)`
+      if (hasBakedPlanning) {
+        prompt += `\n   - The user's request applies ONLY to the ${dirDesc} extension area guided by the composition plan`
+      } else {
+        prompt += `\n   - The user's request applies ONLY to the new ${direction === 'up' ? 'upper' : direction === 'down' ? 'lower' : direction === 'left' ? 'left' : 'right'} area (the light gray blank space)`
+      }
       prompt += `\n   - Blend and integrate smoothly with the visible edge content`
       if (!artStyle) {
         prompt += `\n   - Maintain perfect style, color, and lighting consistency`
@@ -358,7 +384,7 @@ KEY INSTRUCTIONS:
         : chunkInfo.originalHeight
     const dimTarget = hasExtras ? 'IMAGE 1' : 'the input image'
     const fillInstruction = hasBakedPlanning
-      ? 'Render the extension area at full resolution.'
+      ? 'Render the extension area as a sharp high-resolution version of the composition plan — full native detail, not a stylised or upscaled low-res look.'
       : 'Fill every gray pixel in the blank area.'
     prompt += `\n\nOUTPUT DIMENSIONS: Return ${outputImage} at exactly ${chunkW}x${chunkH} pixels — the same dimensions as ${dimTarget}.${hasExtras ? ' Do NOT use the dimensions of any reference image.' : ''} ${fillInstruction} Do NOT return a different size or aspect ratio.`
 
@@ -490,7 +516,7 @@ export function buildGlobalPlanningPrompt(params: BuildGlobalPlanningPromptParam
 `
     : ''
 
-  let prompt = `${preamble}EXTENSION PLAN — LOW-RESOLUTION SKETCH PASS.
+  let prompt = `${preamble}EXTENSION PLAN — LOW-RESOLUTION COMPOSITION PASS.
 
 The WORKING CANVAS shows the full scene: the original source image with the extension area on the ${dirLabel} filled with solid GREY (#B0B0B0). Any non-grey content in the extension area represents already-accepted tiles — preserve those exactly.
 
@@ -504,10 +530,15 @@ YOUR TASK:
 3. Return the image at the SAME pixel dimensions as the input.
 
 COMPOSITION RULES:
-- This is a low-resolution planning sketch — focus on correct layout, tonal composition, and subject placement over fine detail.
+- Match the EXACT visual style of the source image: same realism level, colour rendering, shading, and art medium. This output is a smaller-resolution version of the same scene — NOT a new art style.
 - Continue the existing scene naturally: same horizon line, lighting direction, atmosphere, and scale.
 - If the grey area spans multiple columns or rows of tiles, treat the whole grey region as one unified fill target and ensure internal coherence.
-- Do not leave any grey (#B0B0B0) pixels unchanged — a fully grey output is a FAILURE.`
+- Do not leave any grey (#B0B0B0) pixels unchanged — a fully grey output is a FAILURE.
+
+STYLE RULES (critical):
+- Do NOT simplify into cartoon, anime, pixel art, 8-bit, flat-shaded, or clip-art aesthetics unless the source image already uses that exact style.
+- Preserve continuous tones, natural textures, and the same colour depth as the source — even at this lower resolution.
+- Focus on correct layout and tonal composition; avoid hard outlines, posterized colour bands, and blocky simplified forms.`
 
   if (artStyle && ART_STYLE_DESCRIPTIONS[artStyle]) {
     prompt += `\n\nARTISTIC STYLE: ${ART_STYLE_DESCRIPTIONS[artStyle]}.`

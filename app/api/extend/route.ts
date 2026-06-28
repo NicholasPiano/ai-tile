@@ -200,7 +200,11 @@ export async function POST(request: NextRequest) {
         model: modelId,
         messages: [{ role: 'user', content }],
         max_tokens: 2000,
-        temperature: attempt === 0 ? 0.3 : attempt === 1 ? 0.5 : 0.7,
+        temperature: phase === 'plan'
+          ? 0.3
+          : hasBakedPlanning
+          ? (attempt === 0 ? 0.45 : attempt === 1 ? 0.55 : 0.65)
+          : (attempt === 0 ? 0.3 : attempt === 1 ? 0.5 : 0.7),
       }),
     })
 

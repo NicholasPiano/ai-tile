@@ -59,6 +59,12 @@ export const TILE_OVERLAP_PX = 384
  */
 export const MAX_TILES_PER_EXTEND = 24
 
+/**
+ * Longest edge of the global/per-tile planning map sent to Phase 1/2.
+ * Higher values preserve more detail in the plan but cost more tokens.
+ */
+export const PLANNING_MAP_MAX_DIM = 1024
+
 // ─────────────────────────────────────────────────────────────────────────────
 // OpenRouter integration — BYOK (bring your own key) for open-source friendliness
 // ─────────────────────────────────────────────────────────────────────────────

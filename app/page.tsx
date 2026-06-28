@@ -11,7 +11,7 @@ import { TileStudio } from '@/app/components/TileStudio'
 import { TopBar } from '@/app/components/TopBar'
 import { ResultActions, VariantSelector } from '@/app/components/VariantSelector'
 import { Workspace, TilingState, TileCellDisplay } from '@/app/components/Workspace'
-import { Candidate, Direction, EXTENSION_PERCENT, MAX_AI_DIMENSION, MAX_TILES_PER_EXTEND, Mode, ReferenceImage, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, TILE_OVERLAP_PX } from '@/app/lib/app'
+import { Candidate, Direction, EXTENSION_PERCENT, MAX_AI_DIMENSION, MAX_TILES_PER_EXTEND, Mode, PLANNING_MAP_MAX_DIM, ReferenceImage, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, TILE_OVERLAP_PX } from '@/app/lib/app'
 import { findStyleLabel } from '@/app/lib/artStyles'
 import { DEFAULT_MODEL, MODELS, getModelConfig, skipsArtDirectorReview } from '@/app/lib/models'
 import { LAYER_ORDER, LAYER_ROLES, LayerRole, PARALLAX_MAX_AUTO_STEPS, ParallaxLayer, WORKFLOW_ORDER, createDefaultLayers, getRecommendedLayerIndex, getWorkflowPrerequisite } from '@/app/lib/parallax'
@@ -1015,7 +1015,13 @@ export default function Home() {
       // receives a high-res context strip with the low-res plan overlaid on
       // the blank region.  Without a guide, fall back to the plain tile strip.
       const tileCanvas = planningGuide
-        ? await buildTileSliceComposite(canvas, tileSpec, planningGuide)
+        ? await buildTileSliceComposite(
+            canvas,
+            tileSpec,
+            planningGuide,
+            plan.nonSkippedTileSpecs,
+            plan.tileAccepted,
+          )
         : buildTileInput(canvas, tileSpec)
 
       let raw = await normaliseTileResult(await callApi(tileCanvas, {
@@ -1181,6 +1187,7 @@ export default function Home() {
         plan.imageHeight,
         plan.contextSize,
         plan.extensionSize,
+        PLANNING_MAP_MAX_DIM,
       )
 
       const effectivePrompt = customPrompt.trim() || undefined
@@ -4630,6 +4637,8 @@ export default function Home() {
             isNextPending={getNextPendingTileIdx(plan.tileAccepted) === nsIdx}
             isGenerating={plan.generatingTileIdx === nsIdx}
             bandCanvas={bandCanvasRef.current}
+            allTileSpecs={plan.nonSkippedTileSpecs}
+            tileAccepted={plan.tileAccepted}
             tileReferenceImages={plan.tileReferenceImages[nsIdx] ?? []}
             onSetTilePrompt={(v) =>
               setPendingTiledPlan((prev) => {

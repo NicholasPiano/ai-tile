@@ -4,7 +4,7 @@ import React, { useEffect, useRef, useState } from 'react'
 import { Icons } from '@/app/components/icons'
 import { ART_STYLE_GROUPS } from '@/app/lib/artStyles'
 import { buildExtendPrompt, buildGlobalPlanningPrompt } from '@/app/lib/extendPrompt'
-import { buildTileChunkInfo, buildTileInput, ExtensionTileSpec } from '@/app/utils/imageProcessor'
+import { buildTileChunkInfo, buildTileInput, compositeTileInputWithPlanning, ExtensionTileSpec } from '@/app/utils/imageProcessor'
 import { MODELS, maskKey } from '@/app/lib/models'
 import { Direction, ReferenceImage } from '@/app/lib/app'
 
@@ -1142,6 +1142,10 @@ export interface TileExtensionModalProps {
   isGenerating: boolean
   /** Band canvas needed to build the tile input image preview. */
   bandCanvas: HTMLCanvasElement | null
+  /** All non-skipped tile specs — needed to restore accepted-neighbour overlaps. */
+  allTileSpecs: ExtensionTileSpec[]
+  /** Per non-skipped tile accepted flags — same purpose as allTileSpecs. */
+  tileAccepted: boolean[]
   /** User-supplied reference images for this tile. */
   tileReferenceImages: ReferenceImage[]
   onSetTilePrompt: (v: string) => void
@@ -1172,6 +1176,8 @@ export function TileExtensionModal({
   isNextPending,
   isGenerating,
   bandCanvas,
+  allTileSpecs,
+  tileAccepted,
   tileReferenceImages,
   onSetTilePrompt,
   onSetTileReferenceImages,
@@ -1205,9 +1211,8 @@ export function TileExtensionModal({
     }
   }, [open, bandCanvas, tileSpec])
 
-  // Build the tile-slice composite: INPUT image with the grey blankRegion
-  // replaced by the low-res planning slice, scaled to fit that region.
-  // Result has the same pixel dimensions as the INPUT image.
+  // Build the tile-slice composite: INPUT with a softened planning guide in the
+  // blank region (same treatment as the API composite).
   useEffect(() => {
     if (!inputImageUrl || !planningSlice) {
       setTileSliceUrl(null)
@@ -1216,40 +1221,9 @@ export function TileExtensionModal({
 
     let cancelled = false
 
-    /** Load an image from a data URL and resolve once it is fully decoded. */
-    const loadImage = (src: string): Promise<HTMLImageElement> =>
-      new Promise((resolve, reject) => {
-        const img = new Image()
-        img.onload = () => resolve(img)
-        img.onerror = () => reject(new Error('Image load failed'))
-        img.src = src
-      })
-
-    Promise.all([loadImage(inputImageUrl), loadImage(planningSlice)])
-      .then(([inputImg, sliceImg]) => {
-        if (cancelled) return
-
-        const { tileWidth, tileHeight, blankRegion } = tileSpec
-        const composite = document.createElement('canvas')
-        composite.width  = tileWidth
-        composite.height = tileHeight
-        const ctx = composite.getContext('2d')
-        if (!ctx) {
-          setTileSliceUrl(planningSlice)
-          return
-        }
-
-        // Draw the full INPUT (context strip + grey blank area) as the base.
-        ctx.drawImage(inputImg, 0, 0)
-
-        // Scale the planning slice to cover exactly the grey blank region.
-        ctx.drawImage(
-          sliceImg,
-          0, 0, sliceImg.naturalWidth, sliceImg.naturalHeight,
-          blankRegion.x, blankRegion.y, blankRegion.width, blankRegion.height,
-        )
-
-        setTileSliceUrl(composite.toDataURL('image/jpeg', 0.9))
+    compositeTileInputWithPlanning(inputImageUrl, tileSpec, planningSlice, bandCanvas, allTileSpecs, tileAccepted)
+      .then((url) => {
+        if (!cancelled) setTileSliceUrl(url)
       })
       .catch(() => {
         if (!cancelled) setTileSliceUrl(planningSlice)
