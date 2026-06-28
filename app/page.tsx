@@ -19,7 +19,7 @@ import { PROP_BATCH, PROP_BATCH_COLS, PROP_BATCH_H, PROP_BATCH_ROWS, PROP_BATCH_
 import { SPRITE_ANIMATIONS, SPRITE_FRAME_COUNT, SPRITE_FRAME_SIZE, SPRITE_GRID_COLS, SPRITE_GRID_ROWS, SPRITE_SHEET_H, SPRITE_SHEET_W, SPRITE_STRIP_H, SPRITE_STRIP_W, SpriteAnimType, SpriteFrame, SpriteSheet, createEmptySpriteSheet } from '@/app/lib/sprite'
 import { BODY_PLANS, BodyPlan, isAirborneAnim } from '@/app/lib/bodyPlans'
 import { CORNER_GRAFTS, ENABLE_CORNER_RECONCILE, TILESET_ATLAS_EXTRUDE_PX, TILESET_BY_ROLE, TILESET_COLS, TILESET_PADDED_SHEET_H, TILESET_PADDED_SHEET_W, TILESET_PADDED_STRIDE, TILESET_ROWS, TILESET_SHEET_H, TILESET_SHEET_W, TILESET_SLOTS, TILESET_TILE_SIZE, TILE_TEMPLATE_CELL, TILE_TEMPLATE_COLS, TILE_TEMPLATE_H, TILE_TEMPLATE_MASK, TILE_TEMPLATE_ROWS, TILE_TEMPLATE_SAMPLES, TILE_TEMPLATE_W, TileSetRole, TileSetSlot, alignAiOutputToTemplate, applyFeatheredRoleMask, buildTileSheetGuideDataUrl, createEmptyTileSet, rebuildCornerTile, reconcileAllCorners, templateRoleForCell } from '@/app/lib/tileset'
-import { alignSpriteFramesToBaseline, applyFullContextResult, buildTileChunkInfo, buildTileInput, buildTileSliceComposite, buildTilePlanningMap, centerSpriteFramesHorizontally, ChunkInfo, chromaKeyToAlpha, compositeTileResult, createChunkedExtension, createFullContextExtension, cropPlanningResult, ExtensionTileSpec, getChunkAlign, getImageDimensions, harmonizeHorizontalSeams, initBandCanvas, isolatePrimarySpriteComponent, isAiExtensionUnfilled, isTileResultUnfilled, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, measureSeamResidual, normalizeImageToSize, normalizeSpriteFrameScale, planExtensionTiles, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk, TiledExtensionPlan } from '@/app/utils/imageProcessor'
+import { alignSpriteFramesToBaseline, applyFullContextResult, buildGlobalPlanningMap, buildPerTilePlanningMap, buildTileChunkInfo, buildTileInput, buildTileSliceComposite, buildTilePlanningMap, centerSpriteFramesHorizontally, ChunkInfo, chromaKeyToAlpha, compositeTileResult, createChunkedExtension, createFullContextExtension, cropGlobalPlanExtensionView, cropPlanningResult, ExtensionTileSpec, getChunkAlign, getImageDimensions, harmonizeHorizontalSeams, initBandCanvas, isolatePrimarySpriteComponent, isAiExtensionUnfilled, isTileResultUnfilled, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, measureSeamResidual, normalizeImageToSize, normalizeSpriteFrameScale, PlanTileRegion, planExtensionTiles, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk, TiledExtensionPlan } from '@/app/utils/imageProcessor'
 import { SubjectBounds, drawPoseGuideSheet, measureSubjectBounds } from '@/app/utils/poseRig'
 import JSZip from 'jszip'
 
@@ -91,11 +91,10 @@ export default function Home() {
     tilePrompts: string[]
     /** Per non-skipped tile: result data URL after API call, or null. */
     tilePreviews: (string | null)[]
-    /** Per non-skipped tile: phase-1 planning result data URL, or null. */
-    tilePlanningPreviews: (string | null)[]
-    /** Per non-skipped tile: planning map (full scene + red/grey overlays) sent to phase 1, or null. */
-    tilePlanningMaps: (string | null)[]
-    /** Per non-skipped tile: cropped tile-region slice of the plan result sent to phase 2, or null. */
+    /**
+     * Per non-skipped tile: per-tile plan override slice (Phase 2 re-plan result).
+     * null = derive slice from the global plan; non-null = use this override.
+     */
     tilePlanningSlices: (string | null)[]
     /** Per non-skipped tile: whether the user has accepted the generated result. */
     tileAccepted: boolean[]
@@ -103,8 +102,32 @@ export default function Home() {
     tileReferenceImages: ReferenceImage[][]
     /** Non-skipped index of the tile currently being generated, or null. */
     generatingTileIdx: number | null
-    /** True when the in-flight generation is a plan-only (phase 1 only) run. */
+    /** True when the in-flight generation is a plan-only per-tile re-run (Phase 2). */
     generatingPlanOnly: boolean
+    // ── Global plan (Phase 1) ────────────────────────────────────────────────
+    /** Full-scene planning map image sent to Phase 1, or null if not yet run. */
+    globalPlanningMap: string | null
+    /** Filled low-res plan result covering the entire extension area, or null. */
+    globalPlanResult: string | null
+    /**
+     * Extension-zone crop of globalPlanResult — sized to match the band viewport.
+     * Used as the tiling band background (no CSS offset math needed).
+     */
+    globalPlanExtensionView: string | null
+    /** Map-scale crop rects for each non-skipped tile's blank region. */
+    globalTileRegions: PlanTileRegion[]
+    /**
+     * Pre-cropped per-tile slices from the global plan result.
+     * null = global plan not yet available for this tile.
+     * Non-null = ready to use as the planning slice for Phase 3.
+     */
+    globalTilePlanSlices: (string | null)[]
+    /** Width of the global plan image in pixels (needed to normalise re-plan results). */
+    globalPlanWidth: number
+    /** Height of the global plan image in pixels. */
+    globalPlanHeight: number
+    /** True while Phase 1 (global plan) is in flight. */
+    isGlobalPlanGenerating: boolean
   }
 
   const [pendingTiledPlan, setPendingTiledPlan] = useState<PendingTiledPlan | null>(null)
@@ -122,6 +145,12 @@ export default function Home() {
   /** Running band canvas — seeded from the source image context strip in
    * handleExtend and updated by compositeTileResult after each accepted tile. */
   const bandCanvasRef = useRef<HTMLCanvasElement | null>(null)
+
+  /**
+   * Ref to `generateGlobalPlan` so `startTiledPlan` (zero-dep useCallback)
+   * can call the latest version without a stale closure.
+   */
+  const generateGlobalPlanRef = useRef<((direction: Direction) => Promise<void>) | null>(null)
 
   /** Non-skipped index of the tile whose modal is currently open, or null. */
   const [activeTileModalIdx, setActiveTileModalIdx] = useState<number | null>(null)
@@ -870,7 +899,7 @@ export default function Home() {
     const { direction, nonSkippedCount, layerRole } = plan
     const chunkInfo = buildTileChunkInfo(tileSpec, direction, nsIdx, nonSkippedCount)
 
-    // Two-phase only makes sense when there are multiple tiles AND the layer is
+    // Three-phase only applies when there are multiple tiles AND the layer is
     // not magenta-keyed (coloured map + magenta would confuse the model).
     const isKeyedLayer = !!layerRole && layerRole !== 'sky'
     const useTwoPhase = nonSkippedCount > 1 && !isKeyedLayer
@@ -885,8 +914,6 @@ export default function Home() {
         phase?: 'plan' | 'refine'
         /** True when expandedCanvas is the composite tile slice (planning baked in). */
         bakedPlanning?: boolean
-        planningTileIndex?: number
-        planningTileCount?: number
         populatedRefs: Array<{ dataUrl: string; description: string }>
         effectivePrompt: string | undefined
       }
@@ -909,8 +936,6 @@ export default function Home() {
           referenceImages: opts.populatedRefs.length > 0 ? opts.populatedRefs : undefined,
           phase: opts.phase,
           bakedPlanning: opts.bakedPlanning ?? false,
-          planningTileIndex: opts.planningTileIndex,
-          planningTileCount: opts.planningTileCount,
         }),
       })
       const data = await response.json() as { imageUrl?: string; error?: string }
@@ -935,74 +960,60 @@ export default function Home() {
       let planningGuide: string | undefined
 
       if (useTwoPhase) {
-        // Reuse an existing plan slice if one is already stored for this tile —
-        // the user may have run Re-plan separately or this is a retry after a
-        // failed phase-2 call.  Only re-run phase 1 when no slice is present.
-        // When planOnly = true the user explicitly wants to re-run phase 1, so
-        // always bypass the cache in that case.
-        const existingSlice = planOnly
-          ? null
-          : (pendingTiledPlanRef.current?.tilePlanningSlices[nsIdx] ?? null)
+        if (planOnly) {
+          // ── Phase 2: per-tile plan re-run (user clicked "Re-plan tile") ────────
+          // Build a per-tile planning map from the global plan result by greying
+          // out just this tile's region, then call the API, and store the slice.
+          const currentPlan = pendingTiledPlanRef.current
+          const globalPlanResult = currentPlan?.globalPlanResult ?? null
+          const globalTileRegions = currentPlan?.globalTileRegions ?? []
+          const globalPlanWidth   = currentPlan?.globalPlanWidth ?? 0
+          const globalPlanHeight  = currentPlan?.globalPlanHeight ?? 0
+          const tileRegion = globalTileRegions[nsIdx]
 
-        if (existingSlice) {
-          planningGuide = existingSlice
-        } else {
-          // Phase 1 — planning map (full source image + tile colour overlays)
-          const { mapDataUrl, mapWidth, mapHeight, tileRegionInMap } = await buildTilePlanningMap(
-            plan.sourceImage,
-            canvas,
-            plan.nonSkippedTileSpecs,
-            tileSpec,
-            plan.tileAccepted,
-            direction,
-            plan.imageWidth,
-            plan.imageHeight,
-            plan.contextSize,
-            plan.extensionSize,
-          )
+          if (!globalPlanResult || !tileRegion || tileRegion.width === 0) {
+            // No global plan yet — cannot do per-tile re-plan; release lock.
+            setPendingTiledPlan((prev) =>
+              prev ? { ...prev, generatingTileIdx: null, generatingPlanOnly: false } : null
+            )
+            return
+          }
 
-          const rawPlan = await callApi(mapDataUrl, {
+          const perTileMap = await buildPerTilePlanningMap(globalPlanResult, tileRegion)
+
+          const rawRePlan = await callApi(perTileMap, {
             phase: 'plan',
             populatedRefs,
             effectivePrompt,
-            planningTileIndex: nsIdx,
-            planningTileCount: nonSkippedCount,
           })
 
-          // Normalize the full planning result to exact map dimensions.
-          const normalizedPlan = await normalizeImageToSize(rawPlan, mapWidth, mapHeight)
+          const normalizedRePlan = await normalizeImageToSize(rawRePlan, globalPlanWidth, globalPlanHeight)
+          const tileSlice = await cropPlanningResult(normalizedRePlan, tileRegion)
 
-          // Crop to just the tile's blank region for phase 2 — phase 2 works
-          // with the tile strip, so only the corresponding composition slice is
-          // relevant.  The full result is kept separately for the UI preview.
-          planningGuide = await cropPlanningResult(normalizedPlan, tileRegionInMap)
-
-          // Store all three new data URLs together:
-          //   tilePlanningMaps     → the planning map sent to phase 1 (step 3)
-          //   tilePlanningPreviews → the full phase-1 result (step 4)
-          //   tilePlanningSlices   → the cropped tile region sent to phase 2 (step 5)
           setPendingTiledPlan((prev) => {
             if (!prev) return null
-            const maps    = [...prev.tilePlanningMaps];    maps[nsIdx]    = mapDataUrl
-            const results = [...prev.tilePlanningPreviews]; results[nsIdx] = normalizedPlan
-            const slices  = [...prev.tilePlanningSlices];  slices[nsIdx]  = planningGuide as string
-            return { ...prev, tilePlanningMaps: maps, tilePlanningPreviews: results, tilePlanningSlices: slices }
+            const slices = [...prev.tilePlanningSlices]
+            slices[nsIdx] = tileSlice
+            return { ...prev, tilePlanningSlices: slices, generatingTileIdx: null, generatingPlanOnly: false }
           })
-        }
-
-        // Plan-only run — skip phase 2 and release the generating lock.
-        if (planOnly) {
-          setPendingTiledPlan((prev) =>
-            prev ? { ...prev, generatingTileIdx: null, generatingPlanOnly: false } : null
-          )
           return
         }
+
+        // ── Phase 3: high-res tile generation ───────────────────────────────────
+        // Derive the effective planning slice for this tile:
+        //   1. Per-tile override (tilePlanningSlices[nsIdx]) if the user re-planned.
+        //   2. Pre-cropped global plan slice (globalTilePlanSlices[nsIdx]).
+        //   3. null = no planning guide available yet.
+        const currentPlan = pendingTiledPlanRef.current
+        const perTileSlice  = currentPlan?.tilePlanningSlices[nsIdx] ?? null
+        const globalSlice   = currentPlan?.globalTilePlanSlices[nsIdx] ?? null
+        planningGuide = perTileSlice ?? globalSlice ?? undefined
       }
 
-      // Phase 2 (or single-phase) — full-res refinement.
-      // When a planning guide exists, bake it into IMAGE 1 so the model
-      // receives a single canvas: high-res context strip + low-res extension
-      // preview.  Without a planning guide, fall back to the plain tile strip.
+      // ── Phase 3 (or single-phase): full-res tile generation ─────────────────
+      // When a planning guide is available, bake it into IMAGE 1: the model
+      // receives a high-res context strip with the low-res plan overlaid on
+      // the blank region.  Without a guide, fall back to the plain tile strip.
       const tileCanvas = planningGuide
         ? await buildTileSliceComposite(canvas, tileSpec, planningGuide)
         : buildTileInput(canvas, tileSpec)
@@ -1135,6 +1146,126 @@ export default function Home() {
   }, [])
 
   /**
+   * Phase 1 — Generate the global low-resolution plan for the entire extension.
+   *
+   * Builds a full-scene planning map (source image + grey extension area),
+   * sends it to the API with phase='plan', normalises the result, then crops
+   * one slice per tile and stores everything in plan state.
+   *
+   * Re-runnable at any time via "Re-run Global Plan". Resets per-tile overrides
+   * so they stay consistent with the new plan.
+   */
+  const generateGlobalPlan = useCallback(async (direction: Direction) => {
+    const plan = pendingTiledPlanRef.current
+    if (!plan) return
+
+    const canvas = bandCanvasRef.current
+    if (!canvas) return
+
+    // Global plan only applies to multi-tile non-keyed extensions.
+    const isKeyedLayer = !!plan.layerRole && plan.layerRole !== 'sky'
+    if (plan.nonSkippedCount <= 1 || isKeyedLayer) return
+
+    setPendingTiledPlan((prev) =>
+      prev ? { ...prev, isGlobalPlanGenerating: true } : null
+    )
+
+    try {
+      const { mapDataUrl, mapWidth, mapHeight, tileRegionsInMap } = await buildGlobalPlanningMap(
+        plan.sourceImage,
+        canvas,
+        plan.nonSkippedTileSpecs,
+        plan.tileAccepted,
+        direction,
+        plan.imageWidth,
+        plan.imageHeight,
+        plan.contextSize,
+        plan.extensionSize,
+      )
+
+      const effectivePrompt = customPrompt.trim() || undefined
+      const response = await fetch('/api/extend', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          expandedCanvas: mapDataUrl,
+          direction,
+          extensionAmount: EXTENSION_PERCENT,
+          customPrompt: effectivePrompt,
+          artStyle: artStyle !== 'none' ? artStyle : undefined,
+          apiKey: apiKey || undefined,
+          model: selectedModel,
+          layerRole: plan.layerRole,
+          sceneBrief: mode === 'parallax' && sceneBrief.trim() ? sceneBrief.trim() : undefined,
+          phase: 'plan',
+        }),
+      })
+      const data = await response.json() as { imageUrl?: string; error?: string }
+      if (!response.ok) {
+        const err = new Error(data.error || 'Global plan API call failed') as Error & { status?: number }
+        err.status = response.status
+        throw err
+      }
+
+      const rawResult = data.imageUrl as string
+      // Normalise to exact planning-map dimensions so crop coordinates are accurate.
+      const normalizedResult = await normalizeImageToSize(rawResult, mapWidth, mapHeight)
+
+      // Pre-crop each tile's slice from the global plan result.
+      const globalTilePlanSlices = await Promise.all(
+        tileRegionsInMap.map((region) =>
+          region.width === 0 || region.height === 0
+            ? Promise.resolve(null)
+            : cropPlanningResult(normalizedResult, region)
+        )
+      )
+
+      // Crop the extension-only view for the tiling band background.
+      const globalPlanExtensionView = await cropGlobalPlanExtensionView(
+        normalizedResult,
+        mapWidth,
+        mapHeight,
+        direction,
+        plan.imageWidth,
+        plan.imageHeight,
+        plan.extensionSize,
+      )
+
+      setPendingTiledPlan((prev) => {
+        if (!prev) return null
+        return {
+          ...prev,
+          globalPlanningMap: mapDataUrl,
+          globalPlanResult: normalizedResult,
+          globalPlanExtensionView,
+          globalTileRegions: tileRegionsInMap,
+          globalTilePlanSlices,
+          globalPlanWidth: mapWidth,
+          globalPlanHeight: mapHeight,
+          // Reset per-tile overrides so they match the new plan baseline.
+          tilePlanningSlices: new Array<string | null>(prev.nonSkippedCount).fill(null),
+          isGlobalPlanGenerating: false,
+        }
+      })
+    } catch (err) {
+      const e = err as Error & { status?: number }
+      setError(e.message || 'Global plan generation failed')
+      if (e.status === 401) {
+        setApiKeyRequired(true)
+        setShowApiKeyModal(true)
+      }
+      setPendingTiledPlan((prev) =>
+        prev ? { ...prev, isGlobalPlanGenerating: false } : null
+      )
+    }
+  }, [apiKey, selectedModel, mode, sceneBrief, customPrompt, artStyle])
+
+  // Keep the ref in sync so startTiledPlan (zero-dep useCallback) can call it.
+  useEffect(() => {
+    generateGlobalPlanRef.current = generateGlobalPlan
+  }, [generateGlobalPlan])
+
+  /**
    * Resolve which image (and which layer role, if any) the next extension
    * should operate on. In parallax mode the source is the active layer's
    * raw (un-keyed) image so the AI sees the magenta key consistently; in
@@ -1238,17 +1369,30 @@ export default function Home() {
       imageHeight: dims.height,
       tilePrompts: new Array<string>(nonSkippedCount).fill(''),
       tilePreviews: new Array<string | null>(nonSkippedCount).fill(null),
-      tilePlanningPreviews: new Array<string | null>(nonSkippedCount).fill(null),
-      tilePlanningMaps: new Array<string | null>(nonSkippedCount).fill(null),
       tilePlanningSlices: new Array<string | null>(nonSkippedCount).fill(null),
       tileAccepted: new Array<boolean>(nonSkippedCount).fill(false),
       tileReferenceImages: Array.from({ length: nonSkippedCount }, () => [] as ReferenceImage[]),
       generatingTileIdx: null,
       generatingPlanOnly: false,
+      globalPlanningMap: null,
+      globalPlanResult: null,
+      globalPlanExtensionView: null,
+      globalTileRegions: [],
+      globalTilePlanSlices: new Array<string | null>(nonSkippedCount).fill(null),
+      globalPlanWidth: 0,
+      globalPlanHeight: 0,
+      isGlobalPlanGenerating: false,
     }
 
     pendingTiledPlanRef.current = newPlan
     setPendingTiledPlan(newPlan)
+
+    // Kick off Phase 1 (global plan) immediately for multi-tile, non-keyed extensions.
+    // Uses a ref to avoid stale closures in this zero-dep useCallback.
+    const isKeyedLayerCheck = !!layerRole && layerRole !== 'sky'
+    if (nonSkippedCount > 1 && !isKeyedLayerCheck) {
+      void generateGlobalPlanRef.current?.(direction)
+    }
   }, [])
 
   const handleExtend = async (direction: Direction) => {
@@ -4403,11 +4547,19 @@ export default function Home() {
                   tileAccepted: pendingTiledPlan.tileAccepted,
                   generatingTileIdx: pendingTiledPlan.generatingTileIdx,
                   nextPendingTileIdx: getNextPendingTileIdx(pendingTiledPlan.tileAccepted),
+                  globalPlanResult: pendingTiledPlan.globalPlanResult,
+                  globalPlanExtensionView: pendingTiledPlan.globalPlanExtensionView,
+                  isGlobalPlanGenerating: pendingTiledPlan.isGlobalPlanGenerating,
                 } satisfies TilingState)
               : null
           }
           onTileClick={(nsIdx) => setActiveTileModalIdx(nsIdx)}
           onTileCancel={cancelTiledPlan}
+          onRerunGlobalPlan={
+            pendingTiledPlan
+              ? () => void generateGlobalPlan(pendingTiledPlan.direction)
+              : undefined
+          }
         />
       )}
 
@@ -4470,10 +4622,11 @@ export default function Home() {
             sceneBrief={mode === 'parallax' ? sceneBrief : undefined}
             nonSkippedCount={plan.nonSkippedCount}
             preview={plan.tilePreviews[nsIdx] ?? null}
-            planningPreview={plan.tilePlanningPreviews[nsIdx] ?? null}
-            sourceImage={plan.sourceImage}
-            planningMap={plan.tilePlanningMaps[nsIdx] ?? null}
-            planningSlice={plan.tilePlanningSlices[nsIdx] ?? null}
+            planningSlice={
+              plan.tilePlanningSlices[nsIdx]
+              ?? plan.globalTilePlanSlices[nsIdx]
+              ?? null
+            }
             isNextPending={getNextPendingTileIdx(plan.tileAccepted) === nsIdx}
             isGenerating={plan.generatingTileIdx === nsIdx}
             bandCanvas={bandCanvasRef.current}

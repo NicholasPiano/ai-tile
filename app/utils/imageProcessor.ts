@@ -1965,8 +1965,183 @@ export function buildTileSliceComposite(
   })
 }
 
-/** Red used for future-tile regions on the planning map. */
+/** Red used for future-tile regions on the legacy per-tile planning map. */
 const PLANNING_MAP_FUTURE_COLOR = '#FF0000'
+
+// ─── Tile-region rect type ────────────────────────────────────────────────────
+
+export interface PlanTileRegion {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+/**
+ * Build a scaled-down planning map for the GLOBAL extension plan (Phase 1).
+ *
+ * Unlike the legacy per-tile planning map, this version:
+ *   - Paints the ENTIRE extension zone grey (#B0B0B0) — no red future-tile markers.
+ *   - Already-accepted tile regions show their real pixels from the band canvas.
+ *   - Returns `tileRegionsInMap`: one crop-rect per non-skipped tile spec, in
+ *     map-scale coordinates, so each tile's portion of the plan result can be
+ *     cropped out by the caller.
+ *
+ * The full scene (source image + extension area) is scaled to fit within
+ * `maxDim` on the longest edge, matching the legacy function's behaviour.
+ */
+export function buildGlobalPlanningMap(
+  sourceImageDataUrl: string,
+  bandCanvas: HTMLCanvasElement,
+  allTileSpecs: ExtensionTileSpec[],
+  acceptedMask: boolean[],
+  direction: 'up' | 'down' | 'left' | 'right',
+  imageWidth: number,
+  imageHeight: number,
+  contextSize: number,
+  extensionSize: number,
+  maxDim = 512,
+): Promise<{
+  mapDataUrl: string
+  mapWidth: number
+  mapHeight: number
+  tileRegionsInMap: PlanTileRegion[]
+}> {
+  return new Promise((resolve) => {
+    const fallback = (w: number, h: number) => ({
+      mapDataUrl: bandCanvas.toDataURL('image/jpeg', 0.85),
+      mapWidth: w,
+      mapHeight: h,
+      tileRegionsInMap: allTileSpecs.map(() => ({ x: 0, y: 0, width: w, height: h })),
+    })
+
+    const srcImg = new Image()
+    srcImg.onload = () => {
+      const isVertical = direction === 'down' || direction === 'up'
+      const sceneW = isVertical ? imageWidth : imageWidth + extensionSize
+      const sceneH = isVertical ? imageHeight + extensionSize : imageHeight
+
+      const srcOffsetX = direction === 'left' ? extensionSize : 0
+      const srcOffsetY = direction === 'up'   ? extensionSize : 0
+      const extOffsetX = direction === 'right' ? imageWidth  : 0
+      const extOffsetY = direction === 'down'  ? imageHeight : 0
+
+      const bandToSceneX = (bx: number): number => {
+        if (direction === 'right') return (imageWidth  - contextSize) + bx
+        if (direction === 'left')  return (extensionSize - contextSize) + bx
+        return bx
+      }
+      const bandToSceneY = (by: number): number => {
+        if (direction === 'down') return (imageHeight - contextSize) + by
+        if (direction === 'up')   return (extensionSize - contextSize) + by
+        return by
+      }
+
+      const scale = Math.min(1, maxDim / Math.max(sceneW, sceneH))
+      const outW  = Math.max(1, Math.round(sceneW * scale))
+      const outH  = Math.max(1, Math.round(sceneH * scale))
+
+      const map = document.createElement('canvas')
+      map.width  = outW
+      map.height = outH
+      const ctx = map.getContext('2d')
+      if (!ctx) {
+        resolve(fallback(outW, outH))
+        return
+      }
+
+      const extSceneW = isVertical ? imageWidth    : extensionSize
+      const extSceneH = isVertical ? extensionSize : imageHeight
+      const extSX = Math.round(extOffsetX * scale)
+      const extSY = Math.round(extOffsetY * scale)
+      const extSW = Math.max(1, Math.round(extSceneW * scale))
+      const extSH = Math.max(1, Math.round(extSceneH * scale))
+
+      // Step 1: source image
+      ctx.drawImage(
+        srcImg, 0, 0, imageWidth, imageHeight,
+        Math.round(srcOffsetX * scale), Math.round(srcOffsetY * scale),
+        Math.max(1, Math.round(imageWidth  * scale)),
+        Math.max(1, Math.round(imageHeight * scale)),
+      )
+
+      // Step 2: paint the ENTIRE extension zone grey (no red)
+      ctx.fillStyle = EXTENSION_BLANK_COLOR
+      ctx.fillRect(extSX, extSY, extSW, extSH)
+
+      // Step 3: restore accepted tiles with real pixels
+      for (let i = 0; i < allTileSpecs.length; i++) {
+        if (!acceptedMask[i]) continue
+        const spec = allTileSpecs[i]
+        const br   = spec.blankRegion
+        if (br.width === 0 || br.height === 0) continue
+        const bBandX = spec.bandX + br.x
+        const bBandY = spec.bandY + br.y
+        const sX = Math.round(bandToSceneX(bBandX) * scale)
+        const sY = Math.round(bandToSceneY(bBandY) * scale)
+        const sW = Math.max(1, Math.round(br.width  * scale))
+        const sH = Math.max(1, Math.round(br.height * scale))
+        ctx.drawImage(bandCanvas, bBandX, bBandY, br.width, br.height, sX, sY, sW, sH)
+      }
+
+      // Step 4: compute each tile's blank region in map-scale coordinates
+      const tileRegionsInMap: PlanTileRegion[] = allTileSpecs.map((spec) => {
+        const br = spec.blankRegion
+        if (br.width === 0 || br.height === 0) {
+          return { x: 0, y: 0, width: 0, height: 0 }
+        }
+        const bBandX = spec.bandX + br.x
+        const bBandY = spec.bandY + br.y
+        return {
+          x:      Math.round(bandToSceneX(bBandX) * scale),
+          y:      Math.round(bandToSceneY(bBandY) * scale),
+          width:  Math.max(1, Math.round(br.width  * scale)),
+          height: Math.max(1, Math.round(br.height * scale)),
+        }
+      })
+
+      resolve({ mapDataUrl: map.toDataURL('image/jpeg', 0.90), mapWidth: outW, mapHeight: outH, tileRegionsInMap })
+    }
+
+    srcImg.onerror = () => resolve(fallback(bandCanvas.width, bandCanvas.height))
+    srcImg.crossOrigin = 'anonymous'
+    srcImg.src = sourceImageDataUrl
+  })
+}
+
+/**
+ * Build a per-tile re-plan map from the global plan result.
+ *
+ * Loads `globalPlanResult`, then paints the current tile's region grey so the
+ * model fills just that tile while seeing the rest of the already-planned
+ * extension as context.  Used for Phase 2 (per-tile plan override).
+ */
+export function buildPerTilePlanningMap(
+  globalPlanResult: string,
+  tileRegionInMap: PlanTileRegion,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => {
+      const canvas = document.createElement('canvas')
+      canvas.width  = img.naturalWidth
+      canvas.height = img.naturalHeight
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        resolve(globalPlanResult)
+        return
+      }
+      ctx.drawImage(img, 0, 0)
+      // Grey out this tile's region so the model re-fills only that area.
+      ctx.fillStyle = EXTENSION_BLANK_COLOR
+      ctx.fillRect(tileRegionInMap.x, tileRegionInMap.y, tileRegionInMap.width, tileRegionInMap.height)
+      resolve(canvas.toDataURL('image/jpeg', 0.90))
+    }
+    img.onerror = () => reject(new Error('Failed to load global plan result for per-tile map'))
+    img.crossOrigin = 'anonymous'
+    img.src = globalPlanResult
+  })
+}
 
 /**
  * Build a scaled-down planning map of the full scene for phase 1.
@@ -2128,6 +2303,55 @@ export function buildTilePlanningMap(
     srcImg.crossOrigin = 'anonymous'
     srcImg.src = sourceImageDataUrl
   })
+}
+
+/**
+ * Map-scale rectangle of the extension zone within a full-scene global plan.
+ * Uses the same scene layout as buildGlobalPlanningMap.
+ */
+export function globalPlanExtensionRegion(
+  mapWidth: number,
+  mapHeight: number,
+  direction: 'up' | 'down' | 'left' | 'right',
+  imageWidth: number,
+  imageHeight: number,
+  extensionSize: number,
+): PlanTileRegion {
+  const isVertical = direction === 'down' || direction === 'up'
+  const sceneW = isVertical ? imageWidth : imageWidth + extensionSize
+  const sceneH = isVertical ? imageHeight + extensionSize : imageHeight
+  const extOffsetX = direction === 'right' ? imageWidth : 0
+  const extOffsetY = direction === 'down' ? imageHeight : 0
+  const extSceneW = isVertical ? imageWidth : extensionSize
+  const extSceneH = isVertical ? extensionSize : imageHeight
+  const scaleX = mapWidth / sceneW
+  const scaleY = mapHeight / sceneH
+  return {
+    x: Math.round(extOffsetX * scaleX),
+    y: Math.round(extOffsetY * scaleY),
+    width: Math.max(1, Math.round(extSceneW * scaleX)),
+    height: Math.max(1, Math.round(extSceneH * scaleY)),
+  }
+}
+
+/**
+ * Crop the extension-only portion from a full-scene global plan result.
+ * The returned image matches the extension band aspect ratio and can be
+ * displayed at 100% width/height behind tile skeletons without CSS offsets.
+ */
+export function cropGlobalPlanExtensionView(
+  globalPlanResult: string,
+  mapWidth: number,
+  mapHeight: number,
+  direction: 'up' | 'down' | 'left' | 'right',
+  imageWidth: number,
+  imageHeight: number,
+  extensionSize: number,
+): Promise<string> {
+  const region = globalPlanExtensionRegion(
+    mapWidth, mapHeight, direction, imageWidth, imageHeight, extensionSize,
+  )
+  return cropPlanningResult(globalPlanResult, region)
 }
 
 /**

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { buildExtendPrompt, buildPlanningPrompt } from '@/app/lib/extendPrompt'
+import { buildExtendPrompt, buildGlobalPlanningPrompt } from '@/app/lib/extendPrompt'
 import { ReferenceImage } from '@/app/lib/app'
 
 // Default model when the client doesn't specify one.
@@ -83,10 +83,8 @@ export async function POST(request: NextRequest) {
       layerRole,
       sceneBrief,
       referenceImages,
-      // Two-phase fields
+      // Three-phase fields
       phase,
-      planningTileIndex,
-      planningTileCount,
       bakedPlanning,
     } = await request.json() as {
       expandedCanvas: string
@@ -103,17 +101,15 @@ export async function POST(request: NextRequest) {
       layerRole?: string
       sceneBrief?: string
       referenceImages?: ReferenceImage[]
-      /** Phase 1 = planning map pass; phase 2 = refine pass (default). */
+      /**
+       * 'plan'   = global or per-tile planning pass (Phase 1 or 2).
+       * 'refine' = high-res tile generation (Phase 3, default).
+       */
       phase?: 'plan' | 'refine'
-      /** Tile index within the extension, needed by the planning prompt. */
-      planningTileIndex?: number
-      /** Total non-skipped tile count, needed by the planning prompt. */
-      planningTileCount?: number
       /**
        * True when expandedCanvas is the baked tile-slice composite: the grey
        * blank region has been replaced by the low-res planning preview.
-       * The refine prompt frames the task as high-res rendering of the preview
-       * rather than free-form extension into grey space.
+       * The refine prompt frames the task as high-res rendering of the preview.
        */
       bakedPlanning?: boolean
     }
@@ -144,11 +140,10 @@ export async function POST(request: NextRequest) {
     // ── Build prompt ─────────────────────────────────────────────────────────
     let prompt: string
     if (phase === 'plan') {
-      // Phase 1: planning map — uses a dedicated minimal prompt.
-      prompt = buildPlanningPrompt({
+      // Phase 1 (global plan) or Phase 2 (per-tile re-plan) — both use the
+      // global planning prompt which describes: fill grey, preserve everything else.
+      prompt = buildGlobalPlanningPrompt({
         direction: direction as 'up' | 'down' | 'left' | 'right',
-        tileIndex: planningTileIndex ?? 0,
-        tileCount: planningTileCount ?? 1,
         customPrompt: customPrompt ?? null,
         artStyle: artStyle ?? null,
         sceneBrief: sceneBrief ?? null,

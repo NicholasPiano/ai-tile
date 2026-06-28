@@ -43,6 +43,12 @@ export interface TilingState {
   generatingTileIdx: number | null
   /** Non-skipped index of the next tile that can be generated/accepted. */
   nextPendingTileIdx: number | null
+  /** Global low-res plan result (Phase 1 output), shown as band background. */
+  globalPlanResult?: string | null
+  /** Extension-only crop of the global plan — preferred for band background. */
+  globalPlanExtensionView?: string | null
+  /** True while Phase 1 (global plan) is being generated. */
+  isGlobalPlanGenerating?: boolean
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -133,6 +139,7 @@ function TilingBand({
     tileAccepted,
     generatingTileIdx,
     nextPendingTileIdx,
+    globalPlanExtensionView,
   } = state
 
   const isVertical = direction === 'down' || direction === 'up'
@@ -169,6 +176,24 @@ function TilingBand({
         ...sharedEdgeStyle,
       }}
     >
+      {/* Global plan background — pre-cropped extension view, no CSS offset needed */}
+      {globalPlanExtensionView && (
+        <img
+          src={globalPlanExtensionView}
+          alt=""
+          draggable={false}
+          style={{
+            position: 'absolute',
+            inset: 0,
+            width: '100%',
+            height: '100%',
+            objectFit: 'fill',
+            pointerEvents: 'none',
+            opacity: 0.85,
+          }}
+        />
+      )}
+
       {cells
         .filter((c) => !c.isSkipped)
         .map((cell) => {
@@ -283,9 +308,13 @@ function TilingBand({
 function TilingEdgeControl({
   direction,
   onCancel,
+  onRerunGlobalPlan,
+  isGlobalPlanGenerating,
 }: {
   direction: Direction
   onCancel: () => void
+  onRerunGlobalPlan?: () => void
+  isGlobalPlanGenerating?: boolean
 }) {
   const position: React.CSSProperties = (
     {
@@ -296,29 +325,55 @@ function TilingEdgeControl({
     } as Record<Direction, React.CSSProperties>
   )[direction]
 
+  const pillBtnStyle: React.CSSProperties = {
+    background: 'var(--bg-elev)',
+    border: '1px solid var(--border-strong)',
+    color: 'var(--text-secondary)',
+    boxShadow: '0 2px 8px rgba(0,0,0,0.45)',
+  }
+
+  const pillBtnHoverEnter = (e: React.MouseEvent<HTMLButtonElement>) => {
+    e.currentTarget.style.borderColor = 'var(--accent)'
+    e.currentTarget.style.color = 'var(--accent)'
+  }
+  const pillBtnHoverLeave = (e: React.MouseEvent<HTMLButtonElement>) => {
+    e.currentTarget.style.borderColor = 'var(--border-strong)'
+    e.currentTarget.style.color = 'var(--text-secondary)'
+  }
+
   return (
     <div
       className="absolute z-10 flex items-center gap-1.5 whitespace-nowrap"
       style={position}
     >
+      {/* Re-run global plan — only shown when the callback is provided */}
+      {onRerunGlobalPlan && (
+        <button
+          onClick={onRerunGlobalPlan}
+          disabled={isGlobalPlanGenerating}
+          title={isGlobalPlanGenerating ? 'Generating global plan…' : 'Re-run global plan'}
+          className="flex h-8 w-8 items-center justify-center rounded-full transition-colors"
+          style={{
+            ...pillBtnStyle,
+            opacity: isGlobalPlanGenerating ? 0.6 : 1,
+          }}
+          onMouseEnter={pillBtnHoverEnter}
+          onMouseLeave={pillBtnHoverLeave}
+        >
+          {isGlobalPlanGenerating
+            ? <Icons.Spinner size={13} />
+            : <Icons.Refresh size={13} />
+          }
+        </button>
+      )}
+
       <button
         onClick={onCancel}
         title="Cancel tiled extension"
         className="flex h-8 w-8 items-center justify-center rounded-full transition-colors"
-        style={{
-          background: 'var(--bg-elev)',
-          border: '1px solid var(--border-strong)',
-          color: 'var(--text-secondary)',
-          boxShadow: '0 2px 8px rgba(0,0,0,0.45)',
-        }}
-        onMouseEnter={(e) => {
-          e.currentTarget.style.borderColor = 'var(--accent)'
-          e.currentTarget.style.color = 'var(--accent)'
-        }}
-        onMouseLeave={(e) => {
-          e.currentTarget.style.borderColor = 'var(--border-strong)'
-          e.currentTarget.style.color = 'var(--text-secondary)'
-        }}
+        style={pillBtnStyle}
+        onMouseEnter={pillBtnHoverEnter}
+        onMouseLeave={pillBtnHoverLeave}
       >
         <Icons.X size={13} />
       </button>
@@ -409,6 +464,7 @@ export function Workspace({
   tilingState,
   onTileClick,
   onTileCancel,
+  onRerunGlobalPlan,
 }: {
   image: string
   dimensions: { width: number; height: number } | null
@@ -430,6 +486,8 @@ export function Workspace({
   /** Called when the user clicks a non-skipped tile cell in the band. */
   onTileClick?: (nsIdx: number) => void
   onTileCancel?: () => void
+  /** Re-run Phase 1 (global plan) for the entire extension. */
+  onRerunGlobalPlan?: () => void
 }) {
   const isTiling = !!tilingState
 
@@ -558,6 +616,8 @@ export function Workspace({
             <TilingEdgeControl
               direction={tilingState.direction}
               onCancel={onTileCancel ?? (() => undefined)}
+              onRerunGlobalPlan={onRerunGlobalPlan}
+              isGlobalPlanGenerating={tilingState.isGlobalPlanGenerating}
             />
           )
           : !isResult && (

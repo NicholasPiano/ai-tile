@@ -3,7 +3,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { Icons } from '@/app/components/icons'
 import { ART_STYLE_GROUPS } from '@/app/lib/artStyles'
-import { buildExtendPrompt, buildPlanningPrompt } from '@/app/lib/extendPrompt'
+import { buildExtendPrompt, buildGlobalPlanningPrompt } from '@/app/lib/extendPrompt'
 import { buildTileChunkInfo, buildTileInput, ExtensionTileSpec } from '@/app/utils/imageProcessor'
 import { MODELS, maskKey } from '@/app/lib/models'
 import { Direction, ReferenceImage } from '@/app/lib/app'
@@ -1129,13 +1129,12 @@ export interface TileExtensionModalProps {
   nonSkippedCount: number
   /** Latest generated result for this tile, or null if not yet generated. */
   preview: string | null
-  /** Phase-1 planning guide result, or null if two-phase not yet complete. */
-  planningPreview: string | null
-  /** Full source image before any extension (step 2). */
-  sourceImage: string
-  /** Planning map (full scene + red/grey overlays) sent to phase 1 (step 3). */
-  planningMap: string | null
-  /** Cropped tile-region slice of the plan result sent to phase 2 (step 5). */
+  /**
+   * Effective planning slice for this tile (used to build the high-res composite):
+   *   - Per-tile override (Phase 2 re-plan result) if the user re-planned.
+   *   - Otherwise, the pre-cropped slice from the global plan (Phase 1).
+   *   - null = no planning guide available yet.
+   */
   planningSlice: string | null
   /** True when this is the next tile in scan order (Retry/Accept enabled). */
   isNextPending: boolean
@@ -1147,12 +1146,13 @@ export interface TileExtensionModalProps {
   tileReferenceImages: ReferenceImage[]
   onSetTilePrompt: (v: string) => void
   onSetTileReferenceImages: (v: ReferenceImage[]) => void
+  /** Trigger Phase 3: generate the high-res tile. */
   onGenerate: () => void
-  /** Trigger a plan-only (phase 1) re-run for this tile. */
+  /** Trigger Phase 2: per-tile plan re-run. */
   onReplan: () => void
   onAccept: () => void
   onClose: () => void
-  /** True when the in-flight generation for this tile is plan-only (phase 1). */
+  /** True when the in-flight generation for this tile is a Phase 2 re-plan. */
   isReplanInProgress: boolean
 }
 
@@ -1168,9 +1168,6 @@ export function TileExtensionModal({
   sceneBrief,
   nonSkippedCount,
   preview,
-  planningPreview,
-  sourceImage,
-  planningMap,
   planningSlice,
   isNextPending,
   isGenerating,
@@ -1306,10 +1303,8 @@ export function TileExtensionModal({
   })
 
   const planningPromptText = showTwoPhase
-    ? buildPlanningPrompt({
+    ? buildGlobalPlanningPrompt({
         direction,
-        tileIndex: nsIdx,
-        tileCount: nonSkippedCount,
         customPrompt: effectivePrompt ?? null,
         artStyle: artStyle !== 'none' ? artStyle : null,
         sceneBrief: sceneBrief ?? null,
@@ -1570,7 +1565,7 @@ export function TileExtensionModal({
                     className="mt-2 mb-1 text-[10px] uppercase tracking-wider"
                     style={{ color: 'var(--text-muted)' }}
                   >
-                    Phase 1 — Planning
+                    Phase 1 / 2 — Global &amp; Per-tile Planning
                   </p>
                   <pre
                     className="overflow-auto rounded-[var(--radius-sm)] p-3 text-[10px] leading-relaxed whitespace-pre-wrap"
@@ -1587,7 +1582,7 @@ export function TileExtensionModal({
                     className="mt-2 mb-1 text-[10px] uppercase tracking-wider"
                     style={{ color: 'var(--text-muted)' }}
                   >
-                    Phase 2 — Refinement
+                    Phase 3 — High-res Refinement
                   </p>
                 </>
               )}
@@ -1607,12 +1602,9 @@ export function TileExtensionModal({
             {/* ── Image pipeline ───────────────────────────────────── */}
             {(() => {
               const tileAR = `${tileSpec.tileWidth} / ${tileSpec.tileHeight}`
-              // Phase detection for status labels and spinner placement.
-              // planningMap (and planningPreview/planningSlice) are all stored in
-              // one combined setState call once phase 1 completes, so before that
-              // call all three are null.
-              const isPhase1 = showTwoPhase && isGenerating && planningMap === null
-              const isPhase2 = showTwoPhase && isGenerating && planningMap !== null
+
+              // Phase 3 (high-res generation) is in flight when generating but NOT re-planning.
+              const isPhase3Generating = isGenerating && !isReplanInProgress
 
               /** Spinner + pulse overlay used while a phase is in flight. */
               const spinnerOverlay = (size: number) => (
@@ -1627,197 +1619,20 @@ export function TileExtensionModal({
                 </>
               )
 
-              /** Muted dash placeholder for cells not yet populated. */
-              const emptyCell = (
-                <div
-                  className="absolute inset-0 flex items-center justify-center text-[11px]"
-                  style={{ color: 'var(--text-muted)' }}
-                >
-                  —
-                </div>
-              )
+              // TILE PLAN shows the high-res composite (tile strip + low-res plan
+              // overlaid in blank region). Falls back to the plain tile strip when
+              // no planning slice is available yet (single-phase or plan not run).
+              const tilePlanSrc = tileSliceUrl ?? inputImageUrl
 
-              /** Common thumbnail container. */
-              const thumbStyle = (ar: string, highlight = false): React.CSSProperties => ({
-                border: `1px solid ${highlight ? 'var(--border-strong)' : 'var(--border)'}`,
-                aspectRatio: ar,
-                background: 'var(--surface)',
-                borderRadius: 'var(--radius-sm)',
-                position: 'relative',
-                overflow: 'hidden',
-              })
-
-              /** Shared cell label style. */
-              const labelCls = 'mb-1.5 text-[11px] uppercase tracking-wider font-medium'
-              const labelStyle: React.CSSProperties = { color: 'var(--text-muted)' }
-              const subtitleCls = 'mt-1 text-[11px] text-center'
-              const subtitleStyle: React.CSSProperties = { color: 'var(--text-muted)' }
-
-              if (showTwoPhase) {
-                return (
-                  <div
-                    style={{
-                      display: 'grid',
-                      gridTemplateColumns: 'repeat(3, 1fr)',
-                      gap: 10,
-                    }}
-                  >
-                    {/* Step 1 — Input (tile strip sent to phase 2) */}
-                    <div>
-                      <p className={labelCls} style={labelStyle}>Input</p>
-                      <div className="checker" style={thumbStyle('1 / 1')}>
-                        {inputImageUrl ? (
-                          <img
-                            src={inputImageUrl}
-                            alt="Tile input"
-                            className="w-full h-full object-contain block"
-                            draggable={false}
-                          />
-                        ) : (
-                          <div className="absolute inset-0 flex items-center justify-center">
-                            <Icons.Spinner size={14} />
-                          </div>
-                        )}
-                      </div>
-                      <p className={`font-mono ${subtitleCls}`} style={subtitleStyle}>
-                        {tileSpec.tileWidth} × {tileSpec.tileHeight}
-                      </p>
-                    </div>
-
-                    {/* Step 2 — Source (full original image, always available) */}
-                    <div>
-                      <p className={labelCls} style={labelStyle}>Source</p>
-                      <div className="checker" style={thumbStyle('1 / 1')}>
-                        <img
-                          src={sourceImage}
-                          alt="Source image"
-                          className="w-full h-full object-contain block"
-                          draggable={false}
-                        />
-                      </div>
-                      <p className={subtitleCls} style={subtitleStyle}>Original</p>
-                    </div>
-
-                    {/* Step 3 — Plan map (full scene + red/grey, phase 1 input) */}
-                    <div>
-                      <p className={labelCls} style={labelStyle}>Plan map</p>
-                      <div className="checker" style={thumbStyle('1 / 1')}>
-                        {planningMap ? (
-                          <img
-                            src={planningMap}
-                            alt="Planning map"
-                            className="w-full h-full object-contain block"
-                            draggable={false}
-                          />
-                        ) : isPhase1 ? (
-                          spinnerOverlay(14)
-                        ) : (
-                          emptyCell
-                        )}
-                      </div>
-                      <p className={subtitleCls} style={subtitleStyle}>
-                        {isPhase1 ? 'Planning…' : planningMap ? 'Done' : '—'}
-                      </p>
-                    </div>
-
-                    {/* Step 4 — Plan result (full scene with grey filled, phase 1 output) */}
-                    <div>
-                      <p className={labelCls} style={labelStyle}>Plan result</p>
-                      <div className="checker" style={thumbStyle('1 / 1', !!planningPreview)}>
-                        {planningPreview ? (
-                          <img
-                            src={planningPreview}
-                            alt="Plan result"
-                            className="w-full h-full object-contain block"
-                            draggable={false}
-                          />
-                        ) : isPhase1 ? (
-                          spinnerOverlay(14)
-                        ) : (
-                          emptyCell
-                        )}
-                      </div>
-                      <p className={subtitleCls} style={subtitleStyle}>
-                        {isPhase1 ? 'Planning…' : planningPreview ? 'Done' : '—'}
-                      </p>
-                    </div>
-
-                    {/* Step 5 — Tile slice (INPUT-sized composite: context + low-res plan fill) */}
-                    <div>
-                      <p className={labelCls} style={labelStyle}>Tile slice</p>
-                      <div className="checker" style={thumbStyle('1 / 1')}>
-                        {tileSliceUrl ? (
-                          <img
-                            src={tileSliceUrl}
-                            alt="Tile slice"
-                            className="w-full h-full object-contain block"
-                            draggable={false}
-                          />
-                        ) : planningSlice ? (
-                          // Composite not yet computed — show the raw slice as fallback.
-                          <img
-                            src={planningSlice}
-                            alt="Tile slice"
-                            className="w-full h-full object-contain block"
-                            draggable={false}
-                          />
-                        ) : isPhase1 ? (
-                          spinnerOverlay(14)
-                        ) : (
-                          emptyCell
-                        )}
-                      </div>
-                      <p className={subtitleCls} style={subtitleStyle}>
-                        {isPhase1 ? 'Planning…' : (tileSliceUrl ?? planningSlice) ? 'Done' : '—'}
-                      </p>
-                    </div>
-
-                    {/* Step 6 — Result (phase 2 output) */}
-                    <div>
-                      <p className={labelCls} style={labelStyle}>Result</p>
-                      <div className="checker" style={thumbStyle('1 / 1', hasPreview)}>
-                        {hasPreview && preview ? (
-                          <img
-                            src={preview}
-                            alt="Tile result"
-                            className="w-full h-full object-contain block"
-                            draggable={false}
-                          />
-                        ) : isPhase2 ? (
-                          spinnerOverlay(14)
-                        ) : (
-                          <div
-                            className="absolute inset-0 flex items-center justify-center text-[11px]"
-                            style={{ color: 'var(--text-muted)' }}
-                          >
-                            {isPhase1 ? '—' : 'Not generated yet'}
-                          </div>
-                        )}
-                      </div>
-                      <p className={`font-mono ${subtitleCls}`} style={subtitleStyle}>
-                        {resultDimensions
-                          ? `${resultDimensions.width} × ${resultDimensions.height}`
-                          : isPhase2
-                          ? 'Refining…'
-                          : hasPreview
-                          ? '…'
-                          : '—'}
-                      </p>
-                    </div>
-                  </div>
-                )
-              }
-
-              // Single-phase: just Input + Result in a row
               return (
-                <div className="flex gap-3">
-                  {/* Input */}
+                <div className="flex gap-4">
+                  {/* Cell 1 — Tile Plan (high-res composite sent to the model) */}
                   <div className="flex-1 min-w-0">
                     <p
                       className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
                       style={{ color: 'var(--text-muted)' }}
                     >
-                      Input
+                      Tile plan
                     </p>
                     <div
                       className="checker relative overflow-hidden rounded-[var(--radius-sm)]"
@@ -1827,16 +1642,18 @@ export function TileExtensionModal({
                         background: 'var(--surface)',
                       }}
                     >
-                      {inputImageUrl ? (
+                      {isReplanInProgress ? (
+                        spinnerOverlay(14)
+                      ) : tilePlanSrc ? (
                         <img
-                          src={inputImageUrl}
-                          alt="Tile input"
+                          src={tilePlanSrc}
+                          alt="Tile plan"
                           className="w-full h-full object-contain block"
                           draggable={false}
                         />
                       ) : (
                         <div className="absolute inset-0 flex items-center justify-center">
-                          <Icons.Spinner size={16} />
+                          <Icons.Spinner size={14} />
                         </div>
                       )}
                     </div>
@@ -1848,7 +1665,7 @@ export function TileExtensionModal({
                     </p>
                   </div>
 
-                  {/* Result */}
+                  {/* Cell 2 — Result (Phase 3 output) */}
                   <div className="flex-1 min-w-0">
                     <p
                       className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
@@ -1864,16 +1681,8 @@ export function TileExtensionModal({
                         background: 'var(--surface)',
                       }}
                     >
-                      {isGenerating && !hasPreview && (
-                        <>
-                          <div className="absolute inset-0 flex items-center justify-center">
-                            <Icons.Spinner size={16} />
-                          </div>
-                          <div
-                            className="absolute inset-0 animate-pulse"
-                            style={{ background: 'rgba(80,80,130,0.3)' }}
-                          />
-                        </>
+                      {isPhase3Generating && (
+                        spinnerOverlay(16)
                       )}
                       {hasPreview && preview && (
                         <img
@@ -1898,10 +1707,10 @@ export function TileExtensionModal({
                     >
                       {resultDimensions
                         ? `${resultDimensions.width} × ${resultDimensions.height}`
+                        : isPhase3Generating
+                        ? 'Generating…'
                         : hasPreview
                         ? '…'
-                        : isGenerating
-                        ? 'Generating…'
                         : '—'}
                     </p>
                   </div>
@@ -1920,13 +1729,13 @@ export function TileExtensionModal({
               </button>
 
               <div className="flex gap-2">
-                {/* Re-plan — only available in two-phase mode */}
+                {/* Re-plan tile — Phase 2: regenerate the per-tile plan slice */}
                 {showTwoPhase && (
                   <button
                     onClick={onReplan}
                     disabled={!canAct}
                     className="btn btn-ghost"
-                    title={!isNextPending ? 'Accept prior tiles first' : 'Re-run phase 1 only'}
+                    title={!isNextPending ? 'Accept prior tiles first' : 'Regenerate the tile plan slice'}
                   >
                     {isReplanInProgress ? (
                       <>
@@ -1934,11 +1743,12 @@ export function TileExtensionModal({
                         Re-planning…
                       </>
                     ) : (
-                      <>↺ Re-plan</>
+                      <>↺ Re-plan tile</>
                     )}
                   </button>
                 )}
 
+                {/* Regenerate tile — Phase 3: generate the high-res tile */}
                 <button
                   onClick={onGenerate}
                   disabled={!canAct}
@@ -1948,10 +1758,10 @@ export function TileExtensionModal({
                   {isGenerating && !isReplanInProgress ? (
                     <>
                       <Icons.Spinner size={13} />
-                      {showTwoPhase && !planningPreview ? 'Planning…' : 'Refining…'}
+                      Generating…
                     </>
                   ) : (
-                    <>↺ {hasPreview ? 'Retry' : 'Generate'}</>
+                    <>↺ {hasPreview ? 'Regenerate tile' : 'Generate tile'}</>
                   )}
                 </button>
 

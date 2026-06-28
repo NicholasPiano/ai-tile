@@ -64,6 +64,14 @@ export interface BuildPlanningPromptParams {
   referenceImages?: { description: string }[]
 }
 
+export interface BuildGlobalPlanningPromptParams {
+  direction: 'up' | 'down' | 'left' | 'right'
+  customPrompt?: string | null
+  artStyle?: string | null
+  sceneBrief?: string | null
+  referenceImages?: { description: string }[]
+}
+
 // ── Art style labels ─────────────────────────────────────────────────────────
 
 export const ART_STYLE_DESCRIPTIONS: Record<string, string> = {
@@ -446,6 +454,85 @@ COMPOSITION RULES:
 - Return the complete image at the SAME dimensions as the input map.
 - Every grey (#B0B0B0) pixel must be replaced with scene content.
 - Every red (#FF0000) pixel must remain exactly red.
+- No seam, colour shift, or brightness jump at the grey↔real boundary.`
+
+  return prompt
+}
+
+// ── Global extension planning prompt ──────────────────────────────────────────
+
+/**
+ * Build the prompt for Phase 1 of the three-phase extension flow.
+ *
+ * Phase 1 receives a scaled planning map of the FULL extension scene:
+ *   - Real pixels from the source image and already-accepted tile regions.
+ *   - Grey (#B0B0B0) for the ENTIRE unaccepted extension area.
+ *   - No red markers — the model fills all grey at once.
+ *
+ * This prompt is also reused for Phase 2 (per-tile re-plan), where the
+ * background context comes from the global plan result and only the current
+ * tile's region is grey.
+ */
+export function buildGlobalPlanningPrompt(params: BuildGlobalPlanningPromptParams): string {
+  const { direction, customPrompt, artStyle, sceneBrief, referenceImages } = params
+  const hasRefs = !!(referenceImages && referenceImages.length > 0)
+
+  const dirLabel = direction === 'up' ? 'top'
+    : direction === 'down' ? 'bottom'
+    : direction === 'left' ? 'left'
+    : 'right'
+
+  const preamble = hasRefs
+    ? `MULTI-IMAGE REQUEST — IMAGE ROLES:
+- IMAGE 1: your WORKING CANVAS — the planning map described below.
+- IMAGE 2, 3, …: REFERENCE ONLY — style or content guides. Do NOT return them.
+
+`
+    : ''
+
+  let prompt = `${preamble}EXTENSION PLAN — LOW-RESOLUTION SKETCH PASS.
+
+The WORKING CANVAS shows the full scene: the original source image with the extension area on the ${dirLabel} filled with solid GREY (#B0B0B0). Any non-grey content in the extension area represents already-accepted tiles — preserve those exactly.
+
+COLOUR REGIONS:
+- GREY (#B0B0B0): FILL THIS AREA — replace every grey pixel with plausible scene content.
+- All other pixels: real scene content — preserve these EXACTLY unchanged.
+
+YOUR TASK:
+1. Fill EVERY grey pixel with a continuation of the existing scene.
+2. Preserve all non-grey pixels exactly as they appear — do NOT modify them.
+3. Return the image at the SAME pixel dimensions as the input.
+
+COMPOSITION RULES:
+- This is a low-resolution planning sketch — focus on correct layout, tonal composition, and subject placement over fine detail.
+- Continue the existing scene naturally: same horizon line, lighting direction, atmosphere, and scale.
+- If the grey area spans multiple columns or rows of tiles, treat the whole grey region as one unified fill target and ensure internal coherence.
+- Do not leave any grey (#B0B0B0) pixels unchanged — a fully grey output is a FAILURE.`
+
+  if (artStyle && ART_STYLE_DESCRIPTIONS[artStyle]) {
+    prompt += `\n\nARTISTIC STYLE: ${ART_STYLE_DESCRIPTIONS[artStyle]}.`
+  }
+
+  if (customPrompt) {
+    prompt += `\n\nUSER DIRECTION for the grey extension area: "${customPrompt}"`
+  }
+
+  if (typeof sceneBrief === 'string' && sceneBrief.trim()) {
+    prompt += `\n\nSHARED SCENE DIRECTION:\n${sceneBrief.trim()}`
+  }
+
+  if (hasRefs && referenceImages) {
+    const refLines = referenceImages.map((ref, i) => {
+      const label = `IMAGE ${i + 2}`
+      const note = ref.description.trim() ? ref.description.trim() : 'general style or scene reference'
+      return `- ${label}: ${note}`
+    })
+    prompt += `\n\nREFERENCE IMAGES:\n${refLines.join('\n')}\nUse these for style and content guidance when filling the grey area.`
+  }
+
+  prompt += `\n\nCRITICAL OUTPUT RULES:
+- Return the complete image at the SAME dimensions as the input.
+- Every grey (#B0B0B0) pixel must be replaced with scene content.
 - No seam, colour shift, or brightness jump at the grey↔real boundary.`
 
   return prompt
