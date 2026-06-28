@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { CommandBar } from '@/app/components/CommandBar'
+import { EditStudio } from '@/app/components/EditStudio'
 import { EmptyState } from '@/app/components/EmptyState'
 import { ApiKeyModal, ErrorToast, GenerateModal, SettingsDrawer, TileExtensionModal, Toggle } from '@/app/components/Modals'
 import { ParallaxStudio } from '@/app/components/ParallaxStudio'
@@ -4335,6 +4336,7 @@ export default function Home() {
   const isResult = !!activeCandidate
   const variantCount = extendedCandidates.length
 
+  const isEdit = mode === 'edit'
   const isParallax = mode === 'parallax'
   const isTile = mode === 'tile'
   const isSprite = mode === 'sprite'
@@ -4514,6 +4516,13 @@ export default function Home() {
           onGenerate={openGenerateModal}
           onDropFile={handleFile}
         />
+      ) : isEdit ? (
+        <EditStudio
+          image={selectedImage}
+          dimensions={currentImageDimensions}
+          onPickFile={() => fileInputRef.current?.click()}
+          onDropFile={handleFile}
+        />
       ) : !displayImage ? (
         <EmptyState
           mode={mode}
@@ -4577,6 +4586,7 @@ export default function Home() {
       {!isTile &&
         !isSprite &&
         !isProps &&
+        !isEdit &&
         ((isParallax && !!activeLayer?.imageUrl) ||
           (!isParallax && !!selectedImage)) &&
         !isResult &&

@@ -79,7 +79,29 @@ export const STORAGE_MODEL = 'extender:model'
 // ─────────────────────────────────────────────────────────────────────────────
 
 
-export type Mode = 'extender' | 'parallax' | 'tile' | 'sprite' | 'props'
+export type Mode = 'extender' | 'edit' | 'parallax' | 'tile' | 'sprite' | 'props'
+
+/**
+ * Minimum strip of original image pixels that must remain visible around any
+ * edit selection. This context border is sent to the inpaint model so it can
+ * match the surrounding scene.
+ */
+export const EDIT_STRIP_PX = 256
+
+/**
+ * Maximum width or height of the inpaint selection in image pixels.
+ *
+ * The region actually sent to the model is `selection + EDIT_STRIP_PX` on
+ * every side, so its total dimension is `selection + 2 × EDIT_STRIP_PX`.
+ * That total must stay within `MAX_AI_DIMENSION` (1536 px), giving:
+ *
+ *   MAX_EDIT_SELECTION_PX = MAX_AI_DIMENSION − 2 × EDIT_STRIP_PX
+ *
+ * The selection guide drawn on the canvas is therefore dynamic: it reflects
+ * the largest box reachable from the drag-start point within both this limit
+ * and the image edge constraints.
+ */
+export const MAX_EDIT_SELECTION_PX = MAX_AI_DIMENSION - 2 * EDIT_STRIP_PX
 
 /**
  * A single user-supplied reference image attached to a tile extension call.
