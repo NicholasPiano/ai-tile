@@ -1186,6 +1186,11 @@ export function TileExtensionModal({
 }: TileExtensionModalProps) {
   const [inputImageUrl, setInputImageUrl] = useState<string | null>(null)
   const [resultDimensions, setResultDimensions] = useState<{ width: number; height: number } | null>(null)
+  /**
+   * Composite of the INPUT image with the grey blank region replaced by the
+   * low-res planning slice. Same dimensions as the INPUT.
+   */
+  const [tileSliceUrl, setTileSliceUrl] = useState<string | null>(null)
   /** Tracks which row's hidden file input should be programmatically triggered. */
   const refImageFileInputRefs = useRef<(HTMLInputElement | null)[]>([])
 
@@ -1202,6 +1207,59 @@ export function TileExtensionModal({
       setInputImageUrl(null)
     }
   }, [open, bandCanvas, tileSpec])
+
+  // Build the tile-slice composite: INPUT image with the grey blankRegion
+  // replaced by the low-res planning slice, scaled to fit that region.
+  // Result has the same pixel dimensions as the INPUT image.
+  useEffect(() => {
+    if (!inputImageUrl || !planningSlice) {
+      setTileSliceUrl(null)
+      return
+    }
+
+    let cancelled = false
+
+    /** Load an image from a data URL and resolve once it is fully decoded. */
+    const loadImage = (src: string): Promise<HTMLImageElement> =>
+      new Promise((resolve, reject) => {
+        const img = new Image()
+        img.onload = () => resolve(img)
+        img.onerror = () => reject(new Error('Image load failed'))
+        img.src = src
+      })
+
+    Promise.all([loadImage(inputImageUrl), loadImage(planningSlice)])
+      .then(([inputImg, sliceImg]) => {
+        if (cancelled) return
+
+        const { tileWidth, tileHeight, blankRegion } = tileSpec
+        const composite = document.createElement('canvas')
+        composite.width  = tileWidth
+        composite.height = tileHeight
+        const ctx = composite.getContext('2d')
+        if (!ctx) {
+          setTileSliceUrl(planningSlice)
+          return
+        }
+
+        // Draw the full INPUT (context strip + grey blank area) as the base.
+        ctx.drawImage(inputImg, 0, 0)
+
+        // Scale the planning slice to cover exactly the grey blank region.
+        ctx.drawImage(
+          sliceImg,
+          0, 0, sliceImg.naturalWidth, sliceImg.naturalHeight,
+          blankRegion.x, blankRegion.y, blankRegion.width, blankRegion.height,
+        )
+
+        setTileSliceUrl(composite.toDataURL('image/jpeg', 0.9))
+      })
+      .catch(() => {
+        if (!cancelled) setTileSliceUrl(planningSlice)
+      })
+
+    return () => { cancelled = true }
+  }, [inputImageUrl, planningSlice, tileSpec])
 
   // Read result image dimensions when the preview changes.
   useEffect(() => {
@@ -1244,7 +1302,7 @@ export function TileExtensionModal({
     layerRole: layerRole ?? null,
     sceneBrief: sceneBrief ?? null,
     referenceImages: populatedRefs.map((r) => ({ description: r.description })),
-    hasPlanningGuide: showTwoPhase,
+    hasBakedPlanning: showTwoPhase,
   })
 
   const planningPromptText = showTwoPhase
@@ -1684,11 +1742,19 @@ export function TileExtensionModal({
                       </p>
                     </div>
 
-                    {/* Step 5 — Tile slice (crop of plan result sent to phase 2) */}
+                    {/* Step 5 — Tile slice (INPUT-sized composite: context + low-res plan fill) */}
                     <div>
                       <p className={labelCls} style={labelStyle}>Tile slice</p>
                       <div className="checker" style={thumbStyle('1 / 1')}>
-                        {planningSlice ? (
+                        {tileSliceUrl ? (
+                          <img
+                            src={tileSliceUrl}
+                            alt="Tile slice"
+                            className="w-full h-full object-contain block"
+                            draggable={false}
+                          />
+                        ) : planningSlice ? (
+                          // Composite not yet computed — show the raw slice as fallback.
                           <img
                             src={planningSlice}
                             alt="Tile slice"
@@ -1702,7 +1768,7 @@ export function TileExtensionModal({
                         )}
                       </div>
                       <p className={subtitleCls} style={subtitleStyle}>
-                        {isPhase1 ? 'Planning…' : planningSlice ? 'Done' : '—'}
+                        {isPhase1 ? 'Planning…' : (tileSliceUrl ?? planningSlice) ? 'Done' : '—'}
                       </p>
                     </div>
 

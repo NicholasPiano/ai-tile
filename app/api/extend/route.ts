@@ -87,7 +87,7 @@ export async function POST(request: NextRequest) {
       phase,
       planningTileIndex,
       planningTileCount,
-      planningResult,
+      bakedPlanning,
     } = await request.json() as {
       expandedCanvas: string
       direction: string
@@ -109,8 +109,13 @@ export async function POST(request: NextRequest) {
       planningTileIndex?: number
       /** Total non-skipped tile count, needed by the planning prompt. */
       planningTileCount?: number
-      /** Data URL of the phase-1 result, injected as IMAGE 2 in the refine pass. */
-      planningResult?: string
+      /**
+       * True when expandedCanvas is the baked tile-slice composite: the grey
+       * blank region has been replaced by the low-res planning preview.
+       * The refine prompt frames the task as high-res rendering of the preview
+       * rather than free-form extension into grey space.
+       */
+      bakedPlanning?: boolean
     }
 
     if (!expandedCanvas || !direction || !extensionAmount) {
@@ -134,7 +139,7 @@ export async function POST(request: NextRequest) {
     }
 
     const modelId = (typeof model === 'string' && model.trim()) ? model.trim() : DEFAULT_MODEL
-    const hasPlanningResult = typeof planningResult === 'string' && planningResult.length > 0
+    const hasBakedPlanning = phase !== 'plan' && (bakedPlanning === true)
 
     // ── Build prompt ─────────────────────────────────────────────────────────
     let prompt: string
@@ -150,7 +155,10 @@ export async function POST(request: NextRequest) {
         referenceImages: referenceImages?.map((r) => ({ description: r.description })),
       })
     } else {
-      // Phase 2 (default): full extend prompt, optionally with planning guide.
+      // Phase 2 (default): full extend prompt.
+      // When bakedPlanning is true the canvas already has the low-res planning
+      // preview composited into the extension area — the prompt frames the task
+      // as high-res rendering rather than free-form extension into grey space.
       prompt = buildExtendPrompt({
         direction: direction as 'up' | 'down' | 'left' | 'right',
         chunkInfo: (chunkInfo as Parameters<typeof buildExtendPrompt>[0]['chunkInfo']) ?? null,
@@ -162,7 +170,7 @@ export async function POST(request: NextRequest) {
         sceneBrief: sceneBrief ?? null,
         attempt,
         referenceImages: referenceImages?.map((r) => ({ description: r.description })),
-        hasPlanningGuide: hasPlanningResult,
+        hasBakedPlanning,
       })
     }
 
@@ -172,16 +180,13 @@ export async function POST(request: NextRequest) {
     type ContentPart = ImagePart | TextPart
 
     const content: ContentPart[] = [
-      // IMAGE 1 — working canvas (tile strip or planning map).
+      // IMAGE 1 — working canvas (tile strip, baked composite, or planning map).
       { type: 'image_url', image_url: { url: expandedCanvas } },
     ]
 
-    if (phase !== 'plan' && hasPlanningResult) {
-      // IMAGE 2 — phase-1 composition guide (refine pass only).
-      content.push({ type: 'image_url', image_url: { url: planningResult as string } })
-    }
-
-    // IMAGE 3+ (refine) or IMAGE 2+ (plan) — user-supplied reference images.
+    // IMAGE 2+ (refine) or IMAGE 2+ (plan) — user-supplied reference images.
+    // No separate planning guide image: when bakedPlanning is true the planning
+    // preview is already composited into IMAGE 1.
     for (const ref of referenceImages ?? []) {
       content.push({ type: 'image_url', image_url: { url: ref.dataUrl } })
     }

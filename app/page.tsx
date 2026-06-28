@@ -19,7 +19,7 @@ import { PROP_BATCH, PROP_BATCH_COLS, PROP_BATCH_H, PROP_BATCH_ROWS, PROP_BATCH_
 import { SPRITE_ANIMATIONS, SPRITE_FRAME_COUNT, SPRITE_FRAME_SIZE, SPRITE_GRID_COLS, SPRITE_GRID_ROWS, SPRITE_SHEET_H, SPRITE_SHEET_W, SPRITE_STRIP_H, SPRITE_STRIP_W, SpriteAnimType, SpriteFrame, SpriteSheet, createEmptySpriteSheet } from '@/app/lib/sprite'
 import { BODY_PLANS, BodyPlan, isAirborneAnim } from '@/app/lib/bodyPlans'
 import { CORNER_GRAFTS, ENABLE_CORNER_RECONCILE, TILESET_ATLAS_EXTRUDE_PX, TILESET_BY_ROLE, TILESET_COLS, TILESET_PADDED_SHEET_H, TILESET_PADDED_SHEET_W, TILESET_PADDED_STRIDE, TILESET_ROWS, TILESET_SHEET_H, TILESET_SHEET_W, TILESET_SLOTS, TILESET_TILE_SIZE, TILE_TEMPLATE_CELL, TILE_TEMPLATE_COLS, TILE_TEMPLATE_H, TILE_TEMPLATE_MASK, TILE_TEMPLATE_ROWS, TILE_TEMPLATE_SAMPLES, TILE_TEMPLATE_W, TileSetRole, TileSetSlot, alignAiOutputToTemplate, applyFeatheredRoleMask, buildTileSheetGuideDataUrl, createEmptyTileSet, rebuildCornerTile, reconcileAllCorners, templateRoleForCell } from '@/app/lib/tileset'
-import { alignSpriteFramesToBaseline, applyFullContextResult, buildTileChunkInfo, buildTileInput, buildTilePlanningMap, centerSpriteFramesHorizontally, ChunkInfo, chromaKeyToAlpha, compositeTileResult, createChunkedExtension, createFullContextExtension, cropPlanningResult, ExtensionTileSpec, getChunkAlign, getImageDimensions, harmonizeHorizontalSeams, initBandCanvas, isolatePrimarySpriteComponent, isAiExtensionUnfilled, isTileResultUnfilled, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, measureSeamResidual, normalizeImageToSize, normalizeSpriteFrameScale, planExtensionTiles, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk, TiledExtensionPlan } from '@/app/utils/imageProcessor'
+import { alignSpriteFramesToBaseline, applyFullContextResult, buildTileChunkInfo, buildTileInput, buildTileSliceComposite, buildTilePlanningMap, centerSpriteFramesHorizontally, ChunkInfo, chromaKeyToAlpha, compositeTileResult, createChunkedExtension, createFullContextExtension, cropPlanningResult, ExtensionTileSpec, getChunkAlign, getImageDimensions, harmonizeHorizontalSeams, initBandCanvas, isolatePrimarySpriteComponent, isAiExtensionUnfilled, isTileResultUnfilled, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, measureSeamResidual, normalizeImageToSize, normalizeSpriteFrameScale, planExtensionTiles, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk, TiledExtensionPlan } from '@/app/utils/imageProcessor'
 import { SubjectBounds, drawPoseGuideSheet, measureSubjectBounds } from '@/app/utils/poseRig'
 import JSZip from 'jszip'
 
@@ -883,7 +883,8 @@ export default function Home() {
       expandedCanvas: string,
       opts: {
         phase?: 'plan' | 'refine'
-        planningResult?: string
+        /** True when expandedCanvas is the composite tile slice (planning baked in). */
+        bakedPlanning?: boolean
         planningTileIndex?: number
         planningTileCount?: number
         populatedRefs: Array<{ dataUrl: string; description: string }>
@@ -907,7 +908,7 @@ export default function Home() {
           chunkInfo: opts.phase === 'plan' ? undefined : chunkInfo,
           referenceImages: opts.populatedRefs.length > 0 ? opts.populatedRefs : undefined,
           phase: opts.phase,
-          planningResult: opts.planningResult,
+          bakedPlanning: opts.bakedPlanning ?? false,
           planningTileIndex: opts.planningTileIndex,
           planningTileCount: opts.planningTileCount,
         }),
@@ -998,11 +999,17 @@ export default function Home() {
         }
       }
 
-      // Phase 2 (or single-phase) — full-res refinement
-      const tileInput = buildTileInput(canvas, tileSpec)
-      let raw = await normaliseTileResult(await callApi(tileInput, {
+      // Phase 2 (or single-phase) — full-res refinement.
+      // When a planning guide exists, bake it into IMAGE 1 so the model
+      // receives a single canvas: high-res context strip + low-res extension
+      // preview.  Without a planning guide, fall back to the plain tile strip.
+      const tileCanvas = planningGuide
+        ? await buildTileSliceComposite(canvas, tileSpec, planningGuide)
+        : buildTileInput(canvas, tileSpec)
+
+      let raw = await normaliseTileResult(await callApi(tileCanvas, {
         phase: 'refine',
-        planningResult: planningGuide,
+        bakedPlanning: !!planningGuide,
         populatedRefs,
         effectivePrompt,
       }))
@@ -1011,9 +1018,9 @@ export default function Home() {
       if (unfilled) {
         // eslint-disable-next-line no-console
         console.warn(`⚠️ Tile ${nsIdx + 1} appears unfilled — retrying once`)
-        raw = await normaliseTileResult(await callApi(tileInput, {
+        raw = await normaliseTileResult(await callApi(tileCanvas, {
           phase: 'refine',
-          planningResult: planningGuide,
+          bakedPlanning: !!planningGuide,
           populatedRefs,
           effectivePrompt,
         }))

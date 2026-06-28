@@ -39,19 +39,19 @@ export interface BuildExtendPromptParams {
   /**
    * Descriptions for user-supplied reference images. When provided, the
    * prompt switches to multi-image mode and labels them so the model
-   * understands their role relative to the tile strip (IMAGE 1).
+   * understands their role relative to the working canvas (IMAGE 1).
    */
   referenceImages?: { description: string }[]
   /**
-   * When set, a phase-1 planning result is attached as an extra image.  The
-   * prompt inserts a block that identifies this image and explains its role
-   * as a low-res composition guide — not a pixel source.
+   * When true, IMAGE 1 is the baked tile-slice composite: the extension area
+   * already contains the low-resolution planning preview rather than solid
+   * grey. The prompt frames the task as rendering that low-res preview at full
+   * resolution, rather than free-form extension into grey space.
    *
-   * The label index accounts for IMAGE 1 (tile strip) already being taken;
-   * the caller is responsible for injecting the planning result image at the
-   * correct position in the API message.
+   * User reference images follow immediately as IMAGE 2, 3, … — there is no
+   * separate IMAGE slot for a planning guide.
    */
-  hasPlanningGuide?: boolean
+  hasBakedPlanning?: boolean
 }
 
 export interface BuildPlanningPromptParams {
@@ -135,7 +135,7 @@ export function buildExtendPrompt(params: BuildExtendPromptParams): string {
     sceneBrief,
     attempt = 0,
     referenceImages,
-    hasPlanningGuide,
+    hasBakedPlanning,
   } = params
 
   const directionDescriptions: Record<string, string> = {
@@ -149,13 +149,14 @@ export function buildExtendPrompt(params: BuildExtendPromptParams): string {
   const isFullContext = !!useFullContext
   const isChunked = !isFullContext && !!chunkInfo
 
-  // Multi-image mode activates when the user has supplied reference images OR
-  // a planning guide is present (both add extra images after the tile strip).
+  // Multi-image mode activates when the user has supplied reference images.
+  // When hasBakedPlanning is true the planning preview is already composited
+  // into IMAGE 1 — there is no separate IMAGE 2 slot for a planning guide.
   const hasRefs = !!(referenceImages && referenceImages.length > 0)
-  const hasExtras = hasRefs || !!hasPlanningGuide
+  const hasExtras = hasRefs
 
-  // Planning guide is IMAGE 2 when present; user refs follow after it.
-  const refImageOffset = hasPlanningGuide ? 2 : 1
+  // User refs always start at IMAGE 2 (planning guide is no longer a separate image).
+  const refImageOffset = 1
 
   const multiImagePreamble = hasExtras
     ? `MULTI-IMAGE REQUEST — IMAGE ROLES:
@@ -168,7 +169,9 @@ export function buildExtendPrompt(params: BuildExtendPromptParams): string {
   // Wording switches between single-image and multi-image requests.
   const workingImage = hasExtras ? 'IMAGE 1' : 'this image'
   const layoutLabel = hasExtras ? 'IMAGE 1' : 'THIS IMAGE'
-  const outputImage = hasExtras ? 'IMAGE 1 with the gray area filled' : 'the complete image with the blank area filled'
+  const outputImage = hasBakedPlanning
+    ? (hasExtras ? 'IMAGE 1 with the extension area rendered at full resolution' : 'the complete image with the extension area rendered at full resolution')
+    : (hasExtras ? 'IMAGE 1 with the gray area filled' : 'the complete image with the blank area filled')
 
   let prompt: string
 
@@ -200,13 +203,28 @@ CRITICAL: If you return ${workingImage} unchanged with the gray area still prese
       : direction === 'right' ? 'left'
       : 'right'
 
-    const movingDir =
-      direction === 'down' ? 'downward (further below the current view)'
-      : direction === 'up' ? 'upward (further above the current view)'
-      : direction === 'right' ? 'to the right (further right of the current view)'
-      : 'to the left (further left of the current view)'
+    if (hasBakedPlanning) {
+      // The extension area is pre-filled with a low-res planning preview.
+      // Frame the task as super-resolution of that preview, not free invention.
+      prompt = `${multiImagePreamble}You are an expert image renderer. You have been given a ${isHorizDir ? 'vertical' : 'horizontal'} strip${hasExtras ? ' (IMAGE 1)' : ''} where the extension area already contains a low-resolution composition preview.
 
-    prompt = `${multiImagePreamble}You are an expert at seamlessly extending images. You have been given a ${isHorizDir ? 'vertical' : 'horizontal'} strip${hasExtras ? ' (IMAGE 1)' : ''} of an image to extend.
+PIXEL LAYOUT OF ${layoutLabel}:
+- ${contextSide.toUpperCase()} ${contextPx}px → HIGH-RESOLUTION existing scene content. Preserve these pixels EXACTLY — pixel-perfect, no changes whatsoever.
+- ${dirDesc.toUpperCase()} ${extPx}px → LOW-RESOLUTION composition preview showing the planned extension. Render this area at full resolution.
+
+YOUR TASK:
+1. Preserve EVERY pixel in the ${contextSide} ${contextPx}px high-resolution area exactly as-is — do not alter them in any way.
+2. Render the ${dirDesc} ${extPx}px area at full resolution: match the composition, subjects, spatial layout, and colour relationships shown in the low-resolution preview, but add the full detail, sharpness, and texture quality expected at native resolution.
+3. Match the colour palette, lighting direction, and atmosphere of the high-resolution portion exactly.
+4. Make the boundary between the high-resolution and rendered areas completely invisible — no seam, colour shift, or brightness jump.`
+    } else {
+      const movingDir =
+        direction === 'down' ? 'downward (further below the current view)'
+        : direction === 'up' ? 'upward (further above the current view)'
+        : direction === 'right' ? 'to the right (further right of the current view)'
+        : 'to the left (further left of the current view)'
+
+      prompt = `${multiImagePreamble}You are an expert at seamlessly extending images. You have been given a ${isHorizDir ? 'vertical' : 'horizontal'} strip${hasExtras ? ' (IMAGE 1)' : ''} of an image to extend.
 
 PIXEL LAYOUT OF ${layoutLabel}:
 - ${contextSide.toUpperCase()} ${contextPx}px → EXISTING scene content. You must preserve these pixels EXACTLY unchanged.
@@ -218,6 +236,7 @@ YOUR TASK:
 3. Match the perspective, lighting, color palette, and art style of the existing content exactly.
 4. Make the transition between existing and new content completely invisible — no seam, color shift, or brightness jump.
 5. Keep every pixel in the existing ${contextPx}px area pixel-perfect and unchanged.`
+    }
   } else {
     prompt = `${multiImagePreamble}You are an expert at seamlessly extending images. ${hasExtras ? 'IMAGE 1 has' : 'This image has'} a light gray blank area on the ${dirDesc} that needs to be filled naturally.
 
@@ -306,21 +325,14 @@ KEY INSTRUCTIONS:
   }
 
   // Reference images block — only present when user has supplied refs.
-  // IMAGE 1 is always the tile strip; planning guide (if present) takes IMAGE 2;
-  // user refs start at IMAGE (refImageOffset + 1).
+  // IMAGE 1 is always the working canvas; user refs start at IMAGE 2.
   if (hasRefs && referenceImages) {
     const refLines = referenceImages.map((ref, i) => {
       const label = `IMAGE ${refImageOffset + 1 + i}`
       const note = ref.description.trim() ? ref.description.trim() : 'general style or scene reference'
       return `- ${label}: ${note}`
     })
-    prompt += `\n\nREFERENCE IMAGES: In addition to IMAGE 1 (the tile strip), you have been provided ${referenceImages.length} user reference image${referenceImages.length === 1 ? '' : 's'}:\n${refLines.join('\n')}\nUse these to inform the style, mood, and content of the new area. The non-gray pixels in IMAGE 1 remain your primary guide for continuity — blend any reference-inspired content seamlessly with what is already visible in IMAGE 1.`
-  }
-
-  // Planning guide block — emitted after user refs so numbering is clean.
-  if (hasPlanningGuide) {
-    const guideLabel = `IMAGE 2`
-    prompt += `\n\nCOMPOSITION GUIDE (${guideLabel}): A low-resolution planning image was generated in a prior pass. It shows a suggested composition for the grey area of IMAGE 1. Use it as a layout and mood reference only — do NOT copy its pixels. Your output must match the full-resolution colour, texture, and edge continuity of IMAGE 1's existing pixels. Do NOT use the dimensions of ${guideLabel} for your output.`
+    prompt += `\n\nREFERENCE IMAGES: In addition to IMAGE 1 (the working canvas), you have been provided ${referenceImages.length} user reference image${referenceImages.length === 1 ? '' : 's'}:\n${refLines.join('\n')}\nUse these to inform the style, mood, and content of the extension area. The high-resolution pixels in IMAGE 1 remain your primary guide for continuity — blend any reference-inspired content seamlessly with what is already visible in IMAGE 1.`
   }
 
   prompt += `\n\nFINAL OUTPUT: Return ${outputImage}. The result must look like a single, unified ${artStyle && ART_STYLE_DESCRIPTIONS[artStyle] ? 'artistic work' : 'scene'} with absolutely no visible seams. The boundary should be completely invisible.`
@@ -337,7 +349,10 @@ KEY INSTRUCTIONS:
         ? chunkInfo.chunkHeight + chunkInfo.extensionSize
         : chunkInfo.originalHeight
     const dimTarget = hasExtras ? 'IMAGE 1' : 'the input image'
-    prompt += `\n\nOUTPUT DIMENSIONS: Return ${outputImage} at exactly ${chunkW}x${chunkH} pixels — the same dimensions as ${dimTarget}.${hasExtras ? ' Do NOT use the dimensions of any reference image.' : ''} Fill every gray pixel in the blank area. Do NOT return a different size or aspect ratio.`
+    const fillInstruction = hasBakedPlanning
+      ? 'Render the extension area at full resolution.'
+      : 'Fill every gray pixel in the blank area.'
+    prompt += `\n\nOUTPUT DIMENSIONS: Return ${outputImage} at exactly ${chunkW}x${chunkH} pixels — the same dimensions as ${dimTarget}.${hasExtras ? ' Do NOT use the dimensions of any reference image.' : ''} ${fillInstruction} Do NOT return a different size or aspect ratio.`
 
     if (typeof chunkInfo.tileIndex === 'number' && typeof chunkInfo.tileCount === 'number') {
       prompt += `\n\nTILE CONTEXT: This is tile ${chunkInfo.tileIndex + 1} of ${chunkInfo.tileCount} in a larger extension. Any non-gray edge shows content from an already-finished neighbour tile — continue the scene seamlessly across every such edge. Do NOT repeat or mirror content from the existing (non-gray) portions of this or any adjacent tile.`
@@ -385,12 +400,13 @@ export function buildPlanningPrompt(params: BuildPlanningPromptParams): string {
 `
     : ''
 
-  let prompt = `${preamble}PLANNING TASK: You are generating a low-resolution composition plan for tile ${tileIndex + 1} of ${tileCount} in a multi-tile image extension.
+  let prompt = `
+  ${preamble}
 
-You have been given a scaled-down planning map of the full extension band. The map uses three colour regions:
-- GREY (#B0B0B0): the blank area for THIS tile — the only region you must fill.
-- RED (#FF0000): blank areas reserved for FUTURE tiles (generated later) — leave these exactly as red.
-- All other pixels: real scene content (already painted) — preserve these exactly unchanged.
+  The WORKING CANVAS uses three colour regions:
+- GREY (#B0B0B0): FILL THIS AREA with a continuation of the existing scene. Leaving any grey pixels unchanged is a FAILURE.
+- RED (#FF0000): DO NOT MODIFY OR FILL THESE PIXELS. Changing any red pixels is a FAILURE.
+- All other pixels: real scene content (already painted) — preserve these exactly unchanged. Changing any non-grey, non-red pixels is a FAILURE.
 
 YOUR TASK:
 1. Fill EVERY grey pixel with scene content that fits naturally into the overall composition.
@@ -401,8 +417,8 @@ YOUR TASK:
 COMPOSITION RULES:
 - The grey area is on the ${direction === 'up' ? 'top' : direction === 'down' ? 'bottom' : direction === 'left' ? 'left' : 'right'} side.
 - Continue the existing scene naturally — same horizon, lighting direction, atmosphere, and scale.
+- Do not duplicate, repeat, or mirror content from the existing (non-grey) portions of this or any adjacent tile.
 - Do NOT introduce subjects or thematic elements that would conflict with the red (future) regions.
-- Keep the composition balanced: the red areas will be filled by other tiles in a consistent style.
 - This is a planning sketch — focus on correct layout and tonal composition over fine detail.`
 
   if (artStyle && ART_STYLE_DESCRIPTIONS[artStyle]) {

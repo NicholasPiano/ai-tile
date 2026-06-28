@@ -1917,6 +1917,54 @@ export function buildTileInput(
   return tile.toDataURL('image/jpeg', 0.95)
 }
 
+/**
+ * Build the composite IMAGE 1 sent to the phase-2 refine API call.
+ *
+ * Same pixel dimensions as buildTileInput, but the grey blank region is
+ * replaced by the low-resolution planning slice scaled to fit.  The model
+ * therefore receives:
+ *   - High-resolution context strip → preserve exactly.
+ *   - Low-resolution extension preview → render at full quality.
+ *
+ * Falls back to the plain tile input if the planning slice fails to load.
+ */
+export function buildTileSliceComposite(
+  bandCanvas: HTMLCanvasElement,
+  tileSpec: ExtensionTileSpec,
+  planningSlice: string,
+): Promise<string> {
+  return new Promise((resolve) => {
+    const { bandX, bandY, tileWidth, tileHeight, blankRegion } = tileSpec
+
+    const composite = document.createElement('canvas')
+    composite.width  = tileWidth
+    composite.height = tileHeight
+    const ctx = composite.getContext('2d')
+    if (!ctx) {
+      resolve(buildTileInput(bandCanvas, tileSpec))
+      return
+    }
+
+    // Draw the full tile from the band canvas as the base layer.
+    // This gives us the high-res context strip and the grey blank area.
+    ctx.drawImage(bandCanvas, bandX, bandY, tileWidth, tileHeight, 0, 0, tileWidth, tileHeight)
+
+    // Load the planning slice and draw it scaled into the blank region,
+    // replacing the grey pixels with the low-res composition preview.
+    const sliceImg = new Image()
+    sliceImg.onload = () => {
+      ctx.drawImage(
+        sliceImg,
+        0, 0, sliceImg.naturalWidth, sliceImg.naturalHeight,
+        blankRegion.x, blankRegion.y, blankRegion.width, blankRegion.height,
+      )
+      resolve(composite.toDataURL('image/jpeg', 0.95))
+    }
+    sliceImg.onerror = () => resolve(buildTileInput(bandCanvas, tileSpec))
+    sliceImg.src = planningSlice
+  })
+}
+
 /** Red used for future-tile regions on the planning map. */
 const PLANNING_MAP_FUTURE_COLOR = '#FF0000'
 
