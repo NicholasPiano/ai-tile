@@ -19,7 +19,7 @@ import { PROP_BATCH, PROP_BATCH_COLS, PROP_BATCH_H, PROP_BATCH_ROWS, PROP_BATCH_
 import { SPRITE_ANIMATIONS, SPRITE_FRAME_COUNT, SPRITE_FRAME_SIZE, SPRITE_GRID_COLS, SPRITE_GRID_ROWS, SPRITE_SHEET_H, SPRITE_SHEET_W, SPRITE_STRIP_H, SPRITE_STRIP_W, SpriteAnimType, SpriteFrame, SpriteSheet, createEmptySpriteSheet } from '@/app/lib/sprite'
 import { BODY_PLANS, BodyPlan, isAirborneAnim } from '@/app/lib/bodyPlans'
 import { CORNER_GRAFTS, ENABLE_CORNER_RECONCILE, TILESET_ATLAS_EXTRUDE_PX, TILESET_BY_ROLE, TILESET_COLS, TILESET_PADDED_SHEET_H, TILESET_PADDED_SHEET_W, TILESET_PADDED_STRIDE, TILESET_ROWS, TILESET_SHEET_H, TILESET_SHEET_W, TILESET_SLOTS, TILESET_TILE_SIZE, TILE_TEMPLATE_CELL, TILE_TEMPLATE_COLS, TILE_TEMPLATE_H, TILE_TEMPLATE_MASK, TILE_TEMPLATE_ROWS, TILE_TEMPLATE_SAMPLES, TILE_TEMPLATE_W, TileSetRole, TileSetSlot, alignAiOutputToTemplate, applyFeatheredRoleMask, buildTileSheetGuideDataUrl, createEmptyTileSet, rebuildCornerTile, reconcileAllCorners, templateRoleForCell } from '@/app/lib/tileset'
-import { alignSpriteFramesToBaseline, applyFullContextResult, buildTileChunkInfo, buildTileInput, buildTilePlanningMap, centerSpriteFramesHorizontally, ChunkInfo, chromaKeyToAlpha, compositeTileResult, createChunkedExtension, createFullContextExtension, ExtensionTileSpec, getChunkAlign, getImageDimensions, harmonizeHorizontalSeams, initBandCanvas, isolatePrimarySpriteComponent, isAiExtensionUnfilled, isTileResultUnfilled, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, measureSeamResidual, normalizeImageToSize, normalizeSpriteFrameScale, planExtensionTiles, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk, TiledExtensionPlan } from '@/app/utils/imageProcessor'
+import { alignSpriteFramesToBaseline, applyFullContextResult, buildTileChunkInfo, buildTileInput, buildTilePlanningMap, centerSpriteFramesHorizontally, ChunkInfo, chromaKeyToAlpha, compositeTileResult, createChunkedExtension, createFullContextExtension, cropPlanningResult, ExtensionTileSpec, getChunkAlign, getImageDimensions, harmonizeHorizontalSeams, initBandCanvas, isolatePrimarySpriteComponent, isAiExtensionUnfilled, isTileResultUnfilled, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, measureSeamResidual, normalizeImageToSize, normalizeSpriteFrameScale, planExtensionTiles, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk, TiledExtensionPlan } from '@/app/utils/imageProcessor'
 import { SubjectBounds, drawPoseGuideSheet, measureSubjectBounds } from '@/app/utils/poseRig'
 import JSZip from 'jszip'
 
@@ -93,12 +93,18 @@ export default function Home() {
     tilePreviews: (string | null)[]
     /** Per non-skipped tile: phase-1 planning result data URL, or null. */
     tilePlanningPreviews: (string | null)[]
+    /** Per non-skipped tile: planning map (full scene + red/grey overlays) sent to phase 1, or null. */
+    tilePlanningMaps: (string | null)[]
+    /** Per non-skipped tile: cropped tile-region slice of the plan result sent to phase 2, or null. */
+    tilePlanningSlices: (string | null)[]
     /** Per non-skipped tile: whether the user has accepted the generated result. */
     tileAccepted: boolean[]
     /** Per non-skipped tile: user-supplied reference images (may be empty array). */
     tileReferenceImages: ReferenceImage[][]
     /** Non-skipped index of the tile currently being generated, or null. */
     generatingTileIdx: number | null
+    /** True when the in-flight generation is a plan-only (phase 1 only) run. */
+    generatingPlanOnly: boolean
   }
 
   const [pendingTiledPlan, setPendingTiledPlan] = useState<PendingTiledPlan | null>(null)
@@ -844,7 +850,7 @@ export default function Home() {
    * Alpha-keyed parallax layers also skip phase 1 to avoid colour confusion with
    * the magenta key colour.
    */
-  const generateTile = useCallback(async (nsIdx: number) => {
+  const generateTile = useCallback(async (nsIdx: number, planOnly = false) => {
     const plan = pendingTiledPlanRef.current
     if (!plan) return
 
@@ -870,7 +876,7 @@ export default function Home() {
     const useTwoPhase = nonSkippedCount > 1 && !isKeyedLayer
 
     setPendingTiledPlan((prev) =>
-      prev ? { ...prev, generatingTileIdx: nsIdx } : null
+      prev ? { ...prev, generatingTileIdx: nsIdx, generatingPlanOnly: planOnly } : null
     )
 
     const callApi = async (
@@ -928,32 +934,68 @@ export default function Home() {
       let planningGuide: string | undefined
 
       if (useTwoPhase) {
-        // Phase 1 — planning map
-        const { mapDataUrl, mapWidth, mapHeight } = buildTilePlanningMap(
-          canvas,
-          plan.nonSkippedTileSpecs,
-          tileSpec,
-          plan.tileAccepted,
-        )
+        // Reuse an existing plan slice if one is already stored for this tile —
+        // the user may have run Re-plan separately or this is a retry after a
+        // failed phase-2 call.  Only re-run phase 1 when no slice is present.
+        // When planOnly = true the user explicitly wants to re-run phase 1, so
+        // always bypass the cache in that case.
+        const existingSlice = planOnly
+          ? null
+          : (pendingTiledPlanRef.current?.tilePlanningSlices[nsIdx] ?? null)
 
-        const rawPlan = await callApi(mapDataUrl, {
-          phase: 'plan',
-          populatedRefs,
-          effectivePrompt,
-          planningTileIndex: nsIdx,
-          planningTileCount: nonSkippedCount,
-        })
+        if (existingSlice) {
+          planningGuide = existingSlice
+        } else {
+          // Phase 1 — planning map (full source image + tile colour overlays)
+          const { mapDataUrl, mapWidth, mapHeight, tileRegionInMap } = await buildTilePlanningMap(
+            plan.sourceImage,
+            canvas,
+            plan.nonSkippedTileSpecs,
+            tileSpec,
+            plan.tileAccepted,
+            direction,
+            plan.imageWidth,
+            plan.imageHeight,
+            plan.contextSize,
+            plan.extensionSize,
+          )
 
-        // Normalize to exact map dimensions before phase 2.
-        planningGuide = await normalizeImageToSize(rawPlan, mapWidth, mapHeight)
+          const rawPlan = await callApi(mapDataUrl, {
+            phase: 'plan',
+            populatedRefs,
+            effectivePrompt,
+            planningTileIndex: nsIdx,
+            planningTileCount: nonSkippedCount,
+          })
 
-        // Store for UI preview.
-        setPendingTiledPlan((prev) => {
-          if (!prev) return null
-          const next = [...prev.tilePlanningPreviews]
-          next[nsIdx] = planningGuide as string
-          return { ...prev, tilePlanningPreviews: next }
-        })
+          // Normalize the full planning result to exact map dimensions.
+          const normalizedPlan = await normalizeImageToSize(rawPlan, mapWidth, mapHeight)
+
+          // Crop to just the tile's blank region for phase 2 — phase 2 works
+          // with the tile strip, so only the corresponding composition slice is
+          // relevant.  The full result is kept separately for the UI preview.
+          planningGuide = await cropPlanningResult(normalizedPlan, tileRegionInMap)
+
+          // Store all three new data URLs together:
+          //   tilePlanningMaps     → the planning map sent to phase 1 (step 3)
+          //   tilePlanningPreviews → the full phase-1 result (step 4)
+          //   tilePlanningSlices   → the cropped tile region sent to phase 2 (step 5)
+          setPendingTiledPlan((prev) => {
+            if (!prev) return null
+            const maps    = [...prev.tilePlanningMaps];    maps[nsIdx]    = mapDataUrl
+            const results = [...prev.tilePlanningPreviews]; results[nsIdx] = normalizedPlan
+            const slices  = [...prev.tilePlanningSlices];  slices[nsIdx]  = planningGuide as string
+            return { ...prev, tilePlanningMaps: maps, tilePlanningPreviews: results, tilePlanningSlices: slices }
+          })
+        }
+
+        // Plan-only run — skip phase 2 and release the generating lock.
+        if (planOnly) {
+          setPendingTiledPlan((prev) =>
+            prev ? { ...prev, generatingTileIdx: null, generatingPlanOnly: false } : null
+          )
+          return
+        }
       }
 
       // Phase 2 (or single-phase) — full-res refinement
@@ -981,7 +1023,7 @@ export default function Home() {
         if (!prev) return null
         const next = [...prev.tilePreviews]
         next[nsIdx] = raw
-        return { ...prev, tilePreviews: next, generatingTileIdx: null }
+        return { ...prev, tilePreviews: next, generatingTileIdx: null, generatingPlanOnly: false }
       })
     } catch (err) {
       const e = err as Error & { status?: number }
@@ -991,7 +1033,7 @@ export default function Home() {
         setShowApiKeyModal(true)
       }
       setPendingTiledPlan((prev) =>
-        prev ? { ...prev, generatingTileIdx: null } : null
+        prev ? { ...prev, generatingTileIdx: null, generatingPlanOnly: false } : null
       )
     }
   }, [apiKey, selectedModel, mode, sceneBrief, customPrompt, artStyle])
@@ -1190,9 +1232,12 @@ export default function Home() {
       tilePrompts: new Array<string>(nonSkippedCount).fill(''),
       tilePreviews: new Array<string | null>(nonSkippedCount).fill(null),
       tilePlanningPreviews: new Array<string | null>(nonSkippedCount).fill(null),
+      tilePlanningMaps: new Array<string | null>(nonSkippedCount).fill(null),
+      tilePlanningSlices: new Array<string | null>(nonSkippedCount).fill(null),
       tileAccepted: new Array<boolean>(nonSkippedCount).fill(false),
       tileReferenceImages: Array.from({ length: nonSkippedCount }, () => [] as ReferenceImage[]),
       generatingTileIdx: null,
+      generatingPlanOnly: false,
     }
 
     pendingTiledPlanRef.current = newPlan
@@ -4419,6 +4464,9 @@ export default function Home() {
             nonSkippedCount={plan.nonSkippedCount}
             preview={plan.tilePreviews[nsIdx] ?? null}
             planningPreview={plan.tilePlanningPreviews[nsIdx] ?? null}
+            sourceImage={plan.sourceImage}
+            planningMap={plan.tilePlanningMaps[nsIdx] ?? null}
+            planningSlice={plan.tilePlanningSlices[nsIdx] ?? null}
             isNextPending={getNextPendingTileIdx(plan.tileAccepted) === nsIdx}
             isGenerating={plan.generatingTileIdx === nsIdx}
             bandCanvas={bandCanvasRef.current}
@@ -4440,8 +4488,10 @@ export default function Home() {
               })
             }
             onGenerate={() => void generateTile(nsIdx)}
+            onReplan={() => void generateTile(nsIdx, true)}
             onAccept={() => void acceptTile(nsIdx)}
             onClose={() => setActiveTileModalIdx(null)}
+            isReplanInProgress={plan.generatingTileIdx === nsIdx && plan.generatingPlanOnly}
           />
         )
       })()}

@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { Icons } from '@/app/components/icons'
 import { ART_STYLE_GROUPS } from '@/app/lib/artStyles'
 import { buildExtendPrompt, buildPlanningPrompt } from '@/app/lib/extendPrompt'
@@ -1131,6 +1131,12 @@ export interface TileExtensionModalProps {
   preview: string | null
   /** Phase-1 planning guide result, or null if two-phase not yet complete. */
   planningPreview: string | null
+  /** Full source image before any extension (step 2). */
+  sourceImage: string
+  /** Planning map (full scene + red/grey overlays) sent to phase 1 (step 3). */
+  planningMap: string | null
+  /** Cropped tile-region slice of the plan result sent to phase 2 (step 5). */
+  planningSlice: string | null
   /** True when this is the next tile in scan order (Retry/Accept enabled). */
   isNextPending: boolean
   /** True while the API call for this tile is in-flight. */
@@ -1142,8 +1148,12 @@ export interface TileExtensionModalProps {
   onSetTilePrompt: (v: string) => void
   onSetTileReferenceImages: (v: ReferenceImage[]) => void
   onGenerate: () => void
+  /** Trigger a plan-only (phase 1) re-run for this tile. */
+  onReplan: () => void
   onAccept: () => void
   onClose: () => void
+  /** True when the in-flight generation for this tile is plan-only (phase 1). */
+  isReplanInProgress: boolean
 }
 
 export function TileExtensionModal({
@@ -1159,6 +1169,9 @@ export function TileExtensionModal({
   nonSkippedCount,
   preview,
   planningPreview,
+  sourceImage,
+  planningMap,
+  planningSlice,
   isNextPending,
   isGenerating,
   bandCanvas,
@@ -1166,8 +1179,10 @@ export function TileExtensionModal({
   onSetTilePrompt,
   onSetTileReferenceImages,
   onGenerate,
+  onReplan,
   onAccept,
   onClose,
+  isReplanInProgress,
 }: TileExtensionModalProps) {
   const [inputImageUrl, setInputImageUrl] = useState<string | null>(null)
   const [resultDimensions, setResultDimensions] = useState<{ width: number; height: number } | null>(null)
@@ -1531,157 +1546,302 @@ export function TileExtensionModal({
               </pre>
             </details>
 
-            {/* Images row */}
-            <div className="flex gap-3">
-              {/* Input image */}
-              <div className="flex-1 min-w-0">
-                <p
-                  className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
-                  style={{ color: 'var(--text-muted)' }}
-                >
-                  Input
-                </p>
-                <div
-                  className="checker relative overflow-hidden rounded-[var(--radius-sm)]"
-                  style={{
-                    border: '1px solid var(--border)',
-                    aspectRatio: `${tileSpec.tileWidth} / ${tileSpec.tileHeight}`,
-                    background: 'var(--surface)',
-                  }}
-                >
-                  {inputImageUrl ? (
-                    <img
-                      src={inputImageUrl}
-                      alt="Tile input"
-                      className="w-full h-full object-contain block"
-                      draggable={false}
-                    />
-                  ) : (
-                    <div className="absolute inset-0 flex items-center justify-center">
-                      <Icons.Spinner size={16} />
-                    </div>
-                  )}
-                </div>
-                <p
-                  className="mt-1.5 font-mono text-[11px] text-center"
-                  style={{ color: 'var(--text-muted)' }}
-                >
-                  {tileSpec.tileWidth} × {tileSpec.tileHeight}
-                </p>
-              </div>
+            {/* ── Image pipeline ───────────────────────────────────── */}
+            {(() => {
+              const tileAR = `${tileSpec.tileWidth} / ${tileSpec.tileHeight}`
+              // Phase detection for status labels and spinner placement.
+              // planningMap (and planningPreview/planningSlice) are all stored in
+              // one combined setState call once phase 1 completes, so before that
+              // call all three are null.
+              const isPhase1 = showTwoPhase && isGenerating && planningMap === null
+              const isPhase2 = showTwoPhase && isGenerating && planningMap !== null
 
-              {/* Planning guide — only shown when two-phase is active */}
-              {showTwoPhase && (
-                <div className="flex-1 min-w-0">
-                  <p
-                    className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
-                    style={{ color: 'var(--text-muted)' }}
-                  >
-                    Plan guide
-                  </p>
+              /** Spinner + pulse overlay used while a phase is in flight. */
+              const spinnerOverlay = (size: number) => (
+                <>
+                  <div className="absolute inset-0 flex items-center justify-center">
+                    <Icons.Spinner size={size} />
+                  </div>
                   <div
-                    className="checker relative overflow-hidden rounded-[var(--radius-sm)]"
+                    className="absolute inset-0 animate-pulse"
+                    style={{ background: 'rgba(80,80,130,0.3)' }}
+                  />
+                </>
+              )
+
+              /** Muted dash placeholder for cells not yet populated. */
+              const emptyCell = (
+                <div
+                  className="absolute inset-0 flex items-center justify-center text-[11px]"
+                  style={{ color: 'var(--text-muted)' }}
+                >
+                  —
+                </div>
+              )
+
+              /** Common thumbnail container. */
+              const thumbStyle = (ar: string, highlight = false): React.CSSProperties => ({
+                border: `1px solid ${highlight ? 'var(--border-strong)' : 'var(--border)'}`,
+                aspectRatio: ar,
+                background: 'var(--surface)',
+                borderRadius: 'var(--radius-sm)',
+                position: 'relative',
+                overflow: 'hidden',
+              })
+
+              /** Shared cell label style. */
+              const labelCls = 'mb-1.5 text-[11px] uppercase tracking-wider font-medium'
+              const labelStyle: React.CSSProperties = { color: 'var(--text-muted)' }
+              const subtitleCls = 'mt-1 text-[11px] text-center'
+              const subtitleStyle: React.CSSProperties = { color: 'var(--text-muted)' }
+
+              if (showTwoPhase) {
+                return (
+                  <div
                     style={{
-                      border: '1px solid var(--border)',
-                      aspectRatio: '1 / 1',
-                      background: 'var(--surface)',
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(3, 1fr)',
+                      gap: 10,
                     }}
                   >
-                    {isGenerating && !planningPreview && (
-                      <div className="absolute inset-0 flex items-center justify-center">
-                        <Icons.Spinner size={16} />
+                    {/* Step 1 — Input (tile strip sent to phase 2) */}
+                    <div>
+                      <p className={labelCls} style={labelStyle}>Input</p>
+                      <div className="checker" style={thumbStyle('1 / 1')}>
+                        {inputImageUrl ? (
+                          <img
+                            src={inputImageUrl}
+                            alt="Tile input"
+                            className="w-full h-full object-contain block"
+                            draggable={false}
+                          />
+                        ) : (
+                          <div className="absolute inset-0 flex items-center justify-center">
+                            <Icons.Spinner size={14} />
+                          </div>
+                        )}
                       </div>
-                    )}
-                    {isGenerating && !planningPreview && (
-                      <div
-                        className="absolute inset-0 animate-pulse"
-                        style={{ background: 'rgba(80,80,130,0.3)' }}
-                      />
-                    )}
-                    {planningPreview && (
-                      <img
-                        src={planningPreview}
-                        alt="Planning guide"
-                        className="w-full h-full object-contain block"
-                        draggable={false}
-                      />
-                    )}
-                    {!isGenerating && !planningPreview && (
-                      <div
-                        className="absolute inset-0 flex items-center justify-center text-[11px]"
-                        style={{ color: 'var(--text-muted)' }}
-                      >
-                        —
-                      </div>
-                    )}
-                  </div>
-                  <p
-                    className="mt-1.5 text-[11px] text-center"
-                    style={{ color: 'var(--text-muted)' }}
-                  >
-                    {isGenerating && !planningPreview ? 'Planning…' : planningPreview ? 'Done' : '—'}
-                  </p>
-                </div>
-              )}
-
-              {/* Result image */}
-              <div className="flex-1 min-w-0">
-                <p
-                  className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
-                  style={{ color: 'var(--text-muted)' }}
-                >
-                  Result
-                </p>
-                <div
-                  className="checker relative overflow-hidden rounded-[var(--radius-sm)]"
-                  style={{
-                    border: `1px solid ${hasPreview ? 'var(--border-strong)' : 'var(--border)'}`,
-                    aspectRatio: `${tileSpec.tileWidth} / ${tileSpec.tileHeight}`,
-                    background: 'var(--surface)',
-                  }}
-                >
-                  {isGenerating && !hasPreview && (
-                    <div className="absolute inset-0 flex items-center justify-center">
-                      <Icons.Spinner size={16} />
+                      <p className={`font-mono ${subtitleCls}`} style={subtitleStyle}>
+                        {tileSpec.tileWidth} × {tileSpec.tileHeight}
+                      </p>
                     </div>
-                  )}
-                  {isGenerating && !hasPreview && (
-                    <div
-                      className="absolute inset-0 animate-pulse"
-                      style={{ background: 'rgba(80,80,130,0.3)' }}
-                    />
-                  )}
-                  {hasPreview && preview && (
-                    <img
-                      src={preview}
-                      alt="Tile result"
-                      className="w-full h-full object-contain block"
-                      draggable={false}
-                    />
-                  )}
-                  {!isGenerating && !hasPreview && (
-                    <div
-                      className="absolute inset-0 flex items-center justify-center text-[11px]"
+
+                    {/* Step 2 — Source (full original image, always available) */}
+                    <div>
+                      <p className={labelCls} style={labelStyle}>Source</p>
+                      <div className="checker" style={thumbStyle('1 / 1')}>
+                        <img
+                          src={sourceImage}
+                          alt="Source image"
+                          className="w-full h-full object-contain block"
+                          draggable={false}
+                        />
+                      </div>
+                      <p className={subtitleCls} style={subtitleStyle}>Original</p>
+                    </div>
+
+                    {/* Step 3 — Plan map (full scene + red/grey, phase 1 input) */}
+                    <div>
+                      <p className={labelCls} style={labelStyle}>Plan map</p>
+                      <div className="checker" style={thumbStyle('1 / 1')}>
+                        {planningMap ? (
+                          <img
+                            src={planningMap}
+                            alt="Planning map"
+                            className="w-full h-full object-contain block"
+                            draggable={false}
+                          />
+                        ) : isPhase1 ? (
+                          spinnerOverlay(14)
+                        ) : (
+                          emptyCell
+                        )}
+                      </div>
+                      <p className={subtitleCls} style={subtitleStyle}>
+                        {isPhase1 ? 'Planning…' : planningMap ? 'Done' : '—'}
+                      </p>
+                    </div>
+
+                    {/* Step 4 — Plan result (full scene with grey filled, phase 1 output) */}
+                    <div>
+                      <p className={labelCls} style={labelStyle}>Plan result</p>
+                      <div className="checker" style={thumbStyle('1 / 1', !!planningPreview)}>
+                        {planningPreview ? (
+                          <img
+                            src={planningPreview}
+                            alt="Plan result"
+                            className="w-full h-full object-contain block"
+                            draggable={false}
+                          />
+                        ) : isPhase1 ? (
+                          spinnerOverlay(14)
+                        ) : (
+                          emptyCell
+                        )}
+                      </div>
+                      <p className={subtitleCls} style={subtitleStyle}>
+                        {isPhase1 ? 'Planning…' : planningPreview ? 'Done' : '—'}
+                      </p>
+                    </div>
+
+                    {/* Step 5 — Tile slice (crop of plan result sent to phase 2) */}
+                    <div>
+                      <p className={labelCls} style={labelStyle}>Tile slice</p>
+                      <div className="checker" style={thumbStyle('1 / 1')}>
+                        {planningSlice ? (
+                          <img
+                            src={planningSlice}
+                            alt="Tile slice"
+                            className="w-full h-full object-contain block"
+                            draggable={false}
+                          />
+                        ) : isPhase1 ? (
+                          spinnerOverlay(14)
+                        ) : (
+                          emptyCell
+                        )}
+                      </div>
+                      <p className={subtitleCls} style={subtitleStyle}>
+                        {isPhase1 ? 'Planning…' : planningSlice ? 'Done' : '—'}
+                      </p>
+                    </div>
+
+                    {/* Step 6 — Result (phase 2 output) */}
+                    <div>
+                      <p className={labelCls} style={labelStyle}>Result</p>
+                      <div className="checker" style={thumbStyle('1 / 1', hasPreview)}>
+                        {hasPreview && preview ? (
+                          <img
+                            src={preview}
+                            alt="Tile result"
+                            className="w-full h-full object-contain block"
+                            draggable={false}
+                          />
+                        ) : isPhase2 ? (
+                          spinnerOverlay(14)
+                        ) : (
+                          <div
+                            className="absolute inset-0 flex items-center justify-center text-[11px]"
+                            style={{ color: 'var(--text-muted)' }}
+                          >
+                            {isPhase1 ? '—' : 'Not generated yet'}
+                          </div>
+                        )}
+                      </div>
+                      <p className={`font-mono ${subtitleCls}`} style={subtitleStyle}>
+                        {resultDimensions
+                          ? `${resultDimensions.width} × ${resultDimensions.height}`
+                          : isPhase2
+                          ? 'Refining…'
+                          : hasPreview
+                          ? '…'
+                          : '—'}
+                      </p>
+                    </div>
+                  </div>
+                )
+              }
+
+              // Single-phase: just Input + Result in a row
+              return (
+                <div className="flex gap-3">
+                  {/* Input */}
+                  <div className="flex-1 min-w-0">
+                    <p
+                      className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
                       style={{ color: 'var(--text-muted)' }}
                     >
-                      Not generated yet
+                      Input
+                    </p>
+                    <div
+                      className="checker relative overflow-hidden rounded-[var(--radius-sm)]"
+                      style={{
+                        border: '1px solid var(--border)',
+                        aspectRatio: tileAR,
+                        background: 'var(--surface)',
+                      }}
+                    >
+                      {inputImageUrl ? (
+                        <img
+                          src={inputImageUrl}
+                          alt="Tile input"
+                          className="w-full h-full object-contain block"
+                          draggable={false}
+                        />
+                      ) : (
+                        <div className="absolute inset-0 flex items-center justify-center">
+                          <Icons.Spinner size={16} />
+                        </div>
+                      )}
                     </div>
-                  )}
+                    <p
+                      className="mt-1.5 font-mono text-[11px] text-center"
+                      style={{ color: 'var(--text-muted)' }}
+                    >
+                      {tileSpec.tileWidth} × {tileSpec.tileHeight}
+                    </p>
+                  </div>
+
+                  {/* Result */}
+                  <div className="flex-1 min-w-0">
+                    <p
+                      className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
+                      style={{ color: 'var(--text-muted)' }}
+                    >
+                      Result
+                    </p>
+                    <div
+                      className="checker relative overflow-hidden rounded-[var(--radius-sm)]"
+                      style={{
+                        border: `1px solid ${hasPreview ? 'var(--border-strong)' : 'var(--border)'}`,
+                        aspectRatio: tileAR,
+                        background: 'var(--surface)',
+                      }}
+                    >
+                      {isGenerating && !hasPreview && (
+                        <>
+                          <div className="absolute inset-0 flex items-center justify-center">
+                            <Icons.Spinner size={16} />
+                          </div>
+                          <div
+                            className="absolute inset-0 animate-pulse"
+                            style={{ background: 'rgba(80,80,130,0.3)' }}
+                          />
+                        </>
+                      )}
+                      {hasPreview && preview && (
+                        <img
+                          src={preview}
+                          alt="Tile result"
+                          className="w-full h-full object-contain block"
+                          draggable={false}
+                        />
+                      )}
+                      {!isGenerating && !hasPreview && (
+                        <div
+                          className="absolute inset-0 flex items-center justify-center text-[11px]"
+                          style={{ color: 'var(--text-muted)' }}
+                        >
+                          Not generated yet
+                        </div>
+                      )}
+                    </div>
+                    <p
+                      className="mt-1.5 font-mono text-[11px] text-center"
+                      style={{ color: 'var(--text-muted)' }}
+                    >
+                      {resultDimensions
+                        ? `${resultDimensions.width} × ${resultDimensions.height}`
+                        : hasPreview
+                        ? '…'
+                        : isGenerating
+                        ? 'Generating…'
+                        : '—'}
+                    </p>
+                  </div>
                 </div>
-                <p
-                  className="mt-1.5 font-mono text-[11px] text-center"
-                  style={{ color: 'var(--text-muted)' }}
-                >
-                  {resultDimensions
-                    ? `${resultDimensions.width} × ${resultDimensions.height}`
-                    : hasPreview
-                    ? '…'
-                    : isGenerating && showTwoPhase && planningPreview
-                    ? 'Refining…'
-                    : '—'}
-                </p>
-              </div>
-            </div>
+              )
+            })()}
 
             {/* Actions */}
             <div className="flex items-center justify-between">
@@ -1694,16 +1854,35 @@ export function TileExtensionModal({
               </button>
 
               <div className="flex gap-2">
+                {/* Re-plan — only available in two-phase mode */}
+                {showTwoPhase && (
+                  <button
+                    onClick={onReplan}
+                    disabled={!canAct}
+                    className="btn btn-ghost"
+                    title={!isNextPending ? 'Accept prior tiles first' : 'Re-run phase 1 only'}
+                  >
+                    {isReplanInProgress ? (
+                      <>
+                        <Icons.Spinner size={13} />
+                        Re-planning…
+                      </>
+                    ) : (
+                      <>↺ Re-plan</>
+                    )}
+                  </button>
+                )}
+
                 <button
                   onClick={onGenerate}
                   disabled={!canAct}
                   className="btn btn-ghost"
                   title={!isNextPending ? 'Accept prior tiles first' : undefined}
                 >
-                  {isGenerating ? (
+                  {isGenerating && !isReplanInProgress ? (
                     <>
                       <Icons.Spinner size={13} />
-                      {showTwoPhase && !planningPreview ? 'Planning…' : 'Generating…'}
+                      {showTwoPhase && !planningPreview ? 'Planning…' : 'Refining…'}
                     </>
                   ) : (
                     <>↺ {hasPreview ? 'Retry' : 'Generate'}</>

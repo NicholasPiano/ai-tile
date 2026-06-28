@@ -1921,77 +1921,199 @@ export function buildTileInput(
 const PLANNING_MAP_FUTURE_COLOR = '#FF0000'
 
 /**
- * Build a scaled-down planning map of the full extension band for phase 1.
+ * Build a scaled-down planning map of the full scene for phase 1.
  *
- * The map shows three visually distinct regions so the model understands the
- * global composition context before filling the current tile:
+ * Unlike the previous implementation which used only the narrow band canvas,
+ * this version composites the complete source image together with the
+ * extension area so the model has full spatial context (complete horizon,
+ * sky/ground split, subject placement) when deciding what to put in the grey
+ * fill region.
  *
- *   - Real pixels (context strip + already-accepted tiles) — copied from the
- *     running band canvas so the model sees an accurate current state.
- *   - Current tile's blank region — EXTENSION_BLANK_COLOR (#B0B0B0), the grey
- *     area the model must fill during phase 1.
- *   - Future tiles' blank regions (not yet accepted) — PLANNING_MAP_FUTURE_COLOR
- *     (#FF0000), explicitly marked as "do not fill, handled later".
+ * Layout in full-scene coordinates:
+ *   down  → source image on top,  extension rows below
+ *   up    → extension rows on top, source image below
+ *   right → source image on left, extension cols to the right
+ *   left  → extension cols on left, source image to the right
  *
- * The entire band is scaled down to fit within `maxDim` pixels on the longest
- * edge before adding the colour overlays, so the image stays small and fast.
+ * Colour regions in the extension area:
+ *   - Already-accepted tiles   → real pixels (copied from band canvas)
+ *   - Current tile blank region → EXTENSION_BLANK_COLOR (#B0B0B0)
+ *   - Future tile blank regions → PLANNING_MAP_FUTURE_COLOR (#FF0000)
+ *
+ * The full scene is scaled to fit within `maxDim` on the longest edge.
  */
 export function buildTilePlanningMap(
+  sourceImageDataUrl: string,
   bandCanvas: HTMLCanvasElement,
   allTileSpecs: ExtensionTileSpec[],
   currentTileSpec: ExtensionTileSpec,
   acceptedMask: boolean[],
+  direction: 'up' | 'down' | 'left' | 'right',
+  imageWidth: number,
+  imageHeight: number,
+  contextSize: number,
+  extensionSize: number,
   maxDim = 512,
-): { mapDataUrl: string; mapWidth: number; mapHeight: number } {
-  const bw = bandCanvas.width
-  const bh = bandCanvas.height
+): Promise<{ mapDataUrl: string; mapWidth: number; mapHeight: number; tileRegionInMap: { x: number; y: number; width: number; height: number } }> {
+  return new Promise((resolve) => {
+    const srcImg = new Image()
+    srcImg.onload = () => {
+      // ── Full-scene dimensions ────────────────────────────────────────────
+      // The full scene is the source image + the extension strip laid out
+      // adjacently. These are in unscaled "full-scene" pixel coordinates.
+      const isVertical = direction === 'down' || direction === 'up'
 
-  // Scale factor to fit within maxDim on the longest edge.
-  const scale = Math.min(1, maxDim / Math.max(bw, bh))
-  const outW  = Math.max(1, Math.round(bw * scale))
-  const outH  = Math.max(1, Math.round(bh * scale))
+      const sceneW = isVertical ? imageWidth          : imageWidth  + extensionSize
+      const sceneH = isVertical ? imageHeight + extensionSize : imageHeight
 
-  const map = document.createElement('canvas')
-  map.width  = outW
-  map.height = outH
-  const ctx = map.getContext('2d')
-  if (!ctx) {
-    return { mapDataUrl: bandCanvas.toDataURL('image/jpeg', 0.85), mapWidth: bw, mapHeight: bh }
-  }
+      // Where the source image sits in the full scene.
+      const srcOffsetX = direction === 'left' ? extensionSize : 0
+      const srcOffsetY = direction === 'up'   ? extensionSize : 0
 
-  // Draw the full band (contains real pixels + grey blanks from un-accepted tiles).
-  ctx.drawImage(bandCanvas, 0, 0, bw, bh, 0, 0, outW, outH)
+      // Where the extension band sits in the full scene (top-left corner).
+      const extOffsetX = direction === 'right' ? imageWidth  : 0
+      const extOffsetY = direction === 'down'  ? imageHeight : 0
 
-  // Paint future tiles' blank regions red (do this before grey so the current
-  // tile overrides any overlap, though tile specs should not overlap).
-  ctx.fillStyle = PLANNING_MAP_FUTURE_COLOR
-  for (let i = 0; i < allTileSpecs.length; i++) {
-    const spec = allTileSpecs[i]
-    if (spec === currentTileSpec) continue
-    if (acceptedMask[i]) continue
-    // Paint the blank region for this unprocessed future tile.
-    const br = spec.blankRegion
-    if (br.width === 0 || br.height === 0) continue
-    // Convert from tile-local coords to band coords, then scale.
-    const bx = Math.round((spec.bandX + br.x) * scale)
-    const by = Math.round((spec.bandY + br.y) * scale)
-    const bw2 = Math.max(1, Math.round(br.width  * scale))
-    const bh2 = Math.max(1, Math.round(br.height * scale))
-    ctx.fillRect(bx, by, bw2, bh2)
-  }
+      // The band canvas has `contextSize` rows/cols copied from the source
+      // image at one end and `extensionSize` rows/cols of the extension at the
+      // other.  Band coordinate → full-scene coordinate:
+      //   down  : bandX → sceneX = bandX,  bandY → sceneY = (imageHeight - contextSize) + bandY
+      //   up    : bandX → sceneX = bandX,  bandY → sceneY = (extensionSize - contextSize) + bandY
+      //             (= bandY - contextSize because extOffset=extensionSize and context at bottom)
+      //   right : bandX → sceneX = (imageWidth - contextSize) + bandX, bandY → sceneY = bandY
+      //   left  : bandX → sceneX = (extensionSize - contextSize) + bandX, bandY → sceneY = bandY
+      const bandToSceneX = (bx: number): number => {
+        if (direction === 'right') return (imageWidth  - contextSize) + bx
+        if (direction === 'left')  return (extensionSize - contextSize) + bx
+        return bx
+      }
+      const bandToSceneY = (by: number): number => {
+        if (direction === 'down') return (imageHeight - contextSize) + by
+        if (direction === 'up')   return (extensionSize - contextSize) + by
+        return by
+      }
 
-  // Paint the current tile's blank region grey (the fill target for phase 1).
-  ctx.fillStyle = EXTENSION_BLANK_COLOR
-  const cur = currentTileSpec.blankRegion
-  if (cur.width > 0 && cur.height > 0) {
-    const cx = Math.round((currentTileSpec.bandX + cur.x) * scale)
-    const cy = Math.round((currentTileSpec.bandY + cur.y) * scale)
-    const cw = Math.max(1, Math.round(cur.width  * scale))
-    const ch = Math.max(1, Math.round(cur.height * scale))
-    ctx.fillRect(cx, cy, cw, ch)
-  }
+      // ── Scale to fit within maxDim ───────────────────────────────────────
+      const scale = Math.min(1, maxDim / Math.max(sceneW, sceneH))
+      const outW  = Math.max(1, Math.round(sceneW * scale))
+      const outH  = Math.max(1, Math.round(sceneH * scale))
 
-  return { mapDataUrl: map.toDataURL('image/jpeg', 0.90), mapWidth: outW, mapHeight: outH }
+      const map = document.createElement('canvas')
+      map.width  = outW
+      map.height = outH
+      const ctx = map.getContext('2d')
+      if (!ctx) {
+        resolve({ mapDataUrl: bandCanvas.toDataURL('image/jpeg', 0.85), mapWidth: map.width, mapHeight: map.height, tileRegionInMap: { x: 0, y: 0, width: map.width, height: map.height } })
+        return
+      }
+
+      // Scaled extension-zone rectangle (used in multiple steps below).
+      const extSceneW = isVertical ? imageWidth    : extensionSize
+      const extSceneH = isVertical ? extensionSize : imageHeight
+      const extSX = Math.round(extOffsetX * scale)
+      const extSY = Math.round(extOffsetY * scale)
+      const extSW = Math.max(1, Math.round(extSceneW * scale))
+      const extSH = Math.max(1, Math.round(extSceneH * scale))
+
+      // ── Step 1: draw the full source image ───────────────────────────────
+      ctx.drawImage(
+        srcImg, 0, 0, imageWidth, imageHeight,
+        Math.round(srcOffsetX * scale),
+        Math.round(srcOffsetY * scale),
+        Math.max(1, Math.round(imageWidth  * scale)),
+        Math.max(1, Math.round(imageHeight * scale)),
+      )
+
+      // ── Step 2: paint the ENTIRE extension zone red ──────────────────────
+      // Painting the whole extension zone red at once is more reliable than
+      // enumerating individual future tiles, which can leave gaps when tile
+      // blank regions don't perfectly tile-cover the extension area.
+      ctx.fillStyle = PLANNING_MAP_FUTURE_COLOR
+      ctx.fillRect(extSX, extSY, extSW, extSH)
+
+      // ── Step 3: restore accepted-tile regions with real pixels ───────────
+      // Draw accepted tiles' blank regions back on top of the red fill.
+      for (let i = 0; i < allTileSpecs.length; i++) {
+        if (!acceptedMask[i]) continue
+        const spec = allTileSpecs[i]
+        const br   = spec.blankRegion
+        if (br.width === 0 || br.height === 0) continue
+
+        const bBandX = spec.bandX + br.x
+        const bBandY = spec.bandY + br.y
+        const sX = Math.round(bandToSceneX(bBandX) * scale)
+        const sY = Math.round(bandToSceneY(bBandY) * scale)
+        const sW = Math.max(1, Math.round(br.width  * scale))
+        const sH = Math.max(1, Math.round(br.height * scale))
+        ctx.drawImage(bandCanvas, bBandX, bBandY, br.width, br.height, sX, sY, sW, sH)
+      }
+
+      // ── Step 4: paint the current tile's blank region grey ───────────────
+      // This is the ONLY grey area — the fill target for phase 1.
+      ctx.fillStyle = EXTENSION_BLANK_COLOR
+      const cur    = currentTileSpec.blankRegion
+      // Record the tile blank region in map coordinates so the caller can
+      // crop the planning result to just this region for phase 2.
+      const tileRegionInMap = { x: 0, y: 0, width: 1, height: 1 }
+      if (cur.width > 0 && cur.height > 0) {
+        const bBandX = currentTileSpec.bandX + cur.x
+        const bBandY = currentTileSpec.bandY + cur.y
+        const sX = Math.round(bandToSceneX(bBandX) * scale)
+        const sY = Math.round(bandToSceneY(bBandY) * scale)
+        const sW = Math.max(1, Math.round(cur.width  * scale))
+        const sH = Math.max(1, Math.round(cur.height * scale))
+        ctx.fillRect(sX, sY, sW, sH)
+        tileRegionInMap.x = sX
+        tileRegionInMap.y = sY
+        tileRegionInMap.width  = sW
+        tileRegionInMap.height = sH
+      }
+
+      resolve({ mapDataUrl: map.toDataURL('image/jpeg', 0.90), mapWidth: outW, mapHeight: outH, tileRegionInMap })
+    }
+
+    srcImg.onerror = () => {
+      // Fallback: return the whole band canvas rather than crashing.
+      resolve({ mapDataUrl: bandCanvas.toDataURL('image/jpeg', 0.85), mapWidth: bandCanvas.width, mapHeight: bandCanvas.height, tileRegionInMap: { x: 0, y: 0, width: bandCanvas.width, height: bandCanvas.height } })
+    }
+
+    srcImg.crossOrigin = 'anonymous'
+    srcImg.src = sourceImageDataUrl
+  })
+}
+
+/**
+ * Crop a planning-phase result image to the sub-rectangle that corresponds to
+ * the current tile's blank region.
+ *
+ * After phase 1 returns a filled planning image (full-scene dimensions), only
+ * the portion that was the grey fill target is relevant to phase 2.  Cropping
+ * to that rectangle gives the model a compact, tile-aligned composition guide
+ * rather than the full annotated scene.
+ */
+export function cropPlanningResult(
+  planningResultDataUrl: string,
+  tileRegion: { x: number; y: number; width: number; height: number },
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => {
+      const { x, y, width, height } = tileRegion
+      const canvas = document.createElement('canvas')
+      canvas.width  = Math.max(1, width)
+      canvas.height = Math.max(1, height)
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        resolve(planningResultDataUrl)
+        return
+      }
+      ctx.drawImage(img, x, y, width, height, 0, 0, width, height)
+      resolve(canvas.toDataURL('image/jpeg', 0.90))
+    }
+    img.onerror = () => reject(new Error('Failed to load planning result for crop'))
+    img.crossOrigin = 'anonymous'
+    img.src = planningResultDataUrl
+  })
 }
 
 /**
