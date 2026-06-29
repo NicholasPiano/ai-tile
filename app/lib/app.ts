@@ -118,6 +118,120 @@ export type ReferenceImage = {
 
 export const STORAGE_MODE = 'extender:mode'
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Tiled Inpaint Pipeline — shared types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Whether the edit mask is defined by the drawn rectangle or by an AI-generated B&W image. */
+export type InpaintMaskType = 'rect' | 'image'
+
+/**
+ * User-defined region for inpainting — the drawn selection, its derived context
+ * perimeter, and the mask that restricts which pixels may change.
+ */
+export interface InpaintRegion {
+  /** Selection drawn by the user, in image-pixel coordinates. */
+  selectionRect: { x: number; y: number; w: number; h: number }
+  /** Which kind of mask governs the edit zone. */
+  maskType: InpaintMaskType
+  /** B&W mask URL from /api/edit-mask (text-mask path only). Undefined for 'rect'. */
+  maskImageUrl?: string
+  /** Context perimeter bounding rect in image-pixel coordinates. */
+  contextRect: { x: number; y: number; w: number; h: number }
+}
+
+/** Phases of the tiled inpaint workflow managed by EditStudio. */
+export type InpaintPhase =
+  | 'mask'      // Stage 1: choose mask type / describe what to mask
+  | 'prompt'    // Stage 2: enter edit description + optional reference images
+  | 'planning'  // Phase 1 running: low-res global plan
+  | 'tiling'    // Phase 2 running: per-tile high-res refinement
+  | 'done'      // All tiles complete; awaiting Accept / Discard
+
+/**
+ * One tile in the 2-D inpaint grid.  Position and size are in context-perimeter
+ * coordinates (origin = top-left of contextRect).
+ */
+export interface InpaintTileSpec {
+  row: number
+  col: number
+  totalRows: number
+  totalCols: number
+  /** Top-left in context-perimeter coordinates. */
+  x: number
+  y: number
+  /** Pixel dimensions of this tile. */
+  w: number
+  h: number
+  /** Feather overlap in pixels per edge (0 = no feather on that edge). */
+  featherOverlap: { top: number; bottom: number; left: number; right: number }
+  /**
+   * The intersection of the edit mask with this tile in tile-local coordinates.
+   * Null when the tile is pure context — the API call should be skipped.
+   */
+  maskSubRect: { x: number; y: number; w: number; h: number } | null
+}
+
+/** Tile plan produced by planInpaintTiles. */
+export interface InpaintTilePlan {
+  tiles: InpaintTileSpec[]
+  /** Pixel width of the context perimeter canvas. */
+  contextW: number
+  /** Pixel height of the context perimeter canvas. */
+  contextH: number
+}
+
+/**
+ * Full phase-machine state for an active inpaint session managed by EditStudio.
+ * EditPanel receives this as a prop and renders accordingly.
+ */
+export interface InpaintState {
+  phase: InpaintPhase
+  region: InpaintRegion
+  editPrompt: string
+  referenceImages: ReferenceImage[]
+  /**
+   * Low-res context crop built from the source image.
+   * Shared input for mask generation (step 3) and the global plan (step 5).
+   * Kept clean (no annotation) so it can be sent directly to the API.
+   */
+  lowResContextUrl: string | null
+  /**
+   * Same crop as `lowResContextUrl` but with the selection rectangle drawn
+   * on top as a visual aid — used only for display in the panel preview.
+   * Never changes after the selection is committed.
+   */
+  lowResPreviewUrl: string | null
+  /**
+   * Context crop composited with the AI-generated mask as a blue highlight.
+   * Set after /api/edit-mask returns. Shown as a second preview below the
+   * original selection preview in the locked mask section.
+   */
+  maskOverlayUrl: string | null
+  /** Scale factor from context-perimeter pixels to low-res-crop pixels. */
+  lowResScale: number
+  /** Phase 1 global plan result URL (low-res). */
+  globalPlanUrl: string | null
+  tilePlan: InpaintTilePlan | null
+  /** Per-tile AI result URLs (null = not yet generated). */
+  tileResults: Array<string | null>
+  /** Index of the tile currently being processed. Null when idle. */
+  generatingTileIdx: number | null
+  /** True while the mask is being generated (within 'mask' phase). */
+  maskGenerating: boolean
+  error: string | null
+  /**
+   * Debug: the data URL of the last tile's INPUT image (what was sent to the model).
+   * Only populated when DEBUG_PAINT_TEST is false; shown in the panel for diagnosis.
+   */
+  tileDebugInputUrl: string | null
+  /**
+   * Debug: the data URL of the last tile's RESULT image (what the model returned).
+   * Only populated when DEBUG_PAINT_TEST is false; shown alongside the input.
+   */
+  tileDebugResultUrl: string | null
+}
+
 /**
  * Common engine-friendly horizontal targets for sidescroller backgrounds.
  * Multiples of common 16:9 game widths so tiling lands on clean boundaries.

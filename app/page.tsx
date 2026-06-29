@@ -4522,6 +4522,13 @@ export default function Home() {
           dimensions={currentImageDimensions}
           onPickFile={() => fileInputRef.current?.click()}
           onDropFile={handleFile}
+          apiKey={apiKey}
+          model={selectedModel}
+          onAccept={(newImageUrl) => {
+            setSelectedImage(newImageUrl)
+            setExtendedCandidates([])
+            // Inpainting preserves image dimensions — no need to reset them.
+          }}
         />
       ) : !displayImage ? (
         <EmptyState
