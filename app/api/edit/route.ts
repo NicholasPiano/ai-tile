@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import {
-  buildInpaintPlanPrompt,
-  buildInpaintTilePrompt,
+  buildGlobalPlanPrompt,
+  buildTileRefinementPrompt,
+  buildMaskExtractionPrompt,
 } from '@/app/lib/editPrompt'
 import type { ReferenceImage } from '@/app/lib/app'
 
@@ -53,46 +54,51 @@ function extractImageFromAny(node: unknown): string | null {
 /**
  * POST /api/edit
  *
- * Dual-purpose inpaint route used for both the Phase 1 global plan and the
- * Phase 2 per-tile refinement passes of the Tiled Inpaint Pipeline.
+ * Unified inpaint route for all three phases of the Tiled Inpaint Pipeline:
  *
- * Body:
- *   phase             'plan' | 'refine'
- *   imageDataUrl      string   — low-res masked context crop (plan) or
- *                               full-res tile input with baked plan (refine)
- *   editPrompt        string   — what to do in the masked region
- *   referenceImages?  ReferenceImage[]  — optional reference images
- *   maskDataUrl?      string   — B&W mask (plan phase, text-mask path only)
- *   apiKey?           string   — BYOK OpenRouter key
- *   model?            string   — OpenRouter model id
+ *   phase: 'plan'
+ *     imageDataUrl      — low-res context crop with grey fill + red border
+ *     editPrompt        — what to generate inside the red border
+ *     referenceImages?  — optional style reference images
  *
- * Response:
- *   { resultUrl: string }
+ *   phase: 'extract-mask'
+ *     sourceContextUrl  — original (clean) low-res context crop
+ *     globalPlanUrl     — the 'plan' phase result to compare against
+ *
+ *   phase: 'refine'
+ *     imageDataUrl      — full-res tile with plan content baked in + blue border
+ *     editPrompt        — what was changed (passed to tile-refinement prompt)
+ *     referenceImages?  — optional style reference images
+ *
+ * All phases return { resultUrl: string }.
  */
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json() as {
-      phase: 'plan' | 'refine'
-      imageDataUrl: string
-      editPrompt: string
+      phase: 'plan' | 'extract-mask' | 'refine'
+      imageDataUrl?: string
+      sourceContextUrl?: string
+      globalPlanUrl?: string
+      editPrompt?: string
       referenceImages?: ReferenceImage[]
-      maskDataUrl?: string
       apiKey?: string
       model?: string
     }
 
-    const { phase, imageDataUrl, editPrompt, referenceImages, maskDataUrl, apiKey, model } = body
+    const {
+      phase,
+      imageDataUrl,
+      sourceContextUrl,
+      globalPlanUrl: globalPlanBodyUrl,
+      editPrompt,
+      referenceImages,
+      apiKey,
+      model,
+    } = body
 
-    if (!phase || (phase !== 'plan' && phase !== 'refine')) {
+    if (!phase || !['plan', 'extract-mask', 'refine'].includes(phase)) {
       return NextResponse.json(
-        { error: 'phase must be "plan" or "refine"' },
-        { status: 400 },
-      )
-    }
-
-    if (!imageDataUrl || !editPrompt?.trim()) {
-      return NextResponse.json(
-        { error: 'imageDataUrl and editPrompt are required' },
+        { error: 'phase must be "plan", "extract-mask", or "refine"' },
         { status: 400 },
       )
     }
@@ -112,38 +118,61 @@ export async function POST(request: NextRequest) {
     const modelId =
       typeof model === 'string' && model.trim() ? model.trim() : DEFAULT_MODEL
 
-    const prompt =
-      phase === 'plan'
-        ? buildInpaintPlanPrompt(editPrompt.trim())
-        : buildInpaintTilePrompt(editPrompt.trim())
-
     type ImagePart = { type: 'image_url'; image_url: { url: string } }
     type TextPart = { type: 'text'; text: string }
     type ContentPart = ImagePart | TextPart
 
-    const content: ContentPart[] = [
-      { type: 'image_url', image_url: { url: imageDataUrl } },
-    ]
+    let content: ContentPart[]
+    let temperature: number
 
-    // For the plan phase with a text-generated mask: include the B&W mask so
-    // the model has precise pixel-level guidance about which area to fill.
-    if (phase === 'plan' && maskDataUrl) {
-      content.push({ type: 'image_url', image_url: { url: maskDataUrl } })
-    }
+    if (phase === 'extract-mask') {
+      if (!sourceContextUrl || !globalPlanBodyUrl) {
+        return NextResponse.json(
+          { error: 'sourceContextUrl and globalPlanUrl are required for extract-mask phase' },
+          { status: 400 },
+        )
+      }
 
-    // Append any user-supplied reference images.
-    if (Array.isArray(referenceImages)) {
-      for (const ref of referenceImages) {
-        if (ref.dataUrl) {
-          content.push({ type: 'image_url', image_url: { url: ref.dataUrl } })
-          if (ref.description?.trim()) {
-            content.push({ type: 'text', text: `Reference image note: ${ref.description.trim()}` })
+      content = [
+        { type: 'image_url', image_url: { url: sourceContextUrl } },
+        { type: 'image_url', image_url: { url: globalPlanBodyUrl } },
+        { type: 'text', text: buildMaskExtractionPrompt() },
+      ]
+      temperature = 0.1
+
+    } else {
+      // 'plan' or 'refine'
+      if (!imageDataUrl || !editPrompt?.trim()) {
+        return NextResponse.json(
+          { error: 'imageDataUrl and editPrompt are required for plan/refine phases' },
+          { status: 400 },
+        )
+      }
+
+      const prompt =
+        phase === 'plan'
+          ? buildGlobalPlanPrompt(editPrompt.trim())
+          : buildTileRefinementPrompt(editPrompt.trim())
+
+      content = [
+        { type: 'image_url', image_url: { url: imageDataUrl } },
+      ]
+
+      // Append any user-supplied reference images.
+      if (Array.isArray(referenceImages)) {
+        for (const ref of referenceImages) {
+          if (ref.dataUrl) {
+            content.push({ type: 'image_url', image_url: { url: ref.dataUrl } })
+            if (ref.description?.trim()) {
+              content.push({ type: 'text', text: `Reference image note: ${ref.description.trim()}` })
+            }
           }
         }
       }
-    }
 
-    content.push({ type: 'text', text: prompt })
+      content.push({ type: 'text', text: prompt })
+      temperature = phase === 'plan' ? 0.4 : 0.3
+    }
 
     const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
@@ -157,7 +186,7 @@ export async function POST(request: NextRequest) {
         model: modelId,
         messages: [{ role: 'user', content }],
         max_tokens: 2000,
-        temperature: phase === 'plan' ? 0.4 : 0.3,
+        temperature,
       }),
     })
 

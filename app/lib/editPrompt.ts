@@ -1,119 +1,22 @@
 /**
- * Prompt builders for the Edit-tab mask-generation and inpainting workflow.
+ * Prompt builders for the Edit-tab inpainting workflow.
  *
- * These are pure string-building functions used by both the API routes (server)
- * and optionally the client. Do NOT add 'use client' here.
+ * Pure string-building functions — no 'use client' so they can be safely
+ * imported by both API routes (server) and client components.
  */
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Mask generation
+// Stage 1 — global low-res plan
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Prompt for generating a black-and-white mask from a user description.
+ * Prompt for generating the global low-resolution inpaint plan.
  *
- * The model receives the context region image (selection + surrounding strip)
- * and should return a pure B&W mask at exactly the same dimensions.
- *
- * WHITE pixels → area matching `description`
- * BLACK pixels → everything else
+ * The model receives a context-region image where the selection area has been
+ * filled with grey (#B0B0B0) and bordered in red. It should fill the grey zone
+ * with content that matches `editDescription` and blends into the context.
  */
-export function buildMaskPrompt(description: string): string {
-  return [
-    'You are a precision image mask generator.',
-    '',
-    'I will give you an image. Return a black-and-white mask image that is the',
-    'EXACT same pixel dimensions as the input.',
-    '',
-    `WHITE pixels (#FFFFFF): the area that matches "${description}"`,
-    'BLACK pixels (#000000): everything else',
-    '',
-    'Rules:',
-    '- Return ONLY the mask image — no text, no explanation, no border',
-    '- Same pixel width and height as the input image',
-    '- Use clean, hard edges at object boundaries (avoid anti-aliased fades)',
-  ].join('\n')
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Inpainting
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Prompt for inpainting when the edit zone is the full selection box.
- *
- * The model receives one image: the context region (strip + selection) with the
- * selection area drawn in a blue rectangle. Only that rectangle may change.
- * The strip border around it is the theme guide and must remain unchanged.
- */
-export function buildSelectionInpaintPrompt(editDescription: string): string {
-  return [
-    'You are an expert inpainting artist.',
-    '',
-    'You have been given a scene image.',
-    'A blue-bordered rectangle marks the EDIT ZONE.',
-    'The surrounding area outside that rectangle is the CONTEXT ZONE.',
-    '',
-    `Edit instruction: ${editDescription}`,
-    '',
-    'Critical rules:',
-    '- Apply the edit ONLY inside the blue rectangle.',
-    '- Do NOT alter any pixel outside the blue rectangle — the context zone must',
-    '  be pixel-perfect and completely unchanged.',
-    '- Study the context zone carefully: match its lighting, colour temperature,',
-    '  perspective, texture density, and art style exactly.',
-    '- Blend the edited region seamlessly into the surrounding context at every edge.',
-    '- Return the COMPLETE image at exactly the same dimensions as the input.',
-    '  Do not crop, letterbox, or resize.',
-  ].join('\n')
-}
-
-/**
- * Prompt for inpainting when a text-generated mask defines the edit zone.
- *
- * The model receives TWO images:
- *   IMAGE 1 — the context region (strip + selection)
- *   IMAGE 2 — a black-and-white mask (WHITE = edit zone, BLACK = do not touch)
- *
- * Only the WHITE area in the mask may change.
- */
-export function buildMaskedInpaintPrompt(editDescription: string): string {
-  return [
-    'You are an expert inpainting artist.',
-    '',
-    'IMAGE 1: the scene to edit (contains a context ring and an inner edit region)',
-    'IMAGE 2: a black-and-white mask',
-    '   WHITE = the exact pixels that should be edited',
-    '   BLACK = the exact pixels that must not change at all',
-    '',
-    `Edit instruction: ${editDescription}`,
-    '',
-    'Critical rules:',
-    '- Edit ONLY the WHITE area indicated by the mask.',
-    '- The BLACK area must remain completely unchanged — pixel-perfect.',
-    '- Study the BLACK (context) area carefully: match its lighting, colour',
-    '  temperature, perspective, texture density, and art style exactly.',
-    '- Blend the edited region seamlessly into the context at every boundary.',
-    '- Return the COMPLETE image at exactly the same dimensions as IMAGE 1.',
-    '  Do not crop, letterbox, or resize.',
-  ].join('\n')
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Tiled Inpaint Pipeline prompts
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Phase 1 prompt for generating a global low-res inpaint plan.
- *
- * The model receives the low-res context crop where the masked area has been
- * filled with grey (#B0B0B0). It should fill the grey with content that
- * matches the instruction and blends seamlessly with the surrounding context.
- *
- * Optionally a second image (B&W mask) can be prepended by the caller when
- * the user is on the text-mask path, to clarify the exact fill region.
- */
-export function buildInpaintPlanPrompt(editDescription: string): string {
+export function buildGlobalPlanPrompt(editDescription: string): string {
   return [
     'You are an expert image inpainting artist.',
     '',
@@ -139,41 +42,89 @@ export function buildInpaintPlanPrompt(editDescription: string): string {
   ].join('\n')
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 2 — change-mask extraction
+// ─────────────────────────────────────────────────────────────────────────────
+
 /**
- * Phase 2 prompt for high-resolution per-tile refinement.
+ * Prompt for extracting a B&W change-mask by comparing the original context
+ * crop with the global plan result.
  *
- * The model receives a full-resolution tile where the masked sub-region shows
- * a scaled-up (blurry/low-res) preview of the intended result from Phase 1,
- * with a solid 4-pixel blue border marking its exact boundary.
- * The surrounding pixels are the original high-resolution context.
+ * The model receives two images:
+ *   IMAGE 1 — original source context crop (before any edits)
+ *   IMAGE 2 — global plan result (after edits)
  *
- * The model must upscale/refine the low-res content inside the blue border
- * into crisp, high-resolution content that matches the edit instruction and
- * blends seamlessly with the context — WITHOUT changing anything outside
- * the blue border.
+ * Returns a B&W mask at the same dimensions:
+ *   WHITE (#FFFFFF) — pixels that changed
+ *   BLACK (#000000) — pixels that are unchanged
  */
-export function buildInpaintTilePrompt(editDescription: string): string {
+export function buildMaskExtractionPrompt(): string {
+  return [
+    'You are a precision image change-detection tool.',
+    '',
+    'You have been given two images of the same scene:',
+    '  IMAGE 1 — the ORIGINAL image (before any edits)',
+    '  IMAGE 2 — the EDITED image (after changes have been made)',
+    '',
+    'Return a black-and-white mask image at the EXACT same pixel dimensions',
+    'as the input images.',
+    '',
+    'WHITE pixels (#FFFFFF): pixels that have visibly changed between the two images',
+    'BLACK pixels (#000000): pixels that are unchanged',
+    '',
+    'Rules:',
+    '- Return ONLY the mask image — no text, no explanation, no border',
+    '- Match the exact pixel dimensions of the input images',
+    '- Use clean edges at change boundaries',
+    '- Add a small margin around changed regions to ensure natural blending',
+  ].join('\n')
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 3 — per-tile high-resolution refinement
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Prompt for per-tile high-resolution refinement.
+ *
+ * The model receives a full-resolution tile where:
+ *   - A BLUE-BORDERED rectangle marks the edit zone.
+ *   - Inside the blue border: a mix of low-res plan pixels (blurry — needs
+ *     refinement) and high-res original pixels (crisp — do not touch).
+ *   - Outside the blue border: original high-resolution context.
+ *
+ * The model must refine the blurry plan pixels to full resolution while
+ * leaving every other pixel unchanged.
+ */
+export function buildTileRefinementPrompt(editDescription: string): string {
   return [
     'You are an expert image inpainting artist doing high-resolution refinement.',
     '',
-    'You are given a full-resolution image tile. A blue-bordered rectangle marks',
-    'the EDIT ZONE. Inside that rectangle is a low-resolution, blurry preview of',
-    'the intended result. The area outside the blue border is the original',
-    'high-resolution context — it must not change.',
+    'You are given a full-resolution image tile. A BLUE-BORDERED rectangle marks',
+    'the EDIT ZONE.',
+    '',
+    '  • INSIDE the blue border: low-resolution, blurry preview pixels that show a',
+    '    rough draft of the desired result. You must replace ALL pixels inside the',
+    '    blue border with a crisp, full-resolution version that realises the edit',
+    '    instruction below.',
+    '',
+    '  • OUTSIDE the blue border: the original high-resolution context. Do NOT',
+    '    modify these pixels at all.',
     '',
     `Edit instruction: ${editDescription}`,
     '',
     'Your task:',
-    '1. Look at the low-res content inside the blue border.',
-    '2. Re-generate that content in full high resolution, following the edit',
-    '   instruction and matching the global style, lighting, and perspective.',
+    '1. Re-generate EVERY pixel inside the blue border at full high resolution,',
+    '   following the edit instruction and matching the surrounding context in',
+    '   lighting, colour, perspective, texture, and style.',
+    '2. Leave every pixel outside the blue border completely unchanged.',
     '3. Return the COMPLETE tile image at exactly the same pixel dimensions.',
     '',
     'Critical rules:',
-    '- Modify ONLY the pixels inside the blue rectangle.',
+    '- Replace ALL pixels inside the blue rectangle (they are a low-res draft).',
     '- Every pixel outside the blue rectangle must be pixel-perfect unchanged.',
-    '- Blend the edited region seamlessly into the context at every edge.',
-    '- Do NOT return the blue border itself in the output — fill right to the edge.',
+    '- Blend the edited region seamlessly into the surrounding context at each edge.',
+    '- Do NOT include or recreate the blue border itself in the output.',
     '- Do not crop, letterbox, or resize the image.',
   ].join('\n')
 }

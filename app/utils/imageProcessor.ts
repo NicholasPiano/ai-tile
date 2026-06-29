@@ -2546,29 +2546,38 @@ function buildTileFeatherMask(
   tileHeight: number,
   featherOverlap: TileFeatherOverlap,
 ): HTMLCanvasElement {
+  // Canvas dimensions and the ImageData row stride MUST be integers. The tiled
+  // inpaint pipeline produces fractional tile sizes (from global-plan scaling);
+  // if a fractional width were used as the stride, `(y * width + x) * 4` would
+  // be fractional for every row after the first, and writes to a typed array at
+  // a non-integer index are silently dropped — leaving the mask transparent and
+  // erasing the AI tile during the `destination-in` feather step.
+  const w = Math.max(1, Math.round(tileWidth))
+  const h = Math.max(1, Math.round(tileHeight))
+
   const canvas = document.createElement('canvas')
-  canvas.width  = tileWidth
-  canvas.height = tileHeight
+  canvas.width  = w
+  canvas.height = h
   const ctx = canvas.getContext('2d')
   if (!ctx) return canvas
 
-  const imageData = ctx.createImageData(tileWidth, tileHeight)
+  const imageData = ctx.createImageData(w, h)
   const d = imageData.data
 
-  for (let y = 0; y < tileHeight; y++) {
+  for (let y = 0; y < h; y++) {
     let vAlpha = 1
     if (featherOverlap.top    > 0) vAlpha = Math.min(vAlpha, y / featherOverlap.top)
-    if (featherOverlap.bottom > 0) vAlpha = Math.min(vAlpha, (tileHeight - 1 - y) / featherOverlap.bottom)
+    if (featherOverlap.bottom > 0) vAlpha = Math.min(vAlpha, (h - 1 - y) / featherOverlap.bottom)
     vAlpha = Math.max(0, Math.min(1, vAlpha))
 
-    for (let x = 0; x < tileWidth; x++) {
+    for (let x = 0; x < w; x++) {
       let hAlpha = 1
       if (featherOverlap.left  > 0) hAlpha = Math.min(hAlpha, x / featherOverlap.left)
-      if (featherOverlap.right > 0) hAlpha = Math.min(hAlpha, (tileWidth - 1 - x) / featherOverlap.right)
+      if (featherOverlap.right > 0) hAlpha = Math.min(hAlpha, (w - 1 - x) / featherOverlap.right)
       hAlpha = Math.max(0, Math.min(1, hAlpha))
 
       const alpha = Math.round(hAlpha * vAlpha * 255)
-      const idx = (y * tileWidth + x) * 4
+      const idx = (y * w + x) * 4
       d[idx] = 255; d[idx + 1] = 255; d[idx + 2] = 255; d[idx + 3] = alpha
     }
   }
@@ -4900,95 +4909,31 @@ export async function buildLowResContextCrop(
   return { dataUrl: canvas.toDataURL('image/jpeg', 0.92), scale }
 }
 
-/**
- * Grey out the masked pixels in the low-res context crop to indicate the
- * region the AI should fill (step 5 of the workflow).
- *
- * Rect path (no `maskImageUrl`): fills `selectionRect` with EXTENSION_BLANK_COLOR.
- *
- * Image path (`maskImageUrl` provided): the B&W mask was generated at the same
- * low-res dimensions as `lowResCropUrl`. White pixels in the mask that fall
- * within `selectionRect` are replaced with EXTENSION_BLANK_COLOR. This
- * implements step 4 (clip mask to drawn selection bounds) simultaneously.
- *
- * @param selectionRectInContext  Selection rect in context-perimeter coordinates
- *                                (i.e. selectionRect.x − contextRect.x, etc.)
- */
-export async function applyMaskToLowResCrop(
-  lowResCropUrl: string,
-  selectionRectInContext: { x: number; y: number; w: number; h: number },
-  lowResScale: number,
-  maskImageUrl?: string,
-): Promise<string> {
-  const cropImg = await loadImageElement(lowResCropUrl)
-  const outW = cropImg.naturalWidth
-  const outH = cropImg.naturalHeight
-
-  const canvas = document.createElement('canvas')
-  canvas.width = outW
-  canvas.height = outH
-  const ctx = canvas.getContext('2d')
-  if (!ctx) return lowResCropUrl
-
-  ctx.drawImage(cropImg, 0, 0)
-
-  // Selection bounds in low-res pixel coordinates.
-  const selLrX = Math.max(0, Math.round(selectionRectInContext.x * lowResScale))
-  const selLrY = Math.max(0, Math.round(selectionRectInContext.y * lowResScale))
-  const selLrW = Math.max(1, Math.round(selectionRectInContext.w * lowResScale))
-  const selLrH = Math.max(1, Math.round(selectionRectInContext.h * lowResScale))
-
-  if (maskImageUrl) {
-    // Text-mask path: draw B&W mask over the selection sub-rect, then grey white pixels.
-    const maskImg = await loadImageElement(maskImageUrl)
-
-    const offscreen = document.createElement('canvas')
-    offscreen.width = outW
-    offscreen.height = outH
-    const offCtx = offscreen.getContext('2d')
-    if (offCtx) {
-      offCtx.drawImage(maskImg, 0, 0, outW, outH)
-    }
-
-    const maskData = offscreen.getContext('2d')?.getImageData(selLrX, selLrY, selLrW, selLrH)
-    const cropData = ctx.getImageData(selLrX, selLrY, selLrW, selLrH)
-    if (maskData && cropData) {
-      for (let i = 0; i < maskData.data.length; i += 4) {
-        if (maskData.data[i] > 128) {
-          // White pixel in mask → grey out in crop.
-          cropData.data[i]     = 176
-          cropData.data[i + 1] = 176
-          cropData.data[i + 2] = 176
-          cropData.data[i + 3] = 255
-        }
-      }
-      ctx.putImageData(cropData, selLrX, selLrY)
-    }
-  } else {
-    // Rect path: fill the selection area with grey.
-    ctx.fillStyle = EXTENSION_BLANK_COLOR
-    ctx.fillRect(selLrX, selLrY, selLrW, selLrH)
-  }
-
-  return canvas.toDataURL('image/jpeg', 0.92)
-}
 
 /**
- * Build the input image for one inpaint tile:
- *   1. Crop the tile from the source image at full resolution.
- *   2. Fill the masked sub-rect with EXTENSION_BLANK_COLOR.
- *   3. If `planImageUrl` is provided, scale the matching portion of the
- *      Phase 1 result into the grey area ("baked planning").
+ * Build the input image for one inpaint tile.
+ *
+ *   1. Fill the entire tile canvas with source pixels.
+ *   2. When a `planImageUrl` and `globalPlanScale` are provided, bake the
+ *      corresponding region of the global plan (upscaled) into the tile, using
+ *      `globalMaskUrl` as an alpha mask so that only pixels that actually
+ *      changed get the plan content. Pixels inside the selection that were not
+ *      changed by the global plan keep their original source values — this
+ *      feeds as many high-res original pixels to the model as possible.
+ *   3. Draw a blue border around `maskSubRect` as an unambiguous boundary
+ *      marker that matches the tile-refinement prompt wording.
  *
  * Context pixels (everything outside `maskSubRect`) always come from the
- * original source image, never from Phase 1 — this implements step 6.
+ * original source image.
  */
 export async function buildInpaintTileInput(
   sourceImageUrl: string,
   contextRect: { x: number; y: number; w: number; h: number },
   tileSpec: InpaintTileSpec,
   planImageUrl?: string,
-  lowResScale?: number,
+  globalPlanScale?: number,
+  /** @deprecated No longer used — plan pixels are always drawn within maskSubRect. */
+  _globalMaskUrl?: string,
 ): Promise<string> {
   const img = await loadImageElement(sourceImageUrl)
 
@@ -5002,39 +4947,50 @@ export async function buildInpaintTileInput(
   const tileImgX = contextRect.x + tileSpec.x
   const tileImgY = contextRect.y + tileSpec.y
 
-  // Step 1: draw source pixels for this tile.
+  // Step 1: fill with source pixels.
   ctx.drawImage(img, tileImgX, tileImgY, tileSpec.w, tileSpec.h, 0, 0, tileSpec.w, tileSpec.h)
 
-  if (tileSpec.maskSubRect) {
+  if (tileSpec.maskSubRect && planImageUrl && typeof globalPlanScale === 'number' && globalPlanScale > 0) {
     const { x: mX, y: mY, w: mW, h: mH } = tileSpec.maskSubRect
 
-    // Step 2: fill the mask zone with grey so the Phase 1 bake has a clean base.
-    ctx.fillStyle = EXTENSION_BLANK_COLOR
-    ctx.fillRect(mX, mY, mW, mH)
+    const planImg = await loadImageElement(planImageUrl)
 
-    // Step 3: bake the Phase 1 low-res plan into the mask zone (scaling up).
-    // After this the zone shows a blurry upscaled preview — NOT grey.
-    if (planImageUrl && typeof lowResScale === 'number' && lowResScale > 0) {
-      const planImg = await loadImageElement(planImageUrl)
+    // The maskSubRect's position in the global-plan image coordinates.
+    // We draw ONLY the plan content that falls inside the selection boundary
+    // (maskSubRect), so the context ring always shows clean source pixels.
+    const selInCtxX = tileSpec.x + mX  // maskSubRect left edge in context-perimeter coords
+    const selInCtxY = tileSpec.y + mY  // maskSubRect top edge in context-perimeter coords
 
-      // The mask sub-rect in context-perimeter coordinates.
-      const maskCtxX = tileSpec.x + mX
-      const maskCtxY = tileSpec.y + mY
+    const planSrcX = Math.max(0, Math.round(selInCtxX * globalPlanScale))
+    const planSrcY = Math.max(0, Math.round(selInCtxY * globalPlanScale))
+    const planSrcW = Math.max(1, Math.round(mW * globalPlanScale))
+    const planSrcH = Math.max(1, Math.round(mH * globalPlanScale))
 
-      // Corresponding region in the low-res plan image.
-      const planSrcX = Math.max(0, Math.round(maskCtxX * lowResScale))
-      const planSrcY = Math.max(0, Math.round(maskCtxY * lowResScale))
-      const planSrcW = Math.max(1, Math.round(mW * lowResScale))
-      const planSrcH = Math.max(1, Math.round(mH * lowResScale))
-
-      ctx.drawImage(planImg, planSrcX, planSrcY, planSrcW, planSrcH, mX, mY, mW, mH)
+    // Step 2: overlay the plan content into maskSubRect, but FIRST downsample it
+    // by 4× so that when it is drawn back at full tile dimensions it is noticeably
+    // blurry.  This "blurry plan pixel" signal is what the refinement prompt uses
+    // to identify which pixels to re-generate.  Without the downscale step the
+    // plan pixels are already full-resolution (when globalPlanScale ≈ 1) and the
+    // model interprets them as "already crisp — do not change," returning
+    // source-identical output.
+    const PLAN_BLUR_DIVISOR = 4
+    const blurW = Math.max(1, Math.round(planSrcW / PLAN_BLUR_DIVISOR))
+    const blurH = Math.max(1, Math.round(planSrcH / PLAN_BLUR_DIVISOR))
+    const blurCanvas = document.createElement('canvas')
+    blurCanvas.width = blurW
+    blurCanvas.height = blurH
+    const blurCtx = blurCanvas.getContext('2d')
+    if (blurCtx) {
+      blurCtx.drawImage(planImg, planSrcX, planSrcY, planSrcW, planSrcH, 0, 0, blurW, blurH)
     }
+    // Draw the downsampled (blurry) plan pixels back at full maskSubRect size.
+    ctx.drawImage(blurCanvas, 0, 0, blurW, blurH, mX, mY, mW, mH)
 
-    // Step 4: draw a solid blue border around the edit zone so the model has a
-    // clear, unambiguous boundary marker that matches the refine prompt wording.
+    // Step 3: draw blue border around the selection sub-rect so the model has
+    // a clear, unambiguous boundary marker matching the refine prompt wording.
     const borderPx = Math.max(3, Math.round(Math.min(mW, mH) * 0.015))
     ctx.strokeStyle = '#2563EB'
-    ctx.lineWidth = borderPx * 2   // strokeRect centres on the path, so double to keep it inside
+    ctx.lineWidth = borderPx * 2  // strokeRect centres the path, so double to stay inside
     ctx.strokeRect(mX, mY, mW, mH)
   }
 
@@ -5061,17 +5017,39 @@ export async function compositeInpaintTileResult(
   const feather: TileFeatherOverlap = featherOverlap
   const featherMask = buildTileFeatherMask(tW, tH, feather)
 
-  // Composite the AI result with feathering onto a temporary canvas.
-  const tileResultImg = await loadImageElement(tileResultUrl)
+  // Load the AI result and the source image in parallel.
+  const [tileResultImg, sourceImg] = await Promise.all([
+    loadImageElement(tileResultUrl),
+    loadImageElement(sourceImageUrl),
+  ])
+
   const tileCanvas = document.createElement('canvas')
   tileCanvas.width = tW
   tileCanvas.height = tH
   const tileCtx = tileCanvas.getContext('2d')
+
   if (tileCtx) {
+    // Step A: fill the tile canvas with the original source pixels.
+    // This guarantees a fully-opaque base.  Any transparent pixel in the AI
+    // result will therefore fall back to the source rather than punching a
+    // transparent hole through the inpaint canvas.
+    tileCtx.drawImage(sourceImg, contextRect.x + tX, contextRect.y + tY, tW, tH, 0, 0, tW, tH)
+
+    // Step B: draw the AI result on top (source-over).  Where the model produced
+    // fully-opaque pixels the AI content wins; where it produced transparent/
+    // semi-transparent pixels the source shows through.
     tileCtx.drawImage(tileResultImg, 0, 0, tW, tH)
+
+    // Step C: apply the feather mask so that overlapping tile edges blend smoothly.
     tileCtx.globalCompositeOperation = 'destination-in'
     tileCtx.drawImage(featherMask, 0, 0)
     tileCtx.globalCompositeOperation = 'source-over'
+
+    console.log(
+      '[imageProcessor] tileResult natural dimensions:',
+      tileResultImg.naturalWidth, '×', tileResultImg.naturalHeight,
+      '| tile target:', tW, '×', tH,
+    )
   }
 
   // Draw the feather-blended tile into the running inpaint canvas.
@@ -5081,58 +5059,102 @@ export async function compositeInpaintTileResult(
     return
   }
 
-  // Diagnostic: compare a sample pixel in the tile result vs source to detect unchanged tiles.
-  if (tileCtx) {
-    const resultSample = tileCtx.getImageData(Math.floor(tW / 2), Math.floor(tH / 2), 1, 1).data
-    console.log('[imageProcessor] tile result centre pixel (r,g,b,a):', resultSample[0], resultSample[1], resultSample[2], resultSample[3])
-    console.log('[imageProcessor] tileResult URL length:', tileResultUrl.length, '| natural dimensions:', tileResultImg.naturalWidth, '×', tileResultImg.naturalHeight)
-  }
-
-  bandCtx.drawImage(tileCanvas, tX, tY)
-
-  // Re-stamp original source pixels over every non-masked pixel in this tile.
-  const sourceImg = await loadImageElement(sourceImageUrl)
-
+  // The band canvas is pre-filled with the original source for the ENTIRE
+  // context region (see initInpaintCanvas), so the context ring outside the
+  // selection is already correct and must never be overwritten.
   if (!maskSubRect) {
-    // Entire tile is context — restore everything from source.
-    bandCtx.drawImage(sourceImg, contextRect.x + tX, contextRect.y + tY, tW, tH, tX, tY, tW, tH)
+    // Pure-context tile — nothing to composite.
     return
   }
 
-  // Restore all non-masked pixels by clipping out the mask sub-rect.
-  bandCtx.save()
-  bandCtx.beginPath()
-  bandCtx.rect(tX, tY, tW, tH)
-  bandCtx.rect(tX + maskSubRect.x, tY + maskSubRect.y, maskSubRect.w, maskSubRect.h)
-  bandCtx.clip('evenodd')
-  bandCtx.drawImage(sourceImg, contextRect.x + tX, contextRect.y + tY, tW, tH, tX, tY, tW, tH)
-  bandCtx.restore()
+  // Composite ONLY the selection (maskSubRect) of the AI tile onto the band.
+  // Earlier versions drew the whole tile and then "restored" the surrounding
+  // source — first via an even-odd clip, then via a clearRect ring — and BOTH
+  // wiped the edit when the global-plan scaling produced fractional
+  // coordinates. Drawing just the selection crop removes the destructive
+  // restore step entirely: the ring is left untouched, the selection gets the
+  // AI pixels.
+  bandCtx.drawImage(
+    tileCanvas,
+    maskSubRect.x, maskSubRect.y, maskSubRect.w, maskSubRect.h,
+    tX + maskSubRect.x, tY + maskSubRect.y, maskSubRect.w, maskSubRect.h,
+  )
+
+  // ── Diagnostic: trace the edit through each stage at the selection centre ──
+  //   src        = original source pixel
+  //   result     = raw model output (fresh draw, no compositing)
+  //   tileCanvas = AI tile after source-base + result + feather (pre-band)
+  //   band       = pixel actually written into the running canvas
+  // Interpretation:
+  //   tileCanvas ≈ src               → the feather step wiped the edit.
+  //   tileCanvas ≈ result, band ≈ src → the band crop-draw isn't landing.
+  //   band ≈ result                  → the edit is composited correctly.
+  type Rgba = [number, number, number, number]
+  const readPixel = (ctx: CanvasRenderingContext2D, x: number, y: number): Rgba => {
+    const d = ctx.getImageData(x, y, 1, 1).data
+    return [d[0], d[1], d[2], d[3]]
+  }
+  const tileCx = Math.min(Math.floor(tW) - 1, Math.floor(maskSubRect.x + maskSubRect.w / 2))
+  const tileCy = Math.min(Math.floor(tH) - 1, Math.floor(maskSubRect.y + maskSubRect.h / 2))
+  const bandCx = Math.min(inpaintCanvas.width - 1, Math.floor(tX + maskSubRect.x + maskSubRect.w / 2))
+  const bandCy = Math.min(inpaintCanvas.height - 1, Math.floor(tY + maskSubRect.y + maskSubRect.h / 2))
+
+  const sample = (draw: (c: CanvasRenderingContext2D) => void): Rgba => {
+    const c = document.createElement('canvas')
+    c.width = Math.max(1, Math.floor(tW))
+    c.height = Math.max(1, Math.floor(tH))
+    const cc = c.getContext('2d')
+    if (!cc) {
+      return [0, 0, 0, 0]
+    }
+    draw(cc)
+    return readPixel(cc, tileCx, tileCy)
+  }
+  const srcPx: Rgba = sample((c) =>
+    c.drawImage(sourceImg, contextRect.x + tX, contextRect.y + tY, tW, tH, 0, 0, tW, tH),
+  )
+  const resultPx: Rgba = sample((c) => c.drawImage(tileResultImg, 0, 0, tW, tH))
+  const tilePx: Rgba = tileCtx ? readPixel(tileCtx, tileCx, tileCy) : [-1, -1, -1, -1]
+  const bandPx: Rgba = readPixel(bandCtx, bandCx, bandCy)
+
+  const rgbaToStr = (px: Rgba): string => `[${px[0]}, ${px[1]}, ${px[2]}, ${px[3]}]`
+  console.log(
+    [
+      '[imageProcessor] edit trace (r,g,b,a):',
+      `src=${rgbaToStr(srcPx)}`,
+      `result=${rgbaToStr(resultPx)}`,
+      `tileCanvas=${rgbaToStr(tilePx)}`,
+      `band=${rgbaToStr(bandPx)}`,
+      `| tile(${tileCx},${tileCy}) band(${bandCx},${bandCy})`,
+    ].join(' '),
+  )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Simplified single-shot inpaint helpers
+// Tiled Inpaint Pipeline — global plan input and mask overlay helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-const MAX_INPAINT_SEND_DIM = 1536
+/** Longest edge (px) for the global-plan image sent to the LLM. */
+const GLOBAL_PLAN_MAX_DIM = 1356
 
 /**
- * Crop the context region from the source image at full resolution (scaling
- * down only if the longest edge exceeds MAX_INPAINT_SEND_DIM), then grey-out
- * the selection area so the model has a clear zone to fill.
+ * Crop the context region from the source image, scale it so the longest edge
+ * is at most GLOBAL_PLAN_MAX_DIM, grey-fill the selection area, and draw a red
+ * border around it. Returns the annotated data URL and the scale factor used
+ * (context-pixel → plan-pixel).
  *
- * Returns the data URL to send to the model and the scale factor used
- * (context-pixel → sent-pixel). Scale = 1 when no downscaling was needed.
+ * This image is sent to the /api/edit 'plan' phase as the global inpaint input.
+ * The prompt instructs the model to fill the grey zone inside the red border.
  */
-export async function buildInpaintContextInput(
+export async function buildGlobalPlanInput(
   sourceImageUrl: string,
   contextRect: { x: number; y: number; w: number; h: number },
   selectionRect: { x: number; y: number; w: number; h: number },
-  maskImageUrl?: string | null,
 ): Promise<{ dataUrl: string; scale: number }> {
   const img = await loadImageElement(sourceImageUrl)
-  const scale = Math.min(1, MAX_INPAINT_SEND_DIM / Math.max(contextRect.w, contextRect.h))
-  const outW = Math.round(contextRect.w * scale)
-  const outH = Math.round(contextRect.h * scale)
+  const scale = Math.min(1, GLOBAL_PLAN_MAX_DIM / Math.max(contextRect.w, contextRect.h))
+  const outW = Math.max(1, Math.round(contextRect.w * scale))
+  const outH = Math.max(1, Math.round(contextRect.h * scale))
 
   const canvas = document.createElement('canvas')
   canvas.width = outW
@@ -5143,43 +5165,20 @@ export async function buildInpaintContextInput(
   // Draw source pixels for the context region, scaled to output size.
   ctx.drawImage(img, contextRect.x, contextRect.y, contextRect.w, contextRect.h, 0, 0, outW, outH)
 
-  // Selection rect in context-local coordinates, scaled to output size.
+  // Selection in context-local coordinates, scaled to output size.
   const selX = Math.round((selectionRect.x - contextRect.x) * scale)
   const selY = Math.round((selectionRect.y - contextRect.y) * scale)
-  const selW = Math.round(selectionRect.w * scale)
-  const selH = Math.round(selectionRect.h * scale)
+  const selW = Math.max(1, Math.round(selectionRect.w * scale))
+  const selH = Math.max(1, Math.round(selectionRect.h * scale))
 
-  if (maskImageUrl) {
-    // Bitmap mask path: fill entire selection grey then overlay the B&W mask
-    // so only the masked pixels stay grey.
-    ctx.fillStyle = EXTENSION_BLANK_COLOR
-    ctx.fillRect(selX, selY, selW, selH)
-    const maskImg = await loadImageElement(maskImageUrl)
-    const maskCanvas = document.createElement('canvas')
-    maskCanvas.width = selW
-    maskCanvas.height = selH
-    const mCtx = maskCanvas.getContext('2d')
-    if (mCtx) {
-      mCtx.drawImage(maskImg, selX, selY, selW, selH, 0, 0, selW, selH)
-    }
-    ctx.save()
-    ctx.globalCompositeOperation = 'source-over'
-    ctx.fillStyle = EXTENSION_BLANK_COLOR
-    ctx.fillRect(selX, selY, selW, selH)
-    ctx.restore()
-  } else {
-    // Rect mask path: fill selection with grey.
-    ctx.fillStyle = EXTENSION_BLANK_COLOR
-    ctx.fillRect(selX, selY, selW, selH)
-  }
+  // Grey-fill the selection so the model has a clear zone to fill.
+  ctx.fillStyle = EXTENSION_BLANK_COLOR
+  ctx.fillRect(selX, selY, selW, selH)
 
-  // Draw a solid red border around the selection to give the model an
-  // unambiguous boundary marker. The prompt instructs the model that only
-  // pixels inside this border may change — any edit outside is a failure.
+  // Red border — unambiguous boundary marker; prompt says only inside may change.
   const borderPx = Math.max(3, Math.round(Math.min(outW, outH) * 0.008))
   ctx.strokeStyle = '#FF0000'
   ctx.lineWidth = borderPx
-  // Inset by half the line width so the stroke sits fully inside the selection.
   ctx.strokeRect(
     selX + borderPx / 2,
     selY + borderPx / 2,
@@ -5191,23 +5190,66 @@ export async function buildInpaintContextInput(
 }
 
 /**
- * Load the model's result image into a canvas at contextRect dimensions.
- * The model is expected to return the image at the same pixel dimensions as
- * the input (or close to it); we scale-to-fit just in case.
+ * Composite the B&W change-mask extracted from the global plan onto the plan
+ * result image as a semi-transparent blue highlight. Returns a data URL for
+ * display in the sidebar — never sent to the API.
+ *
+ * WHITE mask pixels → blue highlight at ~55 % opacity
+ * BLACK mask pixels → plan image unchanged
  */
-export async function buildInpaintResultCanvas(
-  resultUrl: string,
-  contextRect: { x: number; y: number; w: number; h: number },
-): Promise<HTMLCanvasElement> {
-  const resultImg = await loadImageElement(resultUrl)
+export async function buildMaskOverlay(
+  globalPlanUrl: string,
+  globalMaskUrl: string,
+): Promise<string> {
+  const [planImg, maskImg] = await Promise.all([
+    loadImageElement(globalPlanUrl),
+    loadImageElement(globalMaskUrl),
+  ])
+
+  const w = planImg.naturalWidth
+  const h = planImg.naturalHeight
+
   const canvas = document.createElement('canvas')
-  canvas.width = contextRect.w
-  canvas.height = contextRect.h
+  canvas.width = w
+  canvas.height = h
   const ctx = canvas.getContext('2d')
-  if (ctx) {
-    ctx.drawImage(resultImg, 0, 0, contextRect.w, contextRect.h)
+  if (!ctx) return globalPlanUrl
+
+  // Draw the global plan.
+  ctx.drawImage(planImg, 0, 0)
+
+  // Stretch the mask to match plan dimensions and read pixel data.
+  const offscreen = document.createElement('canvas')
+  offscreen.width = w
+  offscreen.height = h
+  const offCtx = offscreen.getContext('2d')
+  if (!offCtx) return globalPlanUrl
+  offCtx.drawImage(maskImg, 0, 0, w, h)
+  const maskData = offCtx.getImageData(0, 0, w, h)
+
+  // Build a blue-highlight layer from the mask's white pixels.
+  const overlayData = ctx.createImageData(w, h)
+  for (let i = 0; i < maskData.data.length; i += 4) {
+    const brightness = maskData.data[i]  // R channel (B&W: R = G = B)
+    if (brightness > 128) {
+      const alpha = Math.round(((brightness - 128) / 127) * 180)
+      overlayData.data[i]     = 30   // R
+      overlayData.data[i + 1] = 100  // G
+      overlayData.data[i + 2] = 220  // B
+      overlayData.data[i + 3] = alpha
+    }
   }
-  return canvas
+
+  const overlayCanvas = document.createElement('canvas')
+  overlayCanvas.width = w
+  overlayCanvas.height = h
+  const overlayCtx = overlayCanvas.getContext('2d')
+  if (overlayCtx) {
+    overlayCtx.putImageData(overlayData, 0, 0)
+  }
+  ctx.drawImage(overlayCanvas, 0, 0)
+
+  return canvas.toDataURL('image/jpeg', 0.92)
 }
 
 /**

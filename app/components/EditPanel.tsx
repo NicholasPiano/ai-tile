@@ -8,16 +8,19 @@ import type { InpaintState, ReferenceImage } from '@/app/lib/app'
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 
-type MaskMode = 'rect' | 'image'
-
 export interface EditPanelProps {
   inpaintState: InpaintState
-  apiKey: string
-  model: string
-  onMaskConfirm: (maskMode: MaskMode, description: string) => void
-  onPromptConfirm: (editPrompt: string, referenceImages: ReferenceImage[]) => void
+  onGenerate: (editPrompt: string, referenceImages: ReferenceImage[]) => void
+  /** Re-run the global plan (cascades to the change mask + resets tiles). */
+  onRerunPlan: () => void
+  /** Re-run only the change mask, reusing the current plan (resets tiles). */
+  onRerunMask: () => void
+  /** Generate or re-generate a single tile. */
+  onRerunTile: (tileIdx: number) => void
+  /** Sequentially generate every masked tile that has no result yet. */
+  onGenerateAllTiles: () => void
+  onRerun: () => void
   onAccept: () => void
-  onDiscard: () => void
   onClose: () => void
 }
 
@@ -74,17 +77,14 @@ function Spinner() {
   return <Icons.Spinner size={14} />
 }
 
-function LockedValue({ label, value }: { label: string; value: string }) {
+function LockedPrompt({ value }: { value: string }) {
   return (
-    <div className="flex flex-col gap-1">
-      <SectionLabel>{label}</SectionLabel>
-      <p
-        className="rounded-lg border px-3 py-2 text-[12px] italic"
-        style={{ borderColor: 'var(--border)', background: 'var(--bg-elev)', color: 'var(--text-secondary)' }}
-      >
-        {value}
-      </p>
-    </div>
+    <p
+      className="rounded-lg border px-3 py-2 text-[12px] italic"
+      style={{ borderColor: 'var(--border)', background: 'var(--bg-elev)', color: 'var(--text-secondary)' }}
+    >
+      {value}
+    </p>
   )
 }
 
@@ -147,143 +147,171 @@ function ReferenceImageUploader({
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tile progress grid
+// Tile progress grid — thumbnail per tile with re-run and result preview
 // ─────────────────────────────────────────────────────────────────────────────
 
 function TileGrid({
   tilePlan,
   tileResults,
   generatingTileIdx,
+  onRerunTile,
 }: {
   tilePlan: NonNullable<InpaintState['tilePlan']>
   tileResults: Array<string | null>
   generatingTileIdx: number | null
+  onRerunTile: (idx: number) => void
 }) {
-  const { tiles, contextW, contextH } = tilePlan
-  const aspect = contextW / contextH
-  const gridH = Math.round(160 / aspect)
+  const maskedTiles = tilePlan.tiles
+    .map((tile, idx) => ({ tile, idx }))
+    .filter(({ tile }) => tile.maskSubRect !== null)
+
+  if (maskedTiles.length === 0) return null
+
+  // While any tile is generating, disable the other tile buttons so runs stay
+  // sequential and never collide on the shared composite canvas.
+  const anyBusy = generatingTileIdx !== null
 
   return (
-    <div className="relative overflow-hidden rounded-lg border" style={{ borderColor: 'var(--border)', width: '100%', height: gridH }}>
-      {tiles.map((tile, idx) => {
-        const isMasked = tile.maskSubRect !== null
-        const isGenerating = generatingTileIdx === idx
-        const isDone = tileResults[idx] !== null
+    <div className="flex flex-col gap-2">
+      <SectionLabel>{`Tiles (${maskedTiles.length})`}</SectionLabel>
+      <div className="grid gap-1.5" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(80px, 1fr))' }}>
+        {maskedTiles.map(({ tile, idx }) => {
+          const isGenerating = generatingTileIdx === idx
+          const resultUrl = tileResults[idx]
+          const isDone = resultUrl !== null
 
-        let bg = isMasked ? 'rgba(120,120,120,0.18)' : 'rgba(80,80,80,0.06)'
-        if (isDone) bg = 'rgba(40,180,80,0.22)'
-        if (isGenerating) bg = 'rgba(60,140,255,0.3)'
+          return (
+            <div
+              key={idx}
+              className="group relative overflow-hidden rounded border"
+              style={{
+                aspectRatio: `${tile.w} / ${tile.h}`,
+                borderColor: isGenerating
+                  ? 'rgba(60,140,255,0.8)'
+                  : isDone
+                    ? 'rgba(40,200,80,0.6)'
+                    : 'var(--border)',
+                background: 'var(--bg-elev)',
+              }}
+            >
+              {isDone && resultUrl ? (
+                <img src={resultUrl} alt={`Tile ${idx + 1}`} className="block h-full w-full object-cover" draggable={false} />
+              ) : (
+                <div className="flex h-full w-full items-center justify-center text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                  {isGenerating ? <Spinner /> : `${tile.row + 1},${tile.col + 1}`}
+                </div>
+              )}
 
-        return (
-          <div
-            key={idx}
-            style={{
-              position: 'absolute',
-              left: `${(tile.x / contextW) * 100}%`,
-              top: `${(tile.y / contextH) * 100}%`,
-              width: `${(tile.w / contextW) * 100}%`,
-              height: `${(tile.h / contextH) * 100}%`,
-              background: bg,
-              border: isGenerating ? '1.5px solid rgba(60,140,255,0.8)' : '1px solid rgba(255,255,255,0.07)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 8, color: 'rgba(255,255,255,0.55)',
-            }}
-          >
-            {isGenerating ? <Icons.Spinner size={8} /> : isDone ? '✓' : ''}
-          </div>
-        )
-      })}
+              {/* Generate (pending tiles, always visible) / Re-run (done tiles,
+                  revealed on hover). Tiles never run automatically. */}
+              {!isGenerating && (
+                <button
+                  className={
+                    isDone
+                      ? 'absolute inset-0 flex items-center justify-center opacity-0 transition-opacity group-hover:opacity-100 disabled:cursor-not-allowed'
+                      : 'absolute inset-0 flex items-center justify-center opacity-100 transition-opacity disabled:cursor-not-allowed disabled:opacity-40'
+                  }
+                  style={{ background: isDone ? 'rgba(0,0,0,0.55)' : 'rgba(0,0,0,0.35)' }}
+                  onClick={() => onRerunTile(idx)}
+                  disabled={anyBusy}
+                  title={isDone ? `Re-run tile ${idx + 1}` : `Generate tile ${idx + 1}`}
+                  aria-label={isDone ? `Re-run tile ${idx + 1}` : `Generate tile ${idx + 1}`}
+                >
+                  <Icons.Play size={14} />
+                </button>
+              )}
+            </div>
+          )
+        })}
+      </div>
     </div>
   )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// EditPanel — progressive accumulation layout
+// EditPanel
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Sequential panel: each stage locks in place and the next section appears
- * below it. Sections never disappear once shown.
+ * Progressive sidebar panel for the Tiled Inpaint Pipeline.
  *
- *   1. Preview (always visible)
- *   2. Mask    (locked once confirmed)
- *   3. Prompt  (visible after mask confirmed; locked once generation starts)
- *   4. Result  (visible once generation starts)
+ * Sections accumulate as the pipeline advances — earlier sections lock in
+ * place and never disappear:
+ *
+ *   1. Context preview (always visible)
+ *   2. Description + refs input  (input phase — locks when Generate is clicked)
+ *   3. Global plan result         (planning → masking → tiling → done)
+ *   4. Change-mask overlay        (masking → tiling → done)
+ *   5. Tile grid                  (tiling → done)
+ *   6. Accept / Re-run            (done)
  */
 export function EditPanel({
   inpaintState,
-  onMaskConfirm,
-  onPromptConfirm,
+  onGenerate,
+  onRerunPlan,
+  onRerunMask,
+  onRerunTile,
+  onGenerateAllTiles,
+  onRerun,
   onAccept,
-  onDiscard,
   onClose,
 }: EditPanelProps) {
   const {
     phase,
-    region,
     lowResPreviewUrl,
-    maskOverlayUrl,
     globalPlanUrl,
+    globalMaskOverlayUrl,
     tilePlan,
     tileResults,
     generatingTileIdx,
-    maskGenerating,
     error,
-    tileDebugInputUrl,
-    tileDebugResultUrl,
   } = inpaintState
 
-  // ── Local input state ────────────────────────────────────────────────────
-  const [maskMode, setMaskMode] = useState<MaskMode>('rect')
-  const [maskDescription, setMaskDescription] = useState('')
-  const [editPrompt, setEditPrompt] = useState('')
-  const [referenceImages, setReferenceImages] = useState<ReferenceImage[]>([])
+  // ── Local form state ──────────────────────────────────────────────────────
+  // Initialise from the state so that re-run resets to the previous values.
+  const [editPrompt, setEditPrompt] = useState(inpaintState.editPrompt)
+  const [referenceImages, setReferenceImages] = useState<ReferenceImage[]>(inpaintState.referenceImages)
 
   // ── Auto-scroll to bottom when the phase advances or a plan arrives ───────
   const bodyRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     bodyRef.current?.scrollTo({ top: bodyRef.current.scrollHeight, behavior: 'smooth' })
-  }, [phase, globalPlanUrl])
+  }, [phase, globalPlanUrl, globalMaskOverlayUrl, tilePlan])
 
-  // Phase helpers.
-  const pastMask   = phase !== 'mask'
-  const showPrompt = ['prompt', 'planning', 'tiling', 'done'].includes(phase)
-  const pastPrompt = ['planning', 'tiling', 'done'].includes(phase)
-  const showResult = ['planning', 'tiling', 'done'].includes(phase)
-  const isDone     = phase === 'done'
+  // Phase-derived booleans for progressive disclosure.
+  // Note: 'tiling' is now an IDLE phase — plan + mask are done and the user runs
+  // each tile manually. Only an in-flight LLM call counts as "processing".
+  const pastInput     = phase !== 'input'
+  const showPlan      = ['planning', 'masking', 'tiling', 'done'].includes(phase)
+  const showMask      = ['masking', 'tiling', 'done'].includes(phase)
+  const showTiles     = tilePlan !== null
+  const isGenerating  = generatingTileIdx !== null
+  const isStageBusy   = phase === 'planning' || phase === 'masking'
+  const isProcessing  = isStageBusy || isGenerating
 
-  const maskCount = tilePlan?.tiles.filter((t) => t.maskSubRect !== null).length ?? 0
   const doneCount = tileResults.filter((r) => r !== null).length
+  const totalMasked = tilePlan?.tiles.filter((t) => t.maskSubRect !== null).length ?? 0
+  const allTilesDone = totalMasked > 0 && doneCount === totalMasked
+  const canAccept = doneCount > 0
+  const planReady = globalPlanUrl !== null
+  const maskReady = globalMaskOverlayUrl !== null
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
 
-      {/* ── Header ────────────────────────────────────────────────────────── */}
-      <div
-        className="flex h-12 shrink-0 items-center justify-between border-b px-4"
-        style={{ borderColor: 'var(--border)' }}
-      >
-        <span className="text-[13px] font-semibold" style={{ color: 'var(--text)' }}>Edit</span>
-        <button
-          onClick={onClose}
-          className="icon-btn"
-          title="Clear selection"
-          aria-label="Clear selection"
-          disabled={phase === 'planning' || phase === 'tiling'}
-        >
-          <Icons.X size={15} />
-        </button>
-      </div>
-
       {/* ── Scrollable body ───────────────────────────────────────────────── */}
       <div ref={bodyRef} className="flex flex-1 flex-col overflow-y-auto">
 
-        {/* ── Section 1: Preview ─────────────────────────────────────────── */}
+        {/* ── Section 1: Context preview ─────────────────────────────────── */}
         <div className="flex flex-col gap-3 p-4">
+          <SectionLabel>Selection preview</SectionLabel>
           {lowResPreviewUrl
-            ? <ImagePreview src={lowResPreviewUrl} alt="Context preview" label="Context" />
+            ? <ImagePreview src={lowResPreviewUrl} alt="Selection preview" />
             : (
-              <div className="flex h-24 items-center justify-center rounded-lg border text-[12px]" style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}>
+              <div
+                className="flex h-24 items-center justify-center rounded-lg border text-[12px]"
+                style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}
+              >
                 <Spinner />
               </div>
             )}
@@ -291,196 +319,179 @@ export function EditPanel({
 
         <SectionDivider />
 
-        {/* ── Section 2: Mask ────────────────────────────────────────────── */}
+        {/* ── Section 2: Description + refs ─────────────────────────────── */}
         <div className="flex flex-col gap-3 p-4">
-          <SectionLabel>Mask</SectionLabel>
+          <SectionLabel>Edit description</SectionLabel>
 
-          {!pastMask ? (
-            // Active mask stage — show controls.
+          {!pastInput ? (
+            // Active input stage.
             <>
-              {(['rect', 'image'] as MaskMode[]).map((m) => (
-                <label
-                  key={m}
-                  className="flex cursor-pointer items-start gap-3 rounded-lg border p-3 transition-colors"
-                  style={{
-                    borderColor: maskMode === m ? 'var(--accent)' : 'var(--border)',
-                    background: maskMode === m ? 'rgba(var(--accent-rgb),0.06)' : 'var(--bg-elev)',
-                  }}
-                >
-                  <input
-                    type="radio"
-                    name="maskMode"
-                    value={m}
-                    checked={maskMode === m}
-                    onChange={() => setMaskMode(m)}
-                    className="mt-0.5"
-                  />
-                  <div className="flex flex-col gap-0.5">
-                    <span className="text-[12px] font-medium" style={{ color: 'var(--text)' }}>
-                      {m === 'rect' ? 'Selection box' : 'Describe what to mask'}
-                    </span>
-                    <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
-                      {m === 'rect' ? 'The entire selected area will be edited' : 'AI generates a precise mask from your description'}
-                    </span>
-                  </div>
-                </label>
-              ))}
+              <textarea
+                className="w-full resize-none rounded-lg border bg-transparent px-3 py-2 text-[12px] outline-none transition-colors"
+                style={{ borderColor: 'var(--border)', color: 'var(--text)', minHeight: 80 }}
+                placeholder="e.g. replace the tree with a stone tower, keep the lighting identical"
+                value={editPrompt}
+                onChange={(e) => setEditPrompt(e.target.value)}
+                onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--accent)' }}
+                onBlur={(e) => { e.currentTarget.style.borderColor = 'var(--border)' }}
+                rows={3}
+              />
 
-              {maskMode === 'image' && (
-                <textarea
-                  className="w-full resize-none rounded-lg border bg-transparent px-3 py-2 text-[12px] outline-none transition-colors"
-                  style={{ borderColor: 'var(--border)', color: 'var(--text)', minHeight: 64 }}
-                  placeholder="e.g. the tree, the car, the person on the left…"
-                  value={maskDescription}
-                  onChange={(e) => setMaskDescription(e.target.value)}
-                  onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--accent)' }}
-                  onBlur={(e) => { e.currentTarget.style.borderColor = 'var(--border)' }}
-                  rows={2}
-                />
-              )}
+              <ReferenceImageUploader images={referenceImages} onChange={setReferenceImages} />
 
-              {error && phase === 'mask' && <ErrorBanner message={error} />}
+              {error && phase === 'input' && <ErrorBanner message={error} />}
 
               <button
                 className="btn btn-primary w-full"
-                disabled={maskGenerating || !lowResPreviewUrl || (maskMode === 'image' && !maskDescription.trim())}
-                onClick={() => onMaskConfirm(maskMode, maskDescription)}
+                disabled={!editPrompt.trim() || !lowResPreviewUrl}
+                onClick={() => onGenerate(editPrompt, referenceImages)}
               >
-                {maskGenerating ? <Spinner /> : null}
-                {maskGenerating ? 'Generating mask…' : 'Next \u2192'}
+                <Icons.Play size={13} />
+                Generate
               </button>
             </>
           ) : (
-            // Locked mask stage — summary + optional mask overlay preview.
-            <>
-              <LockedValue
-                label="Mode"
-                value={maskMode === 'rect' ? 'Selection box' : `Described: "${maskDescription}"`}
-              />
-              {maskOverlayUrl && (
-                <ImagePreview src={maskOverlayUrl} alt="Mask overlay" label="Mask" />
-              )}
-            </>
+            // Locked — show the prompt that was submitted.
+            <LockedPrompt value={inpaintState.editPrompt} />
           )}
         </div>
 
-        {/* ── Section 3: Prompt (shown after mask confirmed) ─────────────── */}
-        {showPrompt && (
+        {/* ── Section 3: Global plan ─────────────────────────────────────── */}
+        {showPlan && (
           <>
             <SectionDivider />
             <div className="flex flex-col gap-3 p-4">
-              <SectionLabel>Edit description</SectionLabel>
-
-              {!pastPrompt ? (
-                // Active prompt stage.
-                <>
-                  <textarea
-                    className="w-full resize-none rounded-lg border bg-transparent px-3 py-2 text-[12px] outline-none transition-colors"
-                    style={{ borderColor: 'var(--border)', color: 'var(--text)', minHeight: 80 }}
-                    placeholder="e.g. replace the tree with a stone tower, keep the lighting identical"
-                    value={editPrompt}
-                    onChange={(e) => setEditPrompt(e.target.value)}
-                    onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--accent)' }}
-                    onBlur={(e) => { e.currentTarget.style.borderColor = 'var(--border)' }}
-                    rows={3}
-                  />
-
-                  <ReferenceImageUploader images={referenceImages} onChange={setReferenceImages} />
-
-                  {error && phase === 'prompt' && <ErrorBanner message={error} />}
-
+              <div className="flex items-center justify-between">
+                <SectionLabel>Global plan</SectionLabel>
+                {planReady && (
                   <button
-                    className="btn btn-primary w-full"
-                    disabled={!editPrompt.trim()}
-                    onClick={() => onPromptConfirm(editPrompt, referenceImages)}
+                    className="btn btn-ghost text-[11px]"
+                    style={{ padding: '2px 8px', height: 24 }}
+                    onClick={onRerunPlan}
+                    disabled={isProcessing}
+                    title="Re-generate the global plan (also re-runs the change mask)"
                   >
-                    <Icons.Play size={13} />
-                    Generate
+                    <Icons.Refresh size={11} />
+                    Re-run
                   </button>
-                </>
-              ) : (
-                // Locked prompt stage.
-                <LockedValue label="Prompt" value={editPrompt} />
-              )}
-            </div>
-          </>
-        )}
+                )}
+              </div>
 
-        {/* ── Section 4: Result (shown once generation starts) ───────────── */}
-        {showResult && (
-          <>
-            <SectionDivider />
-            <div className="flex flex-col gap-3 p-4">
-              <SectionLabel>Result</SectionLabel>
-
-              {/* Phase 1: planning */}
-              {phase === 'planning' && !globalPlanUrl && (
+              {phase === 'planning' && !globalPlanUrl ? (
                 <div className="flex items-center gap-2 text-[12px]" style={{ color: 'var(--text-muted)' }}>
                   <Spinner />
                   <span>Generating global plan…</span>
                 </div>
-              )}
+              ) : globalPlanUrl ? (
+                <ImagePreview src={globalPlanUrl} alt="Global plan" />
+              ) : null}
+            </div>
+          </>
+        )}
 
-              {/* Global plan preview — shown as soon as Phase 1 completes */}
-              {globalPlanUrl && (
-                <ImagePreview src={globalPlanUrl} alt="Global plan" label="Global plan (Phase 1)" />
-              )}
+        {/* ── Section 4: Change-mask overlay ────────────────────────────── */}
+        {showMask && (
+          <>
+            <SectionDivider />
+            <div className="flex flex-col gap-3 p-4">
+              <div className="flex items-center justify-between">
+                <SectionLabel>Change mask</SectionLabel>
+                {maskReady && planReady && (
+                  <button
+                    className="btn btn-ghost text-[11px]"
+                    style={{ padding: '2px 8px', height: 24 }}
+                    onClick={onRerunMask}
+                    disabled={isProcessing}
+                    title="Re-extract the change mask from the current plan"
+                  >
+                    <Icons.Refresh size={11} />
+                    Re-run
+                  </button>
+                )}
+              </div>
 
-              {/* Phase 2: tile grid + progress */}
-              {tilePlan && (
-                <>
-                  <TileGrid tilePlan={tilePlan} tileResults={tileResults} generatingTileIdx={generatingTileIdx} />
-                  {phase === 'tiling' && (
-                    <div className="flex items-center gap-2 text-[12px]" style={{ color: 'var(--text-muted)' }}>
-                      <Spinner />
-                      <span>{`Tile ${(generatingTileIdx ?? 0) + 1} of ${maskCount}…`}</span>
-                    </div>
-                  )}
-                </>
-              )}
-
-              {/* Debug tile previews — shows last tile input & output side-by-side */}
-              {(tileDebugInputUrl ?? tileDebugResultUrl) && (
-                <div>
-                  <p className="mb-1 text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
-                    Debug: tile comparison
-                  </p>
-                  <div className="flex gap-1">
-                    {tileDebugInputUrl && (
-                      <div className="flex-1">
-                        <p className="mb-0.5 text-[10px]" style={{ color: 'var(--text-muted)' }}>Input (sent)</p>
-                        <img src={tileDebugInputUrl} alt="Tile input" className="w-full rounded" style={{ border: '1px solid var(--border)' }} />
-                      </div>
-                    )}
-                    {tileDebugResultUrl && (
-                      <div className="flex-1">
-                        <p className="mb-0.5 text-[10px]" style={{ color: 'var(--text-muted)' }}>Output (received)</p>
-                        <img src={tileDebugResultUrl} alt="Tile result" className="w-full rounded" style={{ border: '1px solid var(--border)' }} />
-                      </div>
-                    )}
-                  </div>
+              {phase === 'masking' && !globalMaskOverlayUrl ? (
+                <div className="flex items-center gap-2 text-[12px]" style={{ color: 'var(--text-muted)' }}>
+                  <Spinner />
+                  <span>Extracting change mask…</span>
                 </div>
+              ) : globalMaskOverlayUrl ? (
+                <ImagePreview src={globalMaskOverlayUrl} alt="Change mask overlay" />
+              ) : null}
+            </div>
+          </>
+        )}
+
+        {/* ── Section 5: Tile grid ───────────────────────────────────────── */}
+        {showTiles && tilePlan && (
+          <>
+            <SectionDivider />
+            <div className="flex flex-col gap-3 p-4">
+              {isGenerating ? (
+                <div className="flex items-center gap-2 text-[12px]" style={{ color: 'var(--text-muted)' }}>
+                  <Spinner />
+                  <span>{`Generating tile ${(generatingTileIdx ?? 0) + 1}…`}</span>
+                </div>
+              ) : (
+                <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
+                  {`${doneCount} of ${totalMasked} tiles generated. Run each tile below, or generate them all.`}
+                </p>
               )}
 
-              {error && showResult && <ErrorBanner message={error} />}
+              <button
+                className="btn btn-primary w-full"
+                onClick={onGenerateAllTiles}
+                disabled={isProcessing || allTilesDone}
+              >
+                <Icons.Play size={13} />
+                {doneCount === 0 ? 'Generate all tiles' : 'Generate remaining tiles'}
+              </button>
 
-              {/* Accept / Discard when done */}
-              {isDone && (
+              <TileGrid
+                tilePlan={tilePlan}
+                tileResults={tileResults}
+                generatingTileIdx={generatingTileIdx}
+                onRerunTile={onRerunTile}
+              />
+            </div>
+          </>
+        )}
+
+        {/* ── Error banner (shown when not in input phase) ───────────────── */}
+        {error && phase !== 'input' && (
+          <div className="p-4 pt-0">
+            <ErrorBanner message={error} />
+          </div>
+        )}
+
+        {/* ── Section 6: Accept / Re-run from start ─────────────────────── */}
+        {pastInput && (
+          <>
+            <SectionDivider />
+            <div className="flex flex-col gap-3 p-4">
+              {canAccept && (
                 <>
                   <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
-                    {`${doneCount} tile${doneCount !== 1 ? 's' : ''} generated.`}
+                    {allTilesDone
+                      ? `All ${doneCount} tile${doneCount !== 1 ? 's' : ''} generated.`
+                      : `${doneCount} of ${totalMasked} tiles generated — you can accept now or keep going.`}
                   </p>
-                  <div className="flex gap-2">
-                    <button className="btn btn-ghost flex-1" onClick={onDiscard}>
-                      Discard
-                    </button>
-                    <button className="btn btn-primary flex-1" onClick={onAccept}>
-                      <Icons.Check size={14} />
-                      Accept
-                    </button>
-                  </div>
+                  <button
+                    className="btn btn-primary w-full"
+                    onClick={() => {
+                      console.log('[EditPanel] Accept clicked — calling onAccept')
+                      onAccept()
+                    }}
+                    disabled={isProcessing}
+                  >
+                    <Icons.Check size={14} />
+                    Accept
+                  </button>
                 </>
               )}
+              <button className="btn btn-ghost w-full" onClick={onRerun} disabled={isProcessing}>
+                Re-run from start
+              </button>
             </div>
           </>
         )}

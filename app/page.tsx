@@ -4525,6 +4525,10 @@ export default function Home() {
           apiKey={apiKey}
           model={selectedModel}
           onAccept={(newImageUrl) => {
+            console.log('[page] EditStudio onAccept called — setting selectedImage', {
+              urlLength: newImageUrl.length,
+              prefix: newImageUrl.slice(0, 40),
+            })
             setSelectedImage(newImageUrl)
             setExtendedCandidates([])
             // Inpainting preserves image dimensions — no need to reset them.

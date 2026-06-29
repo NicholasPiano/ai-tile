@@ -1,5 +1,26 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { buildMaskPrompt } from '@/app/lib/editPrompt'
+
+/**
+ * Build a B&W mask generation prompt for a given description.
+ * Kept inline here since the edit-mask route is no longer wired to the main
+ * tiled pipeline (mask extraction now happens via /api/edit phase:'extract-mask').
+ */
+function buildMaskPrompt(description: string): string {
+  return [
+    'You are a precision image mask generator.',
+    '',
+    'I will give you an image. Return a black-and-white mask image that is the',
+    'EXACT same pixel dimensions as the input.',
+    '',
+    `WHITE pixels (#FFFFFF): the area that matches "${description}"`,
+    'BLACK pixels (#000000): everything else',
+    '',
+    'Rules:',
+    '- Return ONLY the mask image — no text, no explanation, no border',
+    '- Same pixel width and height as the input image',
+    '- Use clean, hard edges at object boundaries (avoid anti-aliased fades)',
+  ].join('\n')
+}
 
 const DEFAULT_MODEL = 'google/gemini-3.1-flash-image-preview'
 

@@ -1,115 +1,25 @@
 'use client'
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   EDIT_STRIP_PX,
-  MAX_EDIT_SELECTION_PX,
   type InpaintState,
   type InpaintRegion,
+  type InpaintTilePlan,
   type ReferenceImage,
 } from '@/app/lib/app'
 import { EditPanel } from '@/app/components/EditPanel'
+import { Icons } from '@/app/components/icons'
 import {
   buildLowResContextCrop,
-  buildInpaintContextInput,
-  buildInpaintResultCanvas,
+  buildGlobalPlanInput,
+  buildMaskOverlay,
+  planInpaintTiles,
+  initInpaintCanvas,
+  buildInpaintTileInput,
+  compositeInpaintTileResult,
   compositeInpaintFinal,
 } from '@/app/utils/imageProcessor'
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Canvas helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** Promise-wrapper around Image.onload. */
-function loadImg(src: string): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const img = new window.Image()
-    img.onload = () => resolve(img)
-    img.onerror = reject
-    img.src = src
-  })
-}
-
-/**
- * Composite the AI-generated B&W mask onto the context crop as a blue
- * highlight: white mask pixels → semi-transparent blue (#1e64dc at ~55% opacity).
- * The result replaces `lowResPreviewUrl` so the panel always shows the mask
- * overlaid on the original image rather than as a raw B&W image.
- */
-async function buildMaskOverlayPreview(
-  contextCropUrl: string,
-  maskUrl: string,
-): Promise<string> {
-  const [cropImg, maskImg] = await Promise.all([loadImg(contextCropUrl), loadImg(maskUrl)])
-
-  const w = cropImg.naturalWidth
-  const h = cropImg.naturalHeight
-
-  const canvas = document.createElement('canvas')
-  canvas.width = w
-  canvas.height = h
-  const ctx = canvas.getContext('2d')
-  if (!ctx) return contextCropUrl
-
-  // Draw the original context crop.
-  ctx.drawImage(cropImg, 0, 0)
-
-  // Read the B&W mask (stretched to match crop dimensions).
-  const offscreen = document.createElement('canvas')
-  offscreen.width = w
-  offscreen.height = h
-  const offCtx = offscreen.getContext('2d')
-  if (!offCtx) return contextCropUrl
-  offCtx.drawImage(maskImg, 0, 0, w, h)
-  const maskData = offCtx.getImageData(0, 0, w, h)
-
-  // Build a blue-highlight layer from the mask's white pixels.
-  const overlayData = ctx.createImageData(w, h)
-  for (let i = 0; i < maskData.data.length; i += 4) {
-    const brightness = maskData.data[i] // R channel (B&W: R = G = B)
-    if (brightness > 128) {
-      // Map mask brightness → alpha (brighter white = more opaque blue).
-      const alpha = Math.round(((brightness - 128) / 127) * 180)
-      overlayData.data[i]     = 30   // R
-      overlayData.data[i + 1] = 100  // G
-      overlayData.data[i + 2] = 220  // B
-      overlayData.data[i + 3] = alpha
-    }
-  }
-
-  const overlayCanvas = document.createElement('canvas')
-  overlayCanvas.width = w
-  overlayCanvas.height = h
-  const overlayCtx = overlayCanvas.getContext('2d')
-  if (overlayCtx) {
-    overlayCtx.putImageData(overlayData, 0, 0)
-  }
-
-  // Composite the blue overlay onto the context crop.
-  ctx.drawImage(overlayCanvas, 0, 0)
-
-  // Draw a white border around the masked region's bounding box so the
-  // boundary is as clear as the selection-box style.
-  // Find the bounding box of white pixels in the mask.
-  let minX = w, minY = h, maxX = 0, maxY = 0
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      if (maskData.data[(y * w + x) * 4] > 128) {
-        if (x < minX) minX = x
-        if (x > maxX) maxX = x
-        if (y < minY) minY = y
-        if (y > maxY) maxY = y
-      }
-    }
-  }
-  if (maxX > minX && maxY > minY) {
-    ctx.strokeStyle = 'rgba(255,255,255,0.9)'
-    ctx.lineWidth = Math.max(1.5, w / 200)
-    ctx.strokeRect(minX, minY, maxX - minX, maxY - minY)
-  }
-
-  return canvas.toDataURL('image/jpeg', 0.92)
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Local types
@@ -184,19 +94,6 @@ function clampRect(r: ImageRect, bounds: ImageRect): ImageRect {
   return { x, y, w: x2 - x, h: y2 - y }
 }
 
-/**
- * Largest rectangle the user can select starting from `start`, limited by
- * MAX_EDIT_SELECTION_PX and the image boundary.
- */
-function computeDynamicMaxRect(start: ImagePoint, imageBounds: ImageRect): ImageRect {
-  const limit = Math.max(0, MAX_EDIT_SELECTION_PX)
-  const x1 = Math.max(imageBounds.x, start.x - limit)
-  const y1 = Math.max(imageBounds.y, start.y - limit)
-  const x2 = Math.min(imageBounds.x + imageBounds.w, start.x + limit)
-  const y2 = Math.min(imageBounds.y + imageBounds.h, start.y + limit)
-  return { x: x1, y: y1, w: Math.max(0, x2 - x1), h: Math.max(0, y2 - y1) }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Canvas drawing helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -228,7 +125,7 @@ function drawRect(
 
 /**
  * Draw a white label just outside the top-left corner of a rectangle.
- * Flips below the top edge if the rectangle is too close to the canvas top.
+ * Flips below the top edge when the rectangle is near the canvas top.
  */
 function drawLabel(
   ctx: CanvasRenderingContext2D,
@@ -253,7 +150,8 @@ function drawLabel(
 }
 
 /**
- * Render the selection overlay and (when tiling) the tile grid onto the canvas.
+ * Render the selection overlay and (during tiling) the tile grid onto the
+ * overlay canvas.
  */
 function renderOverlay(
   canvas: HTMLCanvasElement,
@@ -272,9 +170,9 @@ function renderOverlay(
   const scaleX = bufW / imgW
   const scaleY = bufH / imgH
 
-  // Faint boundary guide — always visible.
-  const maxStripRect: ImageRect = { x: 0, y: 0, w: imgW, h: imgH }
-  drawRect(ctx, maxStripRect, scaleX, scaleY, {
+  // Faint image-boundary guide — always visible.
+  const imageBounds: ImageRect = { x: 0, y: 0, w: imgW, h: imgH }
+  drawRect(ctx, imageBounds, scaleX, scaleY, {
     strokeStyle: 'rgba(255,255,255,0.4)',
     lineWidth: 1.5,
     dash: [6, 4],
@@ -282,14 +180,14 @@ function renderOverlay(
 
   if (!drag) return
 
-  const dynamicMax = computeDynamicMaxRect(drag.start, maxStripRect)
+  // The selection is clamped to the full image bounds (no artificial size cap).
   const rawSelect = normaliseRect(drag.start, drag.current)
-  const currentSelect = clampRect(rawSelect, dynamicMax)
+  const currentSelect = clampRect(rawSelect, imageBounds)
 
   if (currentSelect.w < 2 || currentSelect.h < 2) return
 
   // Context strip around the selection.
-  const currentStrip = outsetRect(currentSelect, EDIT_STRIP_PX, maxStripRect)
+  const currentStrip = outsetRect(currentSelect, EDIT_STRIP_PX, imageBounds)
   drawRect(ctx, currentStrip, scaleX, scaleY, {
     strokeStyle: 'rgba(255,255,255,1)',
     fillStyle: 'rgba(60,140,255,0.18)',
@@ -305,7 +203,7 @@ function renderOverlay(
   })
   drawLabel(ctx, currentSelect, scaleX, scaleY, 'Selection')
 
-  // Tile grid overlay (visible during tiling phase).
+  // Tile grid overlay (visible during tiling / done phase).
   if (
     inpaintState &&
     (inpaintState.phase === 'tiling' || inpaintState.phase === 'done') &&
@@ -316,11 +214,10 @@ function renderOverlay(
 
     for (let i = 0; i < tilePlan.tiles.length; i++) {
       const tile = tilePlan.tiles[i]
-      const isMasked = tile.maskSubRect !== null
+      if (!tile.maskSubRect) continue
+
       const isGenerating = generatingTileIdx === i
       const isDone = tileResults[i] !== null
-
-      if (!isMasked) continue
 
       const tileRect: ImageRect = {
         x: contextRect.x + tile.x,
@@ -415,25 +312,110 @@ export interface EditStudioProps {
 /**
  * Edit mode workspace.
  *
- * Renders the source image with a transparent canvas overlay for selection
- * drawing. Once a selection is committed the Tiled Inpaint Pipeline is
- * orchestrated here:
+ * Renders the source image with a transparent canvas overlay for interactive
+ * selection drawing. Once the user commits a selection the sidebar transitions
+ * to the input form. On submit, only the plan + mask run automatically — tiles
+ * are generated on demand:
  *
- *   1. Build low-res context crop (preview + mask input)
- *   2. EditPanel stage 1 — user picks mask mode / types a description
- *   3. Optional mask generation via /api/edit-mask
- *   4. EditPanel stage 2 — user enters edit prompt + optional reference images
- *   5. Phase 1: global plan via /api/edit (phase:'plan')
- *   6. Phase 2: per-tile high-res via /api/edit (phase:'refine') in scan order
- *   7. Accept → composite inpaint canvas back into full image
+ *   1. Generate → buildGlobalPlanInput → /api/edit 'plan'        → globalPlanUrl
+ *   2.          → /api/edit 'extract-mask' → globalMaskUrl → buildMaskOverlay
+ *   3.          → planInpaintTiles + initInpaintCanvas (phase → 'tiling', idle)
+ *   4. Per tile (manual): buildInpaintTileInput → /api/edit 'refine'
+ *        → compositeInpaintTileResult   (generateTile / Generate-all)
+ *   5. Accept → compositeInpaintFinal → onAccept
+ *
+ * Re-run controls exist for the plan (cascades to mask), the mask (reuses the
+ * plan), and each tile individually.
  */
-/** Screen-space position for the floating popup. */
-type PopupPos = { x: number; y: number }
+const SIDEBAR_W = 360
 
-const POPUP_W = 380
-const POPUP_H = 640
-const POPUP_GAP = 12
+/** Response shape for any /api/edit phase that returns a generated image URL. */
+type EditPhaseResponse = { resultUrl?: string; error?: string }
 
+/**
+ * Stage 1 — global plan. Builds the annotated plan input, calls the LLM 'plan'
+ * phase, and returns the plan URL plus the context→plan-pixel scale factor.
+ */
+async function runGlobalPlanStage(args: {
+  image: string
+  region: InpaintRegion
+  editPrompt: string
+  referenceImages: ReferenceImage[]
+  apiKey: string
+  model: string
+}): Promise<{ globalPlanUrl: string; globalPlanScale: number }> {
+  const { dataUrl, scale } = await buildGlobalPlanInput(
+    args.image,
+    args.region.contextRect,
+    args.region.selectionRect,
+  )
+  const res = await fetch('/api/edit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      phase: 'plan',
+      imageDataUrl: dataUrl,
+      editPrompt: args.editPrompt,
+      referenceImages: args.referenceImages,
+      apiKey: args.apiKey,
+      model: args.model,
+    }),
+  })
+  const data = (await res.json()) as EditPhaseResponse
+  if (!res.ok || !data.resultUrl) {
+    throw new Error(data.error ?? 'Planning failed')
+  }
+  return { globalPlanUrl: data.resultUrl, globalPlanScale: scale }
+}
+
+/**
+ * Stage 2 — change-mask extraction. Calls the LLM 'extract-mask' phase with the
+ * clean context crop and the plan, then builds the display-only overlay.
+ */
+async function runChangeMaskStage(args: {
+  lowResContextUrl: string | null
+  globalPlanUrl: string
+  apiKey: string
+  model: string
+}): Promise<{ globalMaskUrl: string; globalMaskOverlayUrl: string | null }> {
+  const res = await fetch('/api/edit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      phase: 'extract-mask',
+      sourceContextUrl: args.lowResContextUrl,
+      globalPlanUrl: args.globalPlanUrl,
+      apiKey: args.apiKey,
+      model: args.model,
+    }),
+  })
+  const data = (await res.json()) as EditPhaseResponse
+  if (!res.ok || !data.resultUrl) {
+    throw new Error(data.error ?? 'Mask extraction failed')
+  }
+  const overlay = await buildMaskOverlay(args.globalPlanUrl, data.resultUrl).catch(() => null)
+  return { globalMaskUrl: data.resultUrl, globalMaskOverlayUrl: overlay ?? null }
+}
+
+/**
+ * Stage 3 — tiling setup. Builds the running composite canvas (pre-filled with
+ * source) and the tile plan. Tiles are NOT generated here; each is run on
+ * demand by the user.
+ */
+async function buildTilingSetup(
+  image: string,
+  region: InpaintRegion,
+): Promise<{ canvas: HTMLCanvasElement; tilePlan: InpaintTilePlan }> {
+  const canvas = await initInpaintCanvas(image, region.contextRect)
+  const selInCtx = {
+    x: region.selectionRect.x - region.contextRect.x,
+    y: region.selectionRect.y - region.contextRect.y,
+    w: region.selectionRect.w,
+    h: region.selectionRect.h,
+  }
+  const tilePlan = planInpaintTiles(region.contextRect.w, region.contextRect.h, selInCtx)
+  return { canvas, tilePlan }
+}
 
 export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, model, onAccept }: EditStudioProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -443,7 +425,6 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
   const [drag, setDrag] = useState<DragState | null>(null)
   const [inpaintState, setInpaintState] = useState<InpaintState | null>(null)
-  const [popupPos, setPopupPos] = useState<PopupPos | null>(null)
 
   // ── Sync canvas buffer to natural image dimensions ─────────────────────────
   useEffect(() => {
@@ -464,15 +445,14 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   useEffect(() => {
     if (!drag?.committed || !image || !dimensions) return
 
-    const maxStripRect: ImageRect = { x: 0, y: 0, w: dimensions.width, h: dimensions.height }
-    const dynamicMax = computeDynamicMaxRect(drag.start, maxStripRect)
-    const sel = clampRect(normaliseRect(drag.start, drag.current), dynamicMax)
+    const imageBounds: ImageRect = { x: 0, y: 0, w: dimensions.width, h: dimensions.height }
+    const sel = clampRect(normaliseRect(drag.start, drag.current), imageBounds)
     if (sel.w < 8 || sel.h < 8) return
 
-    const contextRect = outsetRect(sel, EDIT_STRIP_PX, maxStripRect)
+    const contextRect = outsetRect(sel, EDIT_STRIP_PX, imageBounds)
 
     buildLowResContextCrop(image, contextRect).then(({ dataUrl, scale }) => {
-      // Build annotated preview: draw the selection rectangle on the clean crop.
+      // Annotated preview: draw the selection box on top of the clean crop.
       const selInCtx = {
         x: sel.x - contextRect.x,
         y: sel.y - contextRect.y,
@@ -500,61 +480,12 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
         }
         const previewUrl = canvas.toDataURL('image/jpeg', 0.92)
         setInpaintState((prev) =>
-          prev ? { ...prev, lowResContextUrl: dataUrl, lowResPreviewUrl: previewUrl, lowResScale: scale } : null,
+          prev ? { ...prev, lowResContextUrl: dataUrl, lowResPreviewUrl: previewUrl } : null,
         )
       }
       img.src = dataUrl
     }).catch(() => {})
   }, [drag, image, dimensions])
-
-  // ── Popup position: screen-space anchor next to the committed selection ──────
-  // Reads the canvas bounding rect so the popup tracks the displayed image
-  // regardless of how the browser has scaled it.
-
-  useLayoutEffect(() => {
-    if (!inpaintState || !dimensions) {
-      setPopupPos(null)
-      return
-    }
-
-    const compute = () => {
-      const canvas = canvasRef.current
-      if (!canvas) return
-      const rect = canvas.getBoundingClientRect()
-      const scaleX = rect.width / dimensions.width
-      const scaleY = rect.height / dimensions.height
-      const sel = inpaintState.region.selectionRect
-
-      // Right edge of the selection in screen coordinates.
-      const selRight  = rect.left + (sel.x + sel.w) * scaleX
-      const selLeft   = rect.left + sel.x * scaleX
-      const selTop    = rect.top  + sel.y * scaleY
-      const selBottom = rect.top  + (sel.y + sel.h) * scaleY
-
-      // Prefer right of selection; flip left if it would overflow the viewport.
-      let x = selRight + POPUP_GAP
-      if (x + POPUP_W > window.innerWidth - 8) {
-        x = selLeft - POPUP_W - POPUP_GAP
-      }
-      // Clamp to viewport horizontally.
-      x = Math.max(8, Math.min(x, window.innerWidth - POPUP_W - 8))
-
-      // Vertically: align popup top to selection top.
-      // If the selection is taller than the popup, centre them instead.
-      let y = selTop
-      if (selBottom - selTop > POPUP_H) {
-        y = (selTop + selBottom) / 2 - POPUP_H / 2
-      }
-      // Clamp so the full popup height stays within the viewport.
-      y = Math.max(8, Math.min(y, window.innerHeight - POPUP_H - 8))
-
-      setPopupPos({ x, y })
-    }
-
-    compute()
-    window.addEventListener('resize', compute)
-    return () => window.removeEventListener('resize', compute)
-  }, [inpaintState, dimensions])
 
   // ── Mouse handlers ─────────────────────────────────────────────────────────
 
@@ -563,7 +494,6 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       if (!dimensions) return
       const canvas = canvasRef.current
       if (!canvas) return
-      // Don't start a new selection while an inpaint session is active.
       if (inpaintState) return
       e.preventDefault()
       isDraggingRef.current = true
@@ -618,182 +548,242 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   useEffect(() => {
     if (!drag?.committed || !dimensions || inpaintState) return
 
-    const maxStripRect: ImageRect = { x: 0, y: 0, w: dimensions.width, h: dimensions.height }
-    const dynamicMax = computeDynamicMaxRect(drag.start, maxStripRect)
-    const sel = clampRect(normaliseRect(drag.start, drag.current), dynamicMax)
+    const imageBounds: ImageRect = { x: 0, y: 0, w: dimensions.width, h: dimensions.height }
+    const sel = clampRect(normaliseRect(drag.start, drag.current), imageBounds)
     if (sel.w < 8 || sel.h < 8) return
 
-    const contextRect = outsetRect(sel, EDIT_STRIP_PX, maxStripRect)
+    const contextRect = outsetRect(sel, EDIT_STRIP_PX, imageBounds)
 
     const region: InpaintRegion = {
       selectionRect: sel,
-      maskType: 'rect',
       contextRect,
     }
 
     setInpaintState({
-      phase: 'mask',
+      phase: 'input',
       region,
       editPrompt: '',
       referenceImages: [],
       lowResContextUrl: null,
       lowResPreviewUrl: null,
-      maskOverlayUrl: null,
-      lowResScale: 1,
+      globalPlanScale: 1,
       globalPlanUrl: null,
+      globalMaskUrl: null,
+      globalMaskOverlayUrl: null,
       tilePlan: null,
       tileResults: [],
       generatingTileIdx: null,
-      maskGenerating: false,
       error: null,
-      tileDebugInputUrl: null,
-      tileDebugResultUrl: null,
     })
   }, [drag, dimensions, inpaintState])
 
-  // ── Callback: user confirms mask choice ────────────────────────────────────
+  // ── Callback: user submits description — kick off the full pipeline ─────────
 
-  const handleMaskConfirm = useCallback(
-    async (maskMode: 'rect' | 'image', maskDescription: string) => {
-      if (!inpaintState) return
-
-      if (maskMode === 'rect') {
-        // Use selection box — advance immediately to prompt stage.
-        setInpaintState((prev) =>
-          prev
-            ? { ...prev, phase: 'prompt', region: { ...prev.region, maskType: 'rect', maskImageUrl: undefined }, error: null }
-            : null,
-        )
-        return
-      }
-
-      // Text-mask path: generate a B&W mask from the description.
-      if (!maskDescription.trim()) {
-        setInpaintState((prev) => (prev ? { ...prev, error: 'Enter a mask description.' } : null))
-        return
-      }
-      if (!inpaintState.lowResContextUrl) {
-        setInpaintState((prev) => (prev ? { ...prev, error: 'Context preview not ready. Please wait.' } : null))
-        return
-      }
-
-      setInpaintState((prev) => (prev ? { ...prev, maskGenerating: true, error: null } : null))
-
+  /**
+   * Run the global plan + change mask, then set up tiling. Shared by the
+   * initial Generate action and the "re-run plan" action. Tiles are NOT
+   * generated here — the user runs each one manually afterward.
+   */
+  const runPlanAndMask = useCallback(
+    async (editPrompt: string, referenceImages: ReferenceImage[], region: InpaintRegion, lowResContextUrl: string | null) => {
       try {
-        const res = await fetch('/api/edit-mask', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contextDataUrl: inpaintState.lowResContextUrl,
-            maskDescription: maskDescription.trim(),
-            apiKey,
-            model,
-          }),
+        const { globalPlanUrl, globalPlanScale } = await runGlobalPlanStage({
+          image: image ?? '',
+          region,
+          editPrompt,
+          referenceImages,
+          apiKey,
+          model,
         })
-        const data = await res.json() as { maskUrl?: string; error?: string }
-        if (!res.ok || !data.maskUrl) throw new Error(data.error ?? 'Mask generation failed')
+        setInpaintState((prev) =>
+          prev ? { ...prev, globalPlanUrl, globalPlanScale, phase: 'masking' } : null,
+        )
 
-        // Build the mask overlay: B&W mask composited as a blue highlight
-        // over the context crop. Stored separately so the original selection
-        // preview is unchanged and this appears as a second image below it.
-        const maskOverlayUrl = inpaintState.lowResContextUrl
-          ? await buildMaskOverlayPreview(inpaintState.lowResContextUrl, data.maskUrl).catch(() => null)
-          : null
+        const { globalMaskUrl, globalMaskOverlayUrl } = await runChangeMaskStage({
+          lowResContextUrl,
+          globalPlanUrl,
+          apiKey,
+          model,
+        })
+
+        const { canvas, tilePlan } = await buildTilingSetup(image ?? '', region)
+        inpaintCanvasRef.current = canvas
 
         setInpaintState((prev) =>
           prev
             ? {
                 ...prev,
-                phase: 'prompt',
-                maskGenerating: false,
-                maskOverlayUrl,
-                region: { ...prev.region, maskType: 'image', maskImageUrl: data.maskUrl },
-                error: null,
+                globalMaskUrl,
+                globalMaskOverlayUrl,
+                phase: 'tiling',
+                tilePlan,
+                tileResults: Array<string | null>(tilePlan.tiles.length).fill(null),
+                generatingTileIdx: null,
               }
             : null,
         )
       } catch (e) {
         setInpaintState((prev) =>
           prev
-            ? {
-                ...prev,
-                maskGenerating: false,
-                error: e instanceof Error ? e.message : 'Mask generation failed',
-              }
+            ? { ...prev, phase: 'input', error: e instanceof Error ? e.message : 'Generation failed', generatingTileIdx: null }
             : null,
         )
       }
     },
-    [inpaintState, apiKey, model],
+    [image, apiKey, model],
   )
 
-  // ── Callback: user confirms prompt — kick off planning + tiling ────────────
+  // ── Callback: submit description — run plan + mask (tiles stay manual) ──────
 
-  const handlePromptConfirm = useCallback(
+  const handleGenerate = useCallback(
     async (editPrompt: string, referenceImages: ReferenceImage[]) => {
       if (!inpaintState || !image) return
+      const { region, lowResContextUrl } = inpaintState
 
-      const { region } = inpaintState
-      const { selectionRect, contextRect, maskType, maskImageUrl } = region
-
+      inpaintCanvasRef.current = null
       setInpaintState((prev) =>
         prev ? { ...prev, phase: 'planning', editPrompt, referenceImages, error: null } : null,
       )
 
+      await runPlanAndMask(editPrompt, referenceImages, region, lowResContextUrl)
+    },
+    [inpaintState, image, runPlanAndMask],
+  )
+
+  // ── Callback: re-run the global plan (cascades to mask, resets tiles) ───────
+
+  const handleRerunPlan = useCallback(async () => {
+    if (!inpaintState || !image) return
+    const { region, editPrompt, referenceImages, lowResContextUrl } = inpaintState
+
+    inpaintCanvasRef.current = null
+    setInpaintState((prev) =>
+      prev
+        ? {
+            ...prev,
+            phase: 'planning',
+            error: null,
+            globalPlanUrl: null,
+            globalMaskUrl: null,
+            globalMaskOverlayUrl: null,
+            tilePlan: null,
+            tileResults: [],
+            generatingTileIdx: null,
+          }
+        : null,
+    )
+
+    await runPlanAndMask(editPrompt, referenceImages, region, lowResContextUrl)
+  }, [inpaintState, image, runPlanAndMask])
+
+  // ── Callback: re-run only the change mask (reuses the existing plan) ────────
+
+  const handleRerunMask = useCallback(async () => {
+    if (!inpaintState || !image || !inpaintState.globalPlanUrl) return
+    const { region, globalPlanUrl, lowResContextUrl } = inpaintState
+
+    inpaintCanvasRef.current = null
+    setInpaintState((prev) =>
+      prev
+        ? {
+            ...prev,
+            phase: 'masking',
+            error: null,
+            globalMaskUrl: null,
+            globalMaskOverlayUrl: null,
+            tilePlan: null,
+            tileResults: [],
+            generatingTileIdx: null,
+          }
+        : null,
+    )
+
+    try {
+      const { globalMaskUrl, globalMaskOverlayUrl } = await runChangeMaskStage({
+        lowResContextUrl,
+        globalPlanUrl,
+        apiKey,
+        model,
+      })
+
+      const { canvas, tilePlan } = await buildTilingSetup(image, region)
+      inpaintCanvasRef.current = canvas
+
+      setInpaintState((prev) =>
+        prev
+          ? {
+              ...prev,
+              globalMaskUrl,
+              globalMaskOverlayUrl,
+              phase: 'tiling',
+              tilePlan,
+              tileResults: Array<string | null>(tilePlan.tiles.length).fill(null),
+              generatingTileIdx: null,
+            }
+          : null,
+      )
+    } catch (e) {
+      setInpaintState((prev) =>
+        prev ? { ...prev, phase: 'tiling', error: e instanceof Error ? e.message : 'Mask extraction failed' } : null,
+      )
+    }
+  }, [inpaintState, image, apiKey, model])
+
+  // ── Callback: generate / re-run a single tile ──────────────────────────────
+  // This is the ONLY path that produces tile pixels — tiles never run
+  // automatically. Used by the per-tile buttons and by "Generate all".
+
+  const generateTile = useCallback(
+    async (idx: number) => {
+      const canvas = inpaintCanvasRef.current
+      if (!inpaintState || !image || !inpaintState.tilePlan || !inpaintState.globalPlanUrl || !inpaintState.globalMaskUrl || !canvas) return
+
+      const tile = inpaintState.tilePlan.tiles[idx]
+      if (!tile.maskSubRect) return
+
+      const { contextRect } = inpaintState.region
+      const { editPrompt, referenceImages, globalPlanUrl, globalMaskUrl, globalPlanScale } = inpaintState
+
+      setInpaintState((prev) => (prev ? { ...prev, generatingTileIdx: idx, error: null } : null))
+
       try {
-        // Build the context crop at full resolution (capped at 1536 px) with
-        // the selection area greyed out — exactly what the extend pipeline does
-        // for its blank extension strip.
-        const { dataUrl: contextInputUrl } = await buildInpaintContextInput(
+        const tileInputUrl = await buildInpaintTileInput(
           image,
           contextRect,
-          selectionRect,
-          maskType === 'image' ? maskImageUrl : undefined,
+          tile,
+          globalPlanUrl,
+          globalPlanScale,
+          globalMaskUrl,
         )
 
-        // Single API call — same approach as the extend pipeline.
-        const res = await fetch('/api/edit', {
+        const tileRes = await fetch('/api/edit', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            phase: 'plan',
-            imageDataUrl: contextInputUrl,
+            phase: 'refine',
+            imageDataUrl: tileInputUrl,
             editPrompt,
             referenceImages,
-            maskDataUrl: maskType === 'image' ? maskImageUrl : undefined,
             apiKey,
             model,
           }),
         })
-        const data = await res.json() as { resultUrl?: string; error?: string }
-        if (!res.ok || !data.resultUrl) throw new Error(data.error ?? 'Generation failed')
+        const tileData = await tileRes.json() as { resultUrl?: string; error?: string }
+        if (!tileRes.ok || !tileData.resultUrl) throw new Error(tileData.error ?? 'Tile refinement failed')
 
-        // Load the model result into an inpaint canvas sized to the context rect.
-        const inpaintCanvas = await buildInpaintResultCanvas(data.resultUrl, contextRect)
-        inpaintCanvasRef.current = inpaintCanvas
-        console.log('[EditStudio] inpaintCanvas from result', {
-          w: inpaintCanvas.width,
-          h: inpaintCanvas.height,
-          resultUrlLength: data.resultUrl.length,
+        await compositeInpaintTileResult(canvas, image, tileData.resultUrl, tile, contextRect)
+
+        const resultUrl = tileData.resultUrl
+        setInpaintState((prev) => {
+          if (!prev) return null
+          const tileResults = [...prev.tileResults]
+          tileResults[idx] = resultUrl
+          return { ...prev, tileResults, generatingTileIdx: null }
         })
-
-        setInpaintState((prev) =>
-          prev
-            ? {
-                ...prev,
-                phase: 'done',
-                globalPlanUrl: data.resultUrl ?? null,
-                tileResults: [data.resultUrl ?? null],
-                tileDebugInputUrl: contextInputUrl,
-                tileDebugResultUrl: data.resultUrl ?? null,
-                error: null,
-              }
-            : null,
-        )
       } catch (e) {
         setInpaintState((prev) =>
           prev
-            ? { ...prev, phase: 'prompt', error: e instanceof Error ? e.message : 'Generation failed' }
+            ? { ...prev, generatingTileIdx: null, error: e instanceof Error ? e.message : 'Tile failed' }
             : null,
         )
       }
@@ -801,21 +791,59 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     [inpaintState, image, apiKey, model],
   )
 
+  // ── Callback: generate every masked tile that hasn't been generated yet ─────
+
+  const handleGenerateAllTiles = useCallback(async () => {
+    const plan = inpaintState?.tilePlan
+    if (!plan) return
+    const pending = plan.tiles
+      .map((tile, idx) => ({ tile, idx }))
+      .filter(({ tile, idx }) => tile.maskSubRect !== null && (inpaintState?.tileResults[idx] ?? null) === null)
+      .map(({ idx }) => idx)
+
+    for (const idx of pending) {
+      await generateTile(idx)
+    }
+  }, [inpaintState, generateTile])
+
+  // ── Callback: re-run the whole pipeline (back to input phase) ──────────────
+
+  const handleRerun = useCallback(() => {
+    inpaintCanvasRef.current = null
+    setInpaintState((prev) =>
+      prev
+        ? {
+            ...prev,
+            phase: 'input',
+            globalPlanUrl: null,
+            globalMaskUrl: null,
+            globalMaskOverlayUrl: null,
+            tilePlan: null,
+            tileResults: [],
+            generatingTileIdx: null,
+            error: null,
+          }
+        : null,
+    )
+  }, [])
+
   // ── Callback: accept — stamp inpaint canvas into full image ────────────────
 
   const handleAccept = useCallback(async () => {
     const inpaintCanvas = inpaintCanvasRef.current
 
-    // Diagnostic guard — surface any blocking condition visibly rather than
-    // returning silently (makes it easy to spot issues during development).
     if (!inpaintCanvas) {
       console.warn('[EditStudio] handleAccept: inpaintCanvas is null')
-      setInpaintState((prev) => prev ? { ...prev, error: 'Cannot accept: inpaint canvas is missing. Please try regenerating.' } : null)
+      setInpaintState((prev) =>
+        prev ? { ...prev, error: 'Cannot accept: inpaint canvas is missing. Please try regenerating.' } : null,
+      )
       return
     }
     if (!image) {
       console.warn('[EditStudio] handleAccept: image prop is null/empty')
-      setInpaintState((prev) => prev ? { ...prev, error: 'Cannot accept: source image is missing.' } : null)
+      setInpaintState((prev) =>
+        prev ? { ...prev, error: 'Cannot accept: source image is missing.' } : null,
+      )
       return
     }
     if (!inpaintState) {
@@ -828,6 +856,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
         contextRect: inpaintState.region.contextRect,
         canvasW: inpaintCanvas.width,
         canvasH: inpaintCanvas.height,
+        phase: inpaintState.phase,
       })
       const newImageUrl = await compositeInpaintFinal(image, inpaintCanvas, inpaintState.region.contextRect)
       const isSameAsSource = newImageUrl === image
@@ -838,6 +867,16 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
         newPrefix: newImageUrl.slice(0, 40),
         srcPrefix: image.slice(0, 40),
       })
+
+      if (isSameAsSource) {
+        // The compositeInpaintFinal helper fell back to returning the source URL
+        // unchanged — this means canvas.getContext('2d') returned null.
+        setInpaintState((prev) =>
+          prev ? { ...prev, error: 'Compositing failed: could not get canvas context. Try reloading the page.' } : null,
+        )
+        return
+      }
+
       onAccept(newImageUrl)
       setInpaintState(null)
       setDrag(null)
@@ -849,17 +888,6 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       )
     }
   }, [image, inpaintState, onAccept])
-
-  // ── Callback: discard — reset to prompt stage ──────────────────────────────
-
-  const handleDiscard = useCallback(() => {
-    inpaintCanvasRef.current = null
-    setInpaintState((prev) =>
-      prev
-        ? { ...prev, phase: 'prompt', globalPlanUrl: null, tilePlan: null, tileResults: [], generatingTileIdx: null, error: null }
-        : null,
-    )
-  }, [])
 
   // ── Callback: close panel — clear everything ───────────────────────────────
 
@@ -875,115 +903,148 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     return <EmptyEditState onPickFile={onPickFile} onDropFile={onDropFile} />
   }
 
-  const isProcessing = inpaintState?.phase === 'planning' || inpaintState?.phase === 'tiling'
+  const isProcessing =
+    inpaintState?.phase === 'planning' ||
+    inpaintState?.phase === 'masking' ||
+    inpaintState?.phase === 'tiling'
+
+  const hasSelection = !!drag?.committed || !!inpaintState
 
   return (
-    <div className="relative flex flex-1 flex-col items-center justify-center px-6 pb-6 pt-2">
-      {/* Image + canvas overlay */}
-      <div className="relative anim-fade">
-        <div
-          className="relative overflow-hidden checker rounded-[var(--radius-lg)]"
-          style={{
-            border: '1px solid var(--border)',
-            boxShadow:
-              '0 1px 0 rgba(255,255,255,0.04) inset, 0 24px 48px -12px rgba(0,0,0,0.5), 0 0 0 1px rgba(0,0,0,0.4)',
-          }}
-        >
-          {/* Image always uses full available width — popup floats on top */}
-          <img
-            src={image}
-            alt=""
-            className="block object-contain anim-fade max-h-[calc(100vh-260px)] max-w-[min(1200px,calc(100vw-96px))]"
-            draggable={false}
-          />
+    <div className="flex flex-1 overflow-hidden">
 
-          <canvas
-            ref={canvasRef}
-            onMouseDown={handleMouseDown}
-            onMouseMove={handleMouseMove}
-            onMouseUp={handleMouseUp}
-            onMouseLeave={handleMouseLeave}
-            style={{
-              position: 'absolute',
-              inset: 0,
-              width: '100%',
-              height: '100%',
-              cursor: inpaintState || isProcessing ? 'default' : 'crosshair',
-              touchAction: 'none',
-              pointerEvents: inpaintState || isProcessing ? 'none' : 'auto',
-            }}
-          />
-        </div>
-
-        {/* Below-image meta row — fixed height so the image never shifts */}
-        <div className="mt-5 flex h-8 items-center gap-3 anim-slide-up">
+      {/* ── Image area ──────────────────────────────────────────────────────── */}
+      <div className="flex flex-1 flex-col items-center justify-center px-6 pb-6 pt-2">
+        <div className="relative anim-fade">
           <div
-            className="rounded-full border px-2.5 py-1 font-mono text-[11px]"
+            className="relative overflow-hidden checker rounded-[var(--radius-lg)]"
             style={{
-              borderColor: 'var(--border)',
-              background: 'var(--bg-elev)',
-              color: 'var(--text-secondary)',
+              border: '1px solid var(--border)',
+              boxShadow:
+                '0 1px 0 rgba(255,255,255,0.04) inset, 0 24px 48px -12px rgba(0,0,0,0.5), 0 0 0 1px rgba(0,0,0,0.4)',
             }}
           >
-            {dimensions.width} × {dimensions.height}
+            <img
+              src={image}
+              alt=""
+              className="block object-contain anim-fade"
+              style={{
+                maxHeight: 'calc(100vh - 200px)',
+                maxWidth: `min(900px, calc(100vw - ${SIDEBAR_W + 64}px))`,
+              }}
+              draggable={false}
+            />
+
+            <canvas
+              ref={canvasRef}
+              onMouseDown={handleMouseDown}
+              onMouseMove={handleMouseMove}
+              onMouseUp={handleMouseUp}
+              onMouseLeave={handleMouseLeave}
+              style={{
+                position: 'absolute',
+                inset: 0,
+                width: '100%',
+                height: '100%',
+                cursor: inpaintState || isProcessing ? 'default' : 'crosshair',
+                touchAction: 'none',
+                pointerEvents: inpaintState || isProcessing ? 'none' : 'auto',
+              }}
+            />
           </div>
-          <div className="flex h-full items-center">
-            {!drag && !inpaintState && (
-              <span className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
-                Click and drag to select a region
-              </span>
-            )}
+
+          {/* Below-image meta row */}
+          <div className="mt-4 flex h-7 items-center gap-3">
+            <div
+              className="rounded-full border px-2.5 py-1 font-mono text-[11px]"
+              style={{
+                borderColor: 'var(--border)',
+                background: 'var(--bg-elev)',
+                color: 'var(--text-secondary)',
+              }}
+            >
+              {dimensions.width} × {dimensions.height}
+            </div>
             {drag && !drag.committed && (
               <span className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
                 Release to confirm selection
               </span>
             )}
-            {drag?.committed && !inpaintState && (
-              <button
-                className="btn btn-ghost text-[12px]"
-                style={{ height: '100%', padding: '0 10px' }}
-                onClick={() => setDrag(null)}
-              >
-                Clear selection
-              </button>
-            )}
           </div>
         </div>
       </div>
 
-      {/* Floating popup — anchored next to the committed selection */}
-      {inpaintState && popupPos && (
+      {/* ── Sidebar ─────────────────────────────────────────────────────────── */}
+      <div
+        className="flex min-h-0 flex-col"
+        style={{
+          width: SIDEBAR_W,
+          flexShrink: 0,
+          maxHeight: '100vh',
+          borderLeft: '1px solid var(--border)',
+          background: 'var(--bg)',
+        }}
+      >
+        {/* Sidebar header */}
         <div
-          className="anim-fade"
-          style={{
-            position: 'fixed',
-            left: popupPos.x,
-            top: popupPos.y,
-            width: POPUP_W,
-            height: Math.min(POPUP_H, window.innerHeight - 16),
-            maxHeight: 'calc(100vh - 16px)',
-            zIndex: 50,
-            borderRadius: 14,
-            border: '1px solid var(--border)',
-            background: 'var(--bg)',
-            boxShadow: '0 8px 32px rgba(0,0,0,0.55), 0 0 0 1px rgba(0,0,0,0.35)',
-            display: 'flex',
-            flexDirection: 'column',
-            overflow: 'hidden',
-          }}
+          className="flex items-center justify-between px-4 py-3"
+          style={{ borderBottom: '1px solid var(--border)' }}
         >
+          <span className="text-[13px] font-semibold" style={{ color: 'var(--text-primary)' }}>
+            Edit
+          </span>
+          {hasSelection && (
+            <button
+              className="btn btn-ghost text-[12px]"
+              style={{ padding: '2px 10px', height: 28 }}
+              onClick={handleClose}
+            >
+              Cancel
+            </button>
+          )}
+        </div>
+
+        {/* Sidebar body */}
+        {inpaintState ? (
           <EditPanel
             inpaintState={inpaintState}
-            apiKey={apiKey}
-            model={model}
-            onMaskConfirm={(maskMode, desc) => { void handleMaskConfirm(maskMode, desc) }}
-            onPromptConfirm={(prompt, refs) => { void handlePromptConfirm(prompt, refs) }}
+            onGenerate={(prompt, refs) => { void handleGenerate(prompt, refs) }}
+            onRerunPlan={() => { void handleRerunPlan() }}
+            onRerunMask={() => { void handleRerunMask() }}
+            onRerunTile={(idx) => { void generateTile(idx) }}
+            onGenerateAllTiles={() => { void handleGenerateAllTiles() }}
+            onRerun={handleRerun}
             onAccept={() => { void handleAccept() }}
-            onDiscard={handleDiscard}
             onClose={handleClose}
           />
-        </div>
-      )}
+        ) : (
+          <div className="flex flex-1 flex-col items-center justify-center gap-4 px-6 text-center">
+            <div
+              style={{
+                width: 48,
+                height: 48,
+                borderRadius: '50%',
+                background: 'var(--bg-elev)',
+                border: '1px solid var(--border)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
+            >
+              <Icons.Pencil size={20} className="opacity-40" />
+            </div>
+            <div>
+              <p className="text-[13px] font-medium" style={{ color: 'var(--text-primary)' }}>
+                Make a selection
+              </p>
+              <p className="mt-1 text-[12px]" style={{ color: 'var(--text-muted)' }}>
+                Click and drag on the image to select the area you want to edit.
+              </p>
+            </div>
+          </div>
+        )}
+      </div>
+
     </div>
   )
 }
