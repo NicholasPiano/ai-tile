@@ -5150,12 +5150,11 @@ export async function buildInpaintContextInput(
   const selH = Math.round(selectionRect.h * scale)
 
   if (maskImageUrl) {
-    // Bitmap mask path: apply the B&W mask as an alpha mask over the grey fill.
+    // Bitmap mask path: fill entire selection grey then overlay the B&W mask
+    // so only the masked pixels stay grey.
     ctx.fillStyle = EXTENSION_BLANK_COLOR
     ctx.fillRect(selX, selY, selW, selH)
     const maskImg = await loadImageElement(maskImageUrl)
-    // Clip to selection, then use destination-in with the mask to selectively
-    // grey only the masked pixels.
     const maskCanvas = document.createElement('canvas')
     maskCanvas.width = selW
     maskCanvas.height = selH
@@ -5169,10 +5168,24 @@ export async function buildInpaintContextInput(
     ctx.fillRect(selX, selY, selW, selH)
     ctx.restore()
   } else {
-    // Rect mask path: just fill the selection with grey.
+    // Rect mask path: fill selection with grey.
     ctx.fillStyle = EXTENSION_BLANK_COLOR
     ctx.fillRect(selX, selY, selW, selH)
   }
+
+  // Draw a solid red border around the selection to give the model an
+  // unambiguous boundary marker. The prompt instructs the model that only
+  // pixels inside this border may change — any edit outside is a failure.
+  const borderPx = Math.max(3, Math.round(Math.min(outW, outH) * 0.008))
+  ctx.strokeStyle = '#FF0000'
+  ctx.lineWidth = borderPx
+  // Inset by half the line width so the stroke sits fully inside the selection.
+  ctx.strokeRect(
+    selX + borderPx / 2,
+    selY + borderPx / 2,
+    selW - borderPx,
+    selH - borderPx,
+  )
 
   return { dataUrl: canvas.toDataURL('image/jpeg', 0.95), scale }
 }
