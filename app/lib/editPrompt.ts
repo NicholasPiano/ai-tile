@@ -89,42 +89,75 @@ export function buildMaskExtractionPrompt(): string {
  *
  * The model receives a full-resolution tile where:
  *   - A BLUE-BORDERED rectangle marks the edit zone.
- *   - Inside the blue border: a mix of low-res plan pixels (blurry — needs
- *     refinement) and high-res original pixels (crisp — do not touch).
- *   - Outside the blue border: original high-resolution context.
+ *   - Inside the blue border: a SOFTENED COMPOSITION PLAN — a low-resolution,
+ *     blurry preview showing correct layout and colour, but not the target look.
+ *   - Outside the blue border: original high-resolution context (style reference).
  *
- * The model must refine the blurry plan pixels to full resolution while
- * leaving every other pixel unchanged.
+ * Mirrors the structure of the extension hasBakedPlanning tile prompt:
+ *   - Named PIXEL LAYOUT regions.
+ *   - Numbered task steps.
+ *   - STYLE AUTHORITY: context = how to render; plan = what to show.
+ *   - FORBIDDEN OUTPUTS list.
+ *   - "IGNORE its pixel structure" framing so the model does not clone-stamp.
  */
 export function buildTileRefinementPrompt(editDescription: string): string {
   return [
-    'You are an expert image inpainting artist doing high-resolution refinement.',
+    'You are an expert image renderer. You have been given a full-resolution image',
+    'tile where a BLUE-BORDERED rectangle marks an EDIT ZONE that contains a',
+    'SOFTENED COMPOSITION PLAN — layout and colour guidance only, NOT the target look.',
     '',
-    'You are given a full-resolution image tile. A BLUE-BORDERED rectangle marks',
-    'the EDIT ZONE.',
+    'PIXEL LAYOUT OF THE TILE:',
+    '- OUTSIDE the blue border → HIGH-RESOLUTION original scene content.',
+    '  This is your STYLE REFERENCE. Preserve these pixels EXACTLY —',
+    '  pixel-perfect, no changes whatsoever.',
+    '- INSIDE the blue border → SOFTENED composition plan (may look blurry or',
+    '  blocky). IGNORE its pixel structure. Your job is to render this area as a',
+    '  sharp, full-resolution version of what the plan depicts.',
     '',
-    '  • INSIDE the blue border: low-resolution, blurry preview pixels that show a',
-    '    rough draft of the desired result. You must replace ALL pixels inside the',
-    '    blue border with a crisp, full-resolution version that realises the edit',
-    '    instruction below.',
+    `Edit instruction (what the plan depicts): ${editDescription}`,
     '',
-    '  • OUTSIDE the blue border: the original high-resolution context. Do NOT',
-    '    modify these pixels at all.',
+    'YOUR TASK:',
+    '1. Preserve EVERY pixel outside the blue border exactly as-is — do not alter',
+    '   them in any way.',
+    '2. Study the pixels outside the blue border for rendering style: texture',
+    '   density, edge sharpness, colour depth, shading model, and level of realism.',
+    '   The edit zone MUST match this exactly.',
+    '3. Render the area inside the blue border using the plan ONLY for composition',
+    '   (where things go, general shapes, colour masses):',
+    '   - Same subjects, spatial layout, and proportions as the plan shows.',
+    '   - Full native-resolution detail, texture, and anti-aliasing matching the',
+    '     surrounding context.',
+    '   - Do NOT copy the plan\'s blur, blockiness, flat colours, or simplified',
+    '     rendering — those are artefacts of the low-res preview, not the goal.',
+    '   - Do NOT copy, clone, or shift content from outside the border into the',
+    '     zone. Every element inside the border must sit at the position the plan',
+    '     places it — no offset, no mirror, no paste of nearby context.',
+    '4. Make the boundary between the edit zone and the surrounding context',
+    '   completely invisible — no seam, colour shift, or brightness jump.',
+    '   Any object or surface crossing the blue border must line up seamlessly.',
     '',
-    `Edit instruction: ${editDescription}`,
+    'STYLE AUTHORITY (critical):',
+    '- The high-resolution pixels outside the blue border are the SOLE authority',
+    '  for how the edit zone should look.',
+    '- The plan defines WHAT to show, not HOW to render it.',
+    '- Output must look like the same photograph, render, or artwork with the',
+    '  edit applied at full quality — as if captured at the same resolution as',
+    '  the surrounding context.',
     '',
-    'Your task:',
-    '1. Re-generate EVERY pixel inside the blue border at full high resolution,',
-    '   following the edit instruction and matching the surrounding context in',
-    '   lighting, colour, perspective, texture, and style.',
-    '2. Leave every pixel outside the blue border completely unchanged.',
-    '3. Return the COMPLETE tile image at exactly the same pixel dimensions.',
+    'FORBIDDEN OUTPUTS (unless the surrounding context already uses that exact style):',
+    '- Cartoon, anime, chibi, or illustration-simplified rendering',
+    '- Pixel art, 8-bit, 16-bit, or retro-game aesthetics',
+    '- Flat shading, posterization, banding, or limited colour palettes',
+    '- Visible upscaled blocks, chunky pixels, or mosaic artefacts',
+    '- Clip-art, vector-icon, or children\'s-book simplification',
     '',
-    'Critical rules:',
-    '- Replace ALL pixels inside the blue rectangle (they are a low-res draft).',
-    '- Every pixel outside the blue rectangle must be pixel-perfect unchanged.',
-    '- Blend the edited region seamlessly into the surrounding context at each edge.',
-    '- Do NOT include or recreate the blue border itself in the output.',
-    '- Do not crop, letterbox, or resize the image.',
+    'A result that looks like an upscaled, cartoonified, or pixelated version of',
+    'the plan — or that pastes a shifted copy of the surrounding context into the',
+    'zone — is a FAILURE.',
+    '',
+    'OUTPUT RULES:',
+    '- Do NOT draw or recreate the blue border itself.',
+    '- Return the COMPLETE tile at exactly the same pixel dimensions — do not crop,',
+    '  letterbox, pad, or resize.',
   ].join('\n')
 }

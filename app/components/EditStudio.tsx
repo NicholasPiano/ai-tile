@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   EDIT_STRIP_PX,
+  MAX_AI_DIMENSION,
   type InpaintState,
   type InpaintRegion,
   type InpaintTilePlan,
@@ -92,6 +93,19 @@ function clampRect(r: ImageRect, bounds: ImageRect): ImageRect {
   const x2 = clamp(r.x + r.w, bounds.x, bounds.x + bounds.w)
   const y2 = clamp(r.y + r.h, bounds.y, bounds.y + bounds.h)
   return { x, y, w: x2 - x, h: y2 - y }
+}
+
+/**
+ * Minimal Promise-based image loader used by the direct-plan fast path.
+ * Avoids importing the private `loadImageElement` from imageProcessor.
+ */
+function loadImg(url: string): Promise<HTMLImageElement> {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new window.Image()
+    img.onload = () => resolve(img)
+    img.onerror = () => reject(new Error('Failed to load image'))
+    img.src = url
+  })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -314,18 +328,23 @@ export interface EditStudioProps {
  *
  * Renders the source image with a transparent canvas overlay for interactive
  * selection drawing. Once the user commits a selection the sidebar transitions
- * to the input form. On submit, only the plan + mask run automatically — tiles
- * are generated on demand:
+ * to the input form. On submit, only the plan runs automatically. If the
+ * context rect fits within MAX_AI_DIMENSION the plan result is composited
+ * directly and the user can accept immediately (fast path). Otherwise the mask
+ * and tile steps follow:
  *
  *   1. Generate → buildGlobalPlanInput → /api/edit 'plan'        → globalPlanUrl
+ *   Fast path (context ≤ MAX_AI_DIMENSION):
+ *   1a.         → draw globalPlanUrl into inpaint canvas → phase 'done'
+ *   Full path:
  *   2.          → /api/edit 'extract-mask' → globalMaskUrl → buildMaskOverlay
  *   3.          → planInpaintTiles + initInpaintCanvas (phase → 'tiling', idle)
  *   4. Per tile (manual): buildInpaintTileInput → /api/edit 'refine'
  *        → compositeInpaintTileResult   (generateTile / Generate-all)
  *   5. Accept → compositeInpaintFinal → onAccept
  *
- * Re-run controls exist for the plan (cascades to mask), the mask (reuses the
- * plan), and each tile individually.
+ * Re-run controls exist for the plan (cascades to mask/tiles), the mask
+ * (reuses the plan), and each tile individually (full path only).
  */
 const SIDEBAR_W = 360
 
@@ -447,7 +466,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
     const imageBounds: ImageRect = { x: 0, y: 0, w: dimensions.width, h: dimensions.height }
     const sel = clampRect(normaliseRect(drag.start, drag.current), imageBounds)
-    if (sel.w < 8 || sel.h < 8) return
+    if (sel.w < 1 || sel.h < 1) return
 
     const contextRect = outsetRect(sel, EDIT_STRIP_PX, imageBounds)
 
@@ -550,7 +569,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
     const imageBounds: ImageRect = { x: 0, y: 0, w: dimensions.width, h: dimensions.height }
     const sel = clampRect(normaliseRect(drag.start, drag.current), imageBounds)
-    if (sel.w < 8 || sel.h < 8) return
+    if (sel.w < 1 || sel.h < 1) return
 
     const contextRect = outsetRect(sel, EDIT_STRIP_PX, imageBounds)
 
@@ -580,9 +599,11 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   // ── Callback: user submits description — kick off the full pipeline ─────────
 
   /**
-   * Run the global plan + change mask, then set up tiling. Shared by the
-   * initial Generate action and the "re-run plan" action. Tiles are NOT
-   * generated here — the user runs each one manually afterward.
+   * Run the global plan, then — if the context fits within MAX_AI_DIMENSION —
+   * composite the plan directly and jump to 'done' (fast path). Otherwise run
+   * the change mask and set up tiling. Shared by the initial Generate action
+   * and the "re-run plan" action. Tiles are NOT generated here in either path;
+   * the user runs each one manually afterward (full path only).
    */
   const runPlanAndMask = useCallback(
     async (editPrompt: string, referenceImages: ReferenceImage[], region: InpaintRegion, lowResContextUrl: string | null) => {
@@ -599,6 +620,35 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
           prev ? { ...prev, globalPlanUrl, globalPlanScale, phase: 'masking' } : null,
         )
 
+        const { contextRect } = region
+
+        // Fast path — context fits in a single tile. Skip mask extraction and
+        // tiling: draw the plan result directly into the inpaint canvas so the
+        // user can accept immediately without any further LLM calls.
+        if (contextRect.w <= MAX_AI_DIMENSION && contextRect.h <= MAX_AI_DIMENSION) {
+          const canvas = await initInpaintCanvas(image ?? '', contextRect)
+          const planImg = await loadImg(globalPlanUrl)
+          const ctx = canvas.getContext('2d')
+          if (ctx) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height)
+            ctx.drawImage(planImg, 0, 0, canvas.width, canvas.height)
+          }
+          inpaintCanvasRef.current = canvas
+          setInpaintState((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  phase: 'done',
+                  tilePlan: null,
+                  tileResults: [],
+                  generatingTileIdx: null,
+                }
+              : null,
+          )
+          return
+        }
+
+        // Full path — context is too large for a single tile; run mask + tiles.
         const { globalMaskUrl, globalMaskOverlayUrl } = await runChangeMaskStage({
           lowResContextUrl,
           globalPlanUrl,

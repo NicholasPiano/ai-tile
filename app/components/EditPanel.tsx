@@ -283,7 +283,9 @@ export function EditPanel({
   // each tile manually. Only an in-flight LLM call counts as "processing".
   const pastInput     = phase !== 'input'
   const showPlan      = ['planning', 'masking', 'tiling', 'done'].includes(phase)
-  const showMask      = ['masking', 'tiling', 'done'].includes(phase)
+  // showMask only when a mask was actually generated — not in the fast path where
+  // the plan is composited directly and globalMaskOverlayUrl stays null.
+  const showMask      = ['masking', 'tiling', 'done'].includes(phase) && globalMaskOverlayUrl !== null
   const showTiles     = tilePlan !== null
   const isGenerating  = generatingTileIdx !== null
   const isStageBusy   = phase === 'planning' || phase === 'masking'
@@ -292,9 +294,12 @@ export function EditPanel({
   const doneCount = tileResults.filter((r) => r !== null).length
   const totalMasked = tilePlan?.tiles.filter((t) => t.maskSubRect !== null).length ?? 0
   const allTilesDone = totalMasked > 0 && doneCount === totalMasked
-  const canAccept = doneCount > 0
-  const planReady = globalPlanUrl !== null
-  const maskReady = globalMaskOverlayUrl !== null
+  // Fast path: phase reaches 'done' with tilePlan null — the plan was composited
+  // directly and is ready to accept without any tile generation.
+  const isFastPath  = phase === 'done' && tilePlan === null
+  const canAccept   = isFastPath || doneCount > 0
+  const planReady   = globalPlanUrl !== null
+  const maskReady   = globalMaskOverlayUrl !== null
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -472,9 +477,11 @@ export function EditPanel({
               {canAccept && (
                 <>
                   <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
-                    {allTilesDone
-                      ? `All ${doneCount} tile${doneCount !== 1 ? 's' : ''} generated.`
-                      : `${doneCount} of ${totalMasked} tiles generated — you can accept now or keep going.`}
+                    {isFastPath
+                      ? 'Plan is ready — accept to apply the changes.'
+                      : allTilesDone
+                        ? `All ${doneCount} tile${doneCount !== 1 ? 's' : ''} generated.`
+                        : `${doneCount} of ${totalMasked} tiles generated — you can accept now or keep going.`}
                   </p>
                   <button
                     className="btn btn-primary w-full"
