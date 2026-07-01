@@ -1487,9 +1487,10 @@ export default function Home() {
   }
 
   const handleDownload = () => {
-    if (!activeCandidate) return
+    const target = activeCandidate?.imageUrl ?? selectedImage
+    if (!target) return
     const link = document.createElement('a')
-    link.href = activeCandidate.imageUrl
+    link.href = target
     const baseName = originalFileName.replace(/\.[^/.]+$/, '') || 'extended'
     // Tag the filename with the variant index when there are multiple, so
     // batch-downloading different cycles doesn't overwrite the same file.

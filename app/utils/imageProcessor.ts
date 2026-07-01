@@ -4906,22 +4906,172 @@ export async function buildLowResContextCrop(
   if (ctx) {
     ctx.drawImage(img, contextRect.x, contextRect.y, contextRect.w, contextRect.h, 0, 0, outW, outH)
   }
-  return { dataUrl: canvas.toDataURL('image/jpeg', 0.92), scale }
+  // PNG is lossless — no per-channel drift that would pollute the pixel diff
+  // later when comparing this crop against the global plan result.
+  return { dataUrl: canvas.toDataURL('image/png'), scale }
+}
+
+
+/**
+ * Compute a pixel-level change mask by diffing two images at the same
+ * resolution (original low-res context crop vs. the global plan result).
+ *
+ * Returns a canvas where:
+ *   - Changed pixels  → fully opaque   (RGBA [255, 255, 255, 255])
+ *   - Unchanged pixels → fully transparent (RGBA [0, 0, 0, 0])
+ *
+ * This mask is used by buildInpaintTileInput to decide, for each pixel inside
+ * the selection, whether to show the blurry plan (changed) or the crisp
+ * source (unchanged). The result replaces the LLM mask-extraction call.
+ *
+ * @param threshold  Per-channel maximum difference considered "same".
+ *                   Default 10 absorbs JPEG compression noise in the plan
+ *                   result without masking real edits.
+ */
+export async function computeChangeMask(
+  originalUrl: string,
+  planUrl: string,
+  threshold = 10,
+): Promise<HTMLCanvasElement> {
+  const [origImg, planImg] = await Promise.all([
+    loadImageElement(originalUrl),
+    loadImageElement(planUrl),
+  ])
+
+  const w = origImg.naturalWidth
+  const h = origImg.naturalHeight
+
+  const origCanvas = document.createElement('canvas')
+  origCanvas.width = w
+  origCanvas.height = h
+  const origCtx = origCanvas.getContext('2d')
+
+  // Draw the plan scaled to match the original dimensions in case the LLM
+  // returned a slightly different size.
+  const planCanvas = document.createElement('canvas')
+  planCanvas.width = w
+  planCanvas.height = h
+  const planCtx = planCanvas.getContext('2d')
+
+  const maskCanvas = document.createElement('canvas')
+  maskCanvas.width = w
+  maskCanvas.height = h
+  const maskCtx = maskCanvas.getContext('2d')
+
+  if (!origCtx || !planCtx || !maskCtx) {
+    // Fallback: treat everything as changed so no pixels are silently skipped.
+    if (maskCtx) {
+      maskCtx.fillStyle = 'white'
+      maskCtx.fillRect(0, 0, w, h)
+    }
+    return maskCanvas
+  }
+
+  origCtx.drawImage(origImg, 0, 0, w, h)
+  planCtx.drawImage(planImg, 0, 0, w, h)
+
+  const origData = origCtx.getImageData(0, 0, w, h).data
+  const planData = planCtx.getImageData(0, 0, w, h).data
+
+  const maskImageData = maskCtx.createImageData(w, h)
+  const maskData = maskImageData.data
+
+  for (let i = 0; i < w * h; i++) {
+    const idx = i * 4
+    const dr = Math.abs(origData[idx]     - planData[idx])
+    const dg = Math.abs(origData[idx + 1] - planData[idx + 1])
+    const db = Math.abs(origData[idx + 2] - planData[idx + 2])
+    const changed = Math.max(dr, dg, db) > threshold ? 255 : 0
+    maskData[idx]     = changed
+    maskData[idx + 1] = changed
+    maskData[idx + 2] = changed
+    maskData[idx + 3] = changed  // alpha: opaque = changed, transparent = unchanged
+  }
+
+  maskCtx.putImageData(maskImageData, 0, 0)
+  return maskCanvas
+}
+
+/**
+ * Build two display-only visualisations of the computed change mask:
+ *
+ *   maskUrl     — B&W PNG: white where changed, black where unchanged.
+ *   overlayUrl  — global plan image with a light-blue highlight painted over
+ *                 the changed regions (opacity ~45 %).
+ *
+ * Neither URL is ever sent to the API. They are stored in InpaintState so
+ * the sidebar and tile grid can show the user where the plan made changes.
+ *
+ * @param maskCanvas   The canvas returned by computeChangeMask (alpha-encoded).
+ * @param planUrl      The global plan result data URL (used as the base layer
+ *                     in the overlay visualisation).
+ */
+export async function buildChangeMaskVisuals(
+  maskCanvas: HTMLCanvasElement,
+  planUrl: string,
+): Promise<{ maskUrl: string; overlayUrl: string }> {
+  const w = maskCanvas.width
+  const h = maskCanvas.height
+
+  // ── B&W mask ────────────────────────────────────────────────────────────────
+  // Black background + white where the mask alpha is opaque (= changed).
+  const bwCanvas = document.createElement('canvas')
+  bwCanvas.width = w
+  bwCanvas.height = h
+  const bwCtx = bwCanvas.getContext('2d')
+  if (bwCtx) {
+    bwCtx.fillStyle = '#000000'
+    bwCtx.fillRect(0, 0, w, h)
+    bwCtx.drawImage(maskCanvas, 0, 0)
+  }
+  const maskUrl = bwCanvas.toDataURL('image/png')
+
+  // ── Blue-highlight overlay ───────────────────────────────────────────────
+  // Draw the plan, then paint a light-blue tint only over changed pixels.
+  const planImg = await loadImageElement(planUrl)
+  const overlayCanvas = document.createElement('canvas')
+  overlayCanvas.width = w
+  overlayCanvas.height = h
+  const overlayCtx = overlayCanvas.getContext('2d')
+  if (overlayCtx) {
+    // Base: plan image scaled to mask dimensions (plan may differ slightly in
+    // size when the LLM returns a non-exact dimension).
+    overlayCtx.drawImage(planImg, 0, 0, w, h)
+
+    // Tint layer: blue rectangle masked by the change mask.
+    const tintCanvas = document.createElement('canvas')
+    tintCanvas.width = w
+    tintCanvas.height = h
+    const tintCtx = tintCanvas.getContext('2d')
+    if (tintCtx) {
+      tintCtx.fillStyle = '#1e8cff'
+      tintCtx.fillRect(0, 0, w, h)
+      tintCtx.globalCompositeOperation = 'destination-in'
+      tintCtx.drawImage(maskCanvas, 0, 0)
+    }
+
+    overlayCtx.globalAlpha = 0.45
+    overlayCtx.drawImage(tintCanvas, 0, 0)
+    overlayCtx.globalAlpha = 1
+  }
+  const overlayUrl = overlayCanvas.toDataURL('image/png')
+
+  return { maskUrl, overlayUrl }
 }
 
 
 /**
  * Build the input image for one inpaint tile.
  *
- *   1. Fill the entire tile canvas with source pixels.
- *   2. When a `planImageUrl` and `globalPlanScale` are provided, bake the
- *      corresponding region of the global plan (upscaled) into the tile, using
- *      `globalMaskUrl` as an alpha mask so that only pixels that actually
- *      changed get the plan content. Pixels inside the selection that were not
- *      changed by the global plan keep their original source values — this
- *      feeds as many high-res original pixels to the model as possible.
- *   3. Draw a blue border around `maskSubRect` as an unambiguous boundary
- *      marker that matches the tile-refinement prompt wording.
+ *   1. Fill the entire tile canvas with source pixels (high-res, unchanged).
+ *   2. When a `planImageUrl`, `globalPlanScale`, and `changeMask` are provided,
+ *      bake blurry plan pixels into `maskSubRect` — but only for pixels the
+ *      change mask marks as actually changed. Pixels inside the selection that
+ *      the plan left unchanged keep their crisp high-res source values.
+ *
+ *      The visual contrast between blurry plan pixels and crisp source pixels
+ *      is the signal the refinement model uses to locate the edit zone — no
+ *      blue border annotation is needed or drawn.
  *
  * Context pixels (everything outside `maskSubRect`) always come from the
  * original source image.
@@ -4932,8 +5082,10 @@ export async function buildInpaintTileInput(
   tileSpec: InpaintTileSpec,
   planImageUrl?: string,
   globalPlanScale?: number,
-  /** @deprecated No longer used — plan pixels are always drawn within maskSubRect. */
-  _globalMaskUrl?: string,
+  /** Per-pixel diff mask from computeChangeMask. Changed pixels are opaque;
+   *  unchanged pixels are transparent. Used to preserve crisp source content
+   *  inside the selection where the plan made no changes. */
+  changeMask?: HTMLCanvasElement,
 ): Promise<string> {
   const img = await loadImageElement(sourceImageUrl)
 
@@ -4955,24 +5107,16 @@ export async function buildInpaintTileInput(
 
     const planImg = await loadImageElement(planImageUrl)
 
-    // The maskSubRect's position in the global-plan image coordinates.
-    // We draw ONLY the plan content that falls inside the selection boundary
-    // (maskSubRect), so the context ring always shows clean source pixels.
-    const selInCtxX = tileSpec.x + mX  // maskSubRect left edge in context-perimeter coords
-    const selInCtxY = tileSpec.y + mY  // maskSubRect top edge in context-perimeter coords
-
+    // Source coordinates of this selection sub-rect in the global plan image.
+    const selInCtxX = tileSpec.x + mX
+    const selInCtxY = tileSpec.y + mY
     const planSrcX = Math.max(0, Math.round(selInCtxX * globalPlanScale))
     const planSrcY = Math.max(0, Math.round(selInCtxY * globalPlanScale))
     const planSrcW = Math.max(1, Math.round(mW * globalPlanScale))
     const planSrcH = Math.max(1, Math.round(mH * globalPlanScale))
 
-    // Step 2: overlay the plan content into maskSubRect, but FIRST downsample it
-    // by 4× so that when it is drawn back at full tile dimensions it is noticeably
-    // blurry.  This "blurry plan pixel" signal is what the refinement prompt uses
-    // to identify which pixels to re-generate.  Without the downscale step the
-    // plan pixels are already full-resolution (when globalPlanScale ≈ 1) and the
-    // model interprets them as "already crisp — do not change," returning
-    // source-identical output.
+    // Step 2a: downsample the plan region 4× so the model can clearly
+    // distinguish blurry plan pixels from crisp source pixels.
     const PLAN_BLUR_DIVISOR = 4
     const blurW = Math.max(1, Math.round(planSrcW / PLAN_BLUR_DIVISOR))
     const blurH = Math.max(1, Math.round(planSrcH / PLAN_BLUR_DIVISOR))
@@ -4983,15 +5127,32 @@ export async function buildInpaintTileInput(
     if (blurCtx) {
       blurCtx.drawImage(planImg, planSrcX, planSrcY, planSrcW, planSrcH, 0, 0, blurW, blurH)
     }
-    // Draw the downsampled (blurry) plan pixels back at full maskSubRect size.
-    ctx.drawImage(blurCanvas, 0, 0, blurW, blurH, mX, mY, mW, mH)
 
-    // Step 3: draw blue border around the selection sub-rect so the model has
-    // a clear, unambiguous boundary marker matching the refine prompt wording.
-    const borderPx = Math.max(3, Math.round(Math.min(mW, mH) * 0.015))
-    ctx.strokeStyle = '#2563EB'
-    ctx.lineWidth = borderPx * 2  // strokeRect centres the path, so double to stay inside
-    ctx.strokeRect(mX, mY, mW, mH)
+    // Step 2b: draw the blurry plan back at full maskSubRect size into a
+    // temporary plan-zone canvas.
+    const planZoneCanvas = document.createElement('canvas')
+    planZoneCanvas.width = mW
+    planZoneCanvas.height = mH
+    const planZoneCtx = planZoneCanvas.getContext('2d')
+    if (planZoneCtx) {
+      planZoneCtx.drawImage(blurCanvas, 0, 0, blurW, blurH, 0, 0, mW, mH)
+    }
+
+    // Step 2c: apply the change mask so that only pixels that actually changed
+    // relative to the original stay opaque in the plan zone. Unchanged pixels
+    // become transparent and will reveal the crisp source drawn in Step 1.
+    if (changeMask && planZoneCtx) {
+      planZoneCtx.globalCompositeOperation = 'destination-in'
+      planZoneCtx.drawImage(
+        changeMask,
+        planSrcX, planSrcY, planSrcW, planSrcH,
+        0, 0, mW, mH,
+      )
+      planZoneCtx.globalCompositeOperation = 'source-over'
+    }
+
+    // Step 2d: composite the masked plan zone onto the tile canvas.
+    ctx.drawImage(planZoneCanvas, mX, mY)
   }
 
   return canvas.toDataURL('image/jpeg', 0.92)
@@ -5186,7 +5347,7 @@ export async function buildGlobalPlanInput(
     selH - borderPx,
   )
 
-  return { dataUrl: canvas.toDataURL('image/jpeg', 0.95), scale }
+  return { dataUrl: canvas.toDataURL('image/png'), scale }
 }
 
 /**
@@ -5270,5 +5431,5 @@ export async function compositeInpaintFinal(
   if (!ctx) return sourceImageUrl
   ctx.drawImage(img, 0, 0)
   ctx.drawImage(inpaintCanvas, contextRect.x, contextRect.y)
-  return canvas.toDataURL('image/jpeg', 0.95)
+  return canvas.toDataURL('image/png')
 }

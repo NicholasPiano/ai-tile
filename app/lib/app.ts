@@ -89,6 +89,21 @@ export type Mode = 'extender' | 'edit' | 'parallax' | 'tile' | 'sprite' | 'props
 export const EDIT_STRIP_PX = 256
 
 /**
+ * Maximum width or height of the inpaint selection in image pixels.
+ *
+ * The region sent to the model is the selection plus `EDIT_STRIP_PX` on every
+ * side, so its total dimension is `selection + 2 × EDIT_STRIP_PX`. That total
+ * must stay within `MAX_AI_DIMENSION` (1536 px), giving:
+ *
+ *   MAX_EDIT_SELECTION_PX = MAX_AI_DIMENSION − 2 × EDIT_STRIP_PX
+ *
+ * The on-canvas selection guide is dynamic: it reflects the largest box
+ * reachable from the drag-start point within both this limit and the image
+ * edges.
+ */
+export const MAX_EDIT_SELECTION_PX = MAX_AI_DIMENSION - 2 * EDIT_STRIP_PX
+
+/**
  * Longest edge (in pixels) of the low-resolution global plan image sent to
  * the LLM in the first stage of the tiled inpaint pipeline. Slightly below
  * the 1536 MAX_AI_DIMENSION to leave a small safety margin.
@@ -129,9 +144,8 @@ export interface InpaintRegion {
 export type InpaintPhase =
   | 'input'     // awaiting user description + reference images
   | 'planning'  // global low-res plan LLM call in progress
-  | 'masking'   // change-mask extraction LLM call in progress
-  | 'tiling'    // per-tile high-res refinement in progress
-  | 'done'      // all tiles complete; awaiting Accept / Discard
+  | 'tiling'    // per-tile high-res refinement — idle between tiles
+  | 'done'      // all tiles complete (or fast-path plan accepted); awaiting Accept / Discard
 
 /**
  * One tile in the 2-D inpaint grid.  Position and size are in context-perimeter
@@ -194,15 +208,15 @@ export interface InpaintState {
   /** LLM global plan result URL (low-res, from the 'plan' API call). */
   globalPlanUrl: string | null
   /**
-   * B&W change-mask extracted by the 'extract-mask' API call.
-   * WHITE pixels = changed by the global plan; BLACK pixels = unchanged.
+   * B&W visualisation of the client-side pixel diff (white = changed, black =
+   * unchanged). Display only — never sent to the API.
    */
-  globalMaskUrl: string | null
+  changeMaskUrl: string | null
   /**
-   * Global plan composited with the change-mask as a blue highlight — display
-   * only, never sent to the API.
+   * Global plan composited with a light-blue highlight over changed regions.
+   * Display only — never sent to the API.
    */
-  globalMaskOverlayUrl: string | null
+  changeMaskOverlayUrl: string | null
   tilePlan: InpaintTilePlan | null
   /** Per-tile AI result URLs (null = not yet generated). */
   tileResults: Array<string | null>

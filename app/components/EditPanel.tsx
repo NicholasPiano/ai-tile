@@ -11,10 +11,8 @@ import type { InpaintState, ReferenceImage } from '@/app/lib/app'
 export interface EditPanelProps {
   inpaintState: InpaintState
   onGenerate: (editPrompt: string, referenceImages: ReferenceImage[]) => void
-  /** Re-run the global plan (cascades to the change mask + resets tiles). */
+  /** Re-run the global plan (cascades to diff-mask computation + resets tiles). */
   onRerunPlan: () => void
-  /** Re-run only the change mask, reusing the current plan (resets tiles). */
-  onRerunMask: () => void
   /** Generate or re-generate a single tile. */
   onRerunTile: (tileIdx: number) => void
   /** Sequentially generate every masked tile that has no result yet. */
@@ -154,11 +152,15 @@ function TileGrid({
   tilePlan,
   tileResults,
   generatingTileIdx,
+  changeMaskOverlayUrl,
   onRerunTile,
 }: {
   tilePlan: NonNullable<InpaintState['tilePlan']>
   tileResults: Array<string | null>
   generatingTileIdx: number | null
+  /** Blue-highlight overlay from computeChangeMaskVisuals — used as a pending
+   *  tile preview so the user can see where changes fall before generating. */
+  changeMaskOverlayUrl: string | null
   onRerunTile: (idx: number) => void
 }) {
   const maskedTiles = tilePlan.tiles
@@ -196,6 +198,18 @@ function TileGrid({
             >
               {isDone && resultUrl ? (
                 <img src={resultUrl} alt={`Tile ${idx + 1}`} className="block h-full w-full object-cover" draggable={false} />
+              ) : changeMaskOverlayUrl && !isGenerating ? (
+                // Pending tile: crop the change-mask overlay to this tile's region
+                // so the user can see where changes will fall before generating.
+                <div
+                  className="h-full w-full"
+                  style={{
+                    backgroundImage: `url(${changeMaskOverlayUrl})`,
+                    backgroundSize: `${(tilePlan.contextW / tile.w) * 100}% ${(tilePlan.contextH / tile.h) * 100}%`,
+                    backgroundPosition: `-${(tile.x / tile.w) * 100}% -${(tile.y / tile.h) * 100}%`,
+                    backgroundRepeat: 'no-repeat',
+                  }}
+                />
               ) : (
                 <div className="flex h-full w-full items-center justify-center text-[10px]" style={{ color: 'var(--text-muted)' }}>
                   {isGenerating ? <Spinner /> : `${tile.row + 1},${tile.col + 1}`}
@@ -235,21 +249,18 @@ function TileGrid({
 /**
  * Progressive sidebar panel for the Tiled Inpaint Pipeline.
  *
- * Sections accumulate as the pipeline advances — earlier sections lock in
- * place and never disappear:
+ * Sections accumulate as the pipeline advances:
  *
- *   1. Context preview (always visible)
- *   2. Description + refs input  (input phase — locks when Generate is clicked)
- *   3. Global plan result         (planning → masking → tiling → done)
- *   4. Change-mask overlay        (masking → tiling → done)
- *   5. Tile grid                  (tiling → done)
- *   6. Accept / Re-run            (done)
+ *   1. Context preview    (always visible)
+ *   2. Description + refs (input phase — locks when Generate is clicked)
+ *   3. Global plan result (planning → tiling → done)
+ *   4. Tile grid          (tiling → done, full path only)
+ *   5. Accept / Re-run   (done)
  */
 export function EditPanel({
   inpaintState,
   onGenerate,
   onRerunPlan,
-  onRerunMask,
   onRerunTile,
   onGenerateAllTiles,
   onRerun,
@@ -260,7 +271,8 @@ export function EditPanel({
     phase,
     lowResPreviewUrl,
     globalPlanUrl,
-    globalMaskOverlayUrl,
+    changeMaskUrl,
+    changeMaskOverlayUrl,
     tilePlan,
     tileResults,
     generatingTileIdx,
@@ -276,30 +288,25 @@ export function EditPanel({
   const bodyRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     bodyRef.current?.scrollTo({ top: bodyRef.current.scrollHeight, behavior: 'smooth' })
-  }, [phase, globalPlanUrl, globalMaskOverlayUrl, tilePlan])
+  }, [phase, globalPlanUrl, changeMaskUrl, tilePlan])
 
   // Phase-derived booleans for progressive disclosure.
-  // Note: 'tiling' is now an IDLE phase — plan + mask are done and the user runs
-  // each tile manually. Only an in-flight LLM call counts as "processing".
-  const pastInput     = phase !== 'input'
-  const showPlan      = ['planning', 'masking', 'tiling', 'done'].includes(phase)
-  // showMask only when a mask was actually generated — not in the fast path where
-  // the plan is composited directly and globalMaskOverlayUrl stays null.
-  const showMask      = ['masking', 'tiling', 'done'].includes(phase) && globalMaskOverlayUrl !== null
-  const showTiles     = tilePlan !== null
-  const isGenerating  = generatingTileIdx !== null
-  const isStageBusy   = phase === 'planning' || phase === 'masking'
-  const isProcessing  = isStageBusy || isGenerating
+  // 'tiling' is an IDLE phase — plan + diff-mask are done, user runs tiles manually.
+  const pastInput    = phase !== 'input'
+  const showPlan     = ['planning', 'tiling', 'done'].includes(phase)
+  const showMask     = changeMaskUrl !== null
+  const showTiles    = tilePlan !== null
+  const isGenerating = generatingTileIdx !== null
+  const isStageBusy  = phase === 'planning'
+  const isProcessing = isStageBusy || isGenerating
 
-  const doneCount = tileResults.filter((r) => r !== null).length
+  const doneCount   = tileResults.filter((r) => r !== null).length
   const totalMasked = tilePlan?.tiles.filter((t) => t.maskSubRect !== null).length ?? 0
   const allTilesDone = totalMasked > 0 && doneCount === totalMasked
-  // Fast path: phase reaches 'done' with tilePlan null — the plan was composited
-  // directly and is ready to accept without any tile generation.
-  const isFastPath  = phase === 'done' && tilePlan === null
-  const canAccept   = isFastPath || doneCount > 0
-  const planReady   = globalPlanUrl !== null
-  const maskReady   = globalMaskOverlayUrl !== null
+  // Fast path: phase reaches 'done' with tilePlan null — plan composited directly.
+  const isFastPath = phase === 'done' && tilePlan === null
+  const canAccept  = isFastPath || doneCount > 0
+  const planReady  = globalPlanUrl !== null
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -394,35 +401,18 @@ export function EditPanel({
           </>
         )}
 
-        {/* ── Section 4: Change-mask overlay ────────────────────────────── */}
+        {/* ── Section 4: Change mask ────────────────────────────────────── */}
         {showMask && (
           <>
             <SectionDivider />
             <div className="flex flex-col gap-3 p-4">
-              <div className="flex items-center justify-between">
-                <SectionLabel>Change mask</SectionLabel>
-                {maskReady && planReady && (
-                  <button
-                    className="btn btn-ghost text-[11px]"
-                    style={{ padding: '2px 8px', height: 24 }}
-                    onClick={onRerunMask}
-                    disabled={isProcessing}
-                    title="Re-extract the change mask from the current plan"
-                  >
-                    <Icons.Refresh size={11} />
-                    Re-run
-                  </button>
-                )}
-              </div>
-
-              {phase === 'masking' && !globalMaskOverlayUrl ? (
-                <div className="flex items-center gap-2 text-[12px]" style={{ color: 'var(--text-muted)' }}>
-                  <Spinner />
-                  <span>Extracting change mask…</span>
-                </div>
-              ) : globalMaskOverlayUrl ? (
-                <ImagePreview src={globalMaskOverlayUrl} alt="Change mask overlay" />
-              ) : null}
+              <SectionLabel>Change mask</SectionLabel>
+              {changeMaskUrl && (
+                <ImagePreview src={changeMaskUrl} alt="Change mask (B&W)" />
+              )}
+              {changeMaskOverlayUrl && (
+                <ImagePreview src={changeMaskOverlayUrl} alt="Change mask overlay" />
+              )}
             </div>
           </>
         )}
@@ -456,6 +446,7 @@ export function EditPanel({
                 tilePlan={tilePlan}
                 tileResults={tileResults}
                 generatingTileIdx={generatingTileIdx}
+                changeMaskOverlayUrl={changeMaskOverlayUrl}
                 onRerunTile={onRerunTile}
               />
             </div>

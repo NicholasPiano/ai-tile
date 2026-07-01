@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   EDIT_STRIP_PX,
   MAX_AI_DIMENSION,
+  MAX_EDIT_SELECTION_PX,
   type InpaintState,
   type InpaintRegion,
   type InpaintTilePlan,
@@ -14,9 +15,10 @@ import { Icons } from '@/app/components/icons'
 import {
   buildLowResContextCrop,
   buildGlobalPlanInput,
-  buildMaskOverlay,
   planInpaintTiles,
   initInpaintCanvas,
+  computeChangeMask,
+  buildChangeMaskVisuals,
   buildInpaintTileInput,
   compositeInpaintTileResult,
   compositeInpaintFinal,
@@ -50,9 +52,56 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
 
+/** Layout of an object-contain image inside a fixed container. */
+type ObjectContainLayout = {
+  containerW: number
+  containerH: number
+  imgW: number
+  imgH: number
+  /** Uniform scale from image pixels to CSS pixels. */
+  s: number
+  /** CSS-pixel inset of the fitted image within the container. */
+  offsetX: number
+  offsetY: number
+}
+
+function computeObjectContainLayout(
+  containerW: number,
+  containerH: number,
+  imgW: number,
+  imgH: number,
+): ObjectContainLayout {
+  const s = Math.min(containerW / imgW, containerH / imgH)
+  const displayW = imgW * s
+  const displayH = imgH * s
+  return {
+    containerW,
+    containerH,
+    imgW,
+    imgH,
+    s,
+    offsetX: (containerW - displayW) / 2,
+    offsetY: (containerH - displayH) / 2,
+  }
+}
+
+function clientToImageCoord(
+  clientX: number,
+  clientY: number,
+  rect: DOMRect,
+  layout: ObjectContainLayout,
+): ImagePoint {
+  const localX = clientX - rect.left - layout.offsetX
+  const localY = clientY - rect.top - layout.offsetY
+  return {
+    x: clamp(localX / layout.s, 0, layout.imgW),
+    y: clamp(localY / layout.s, 0, layout.imgH),
+  }
+}
+
 /**
  * Convert a MouseEvent's client coordinates into image-pixel coordinates,
- * mapping the displayed canvas element to the natural image dimensions.
+ * accounting for object-contain letterboxing inside the overlay canvas.
  */
 function toImageCoord(
   e: React.MouseEvent<HTMLCanvasElement>,
@@ -61,12 +110,37 @@ function toImageCoord(
   imgH: number,
 ): ImagePoint {
   const rect = canvas.getBoundingClientRect()
-  const scaleX = imgW / rect.width
-  const scaleY = imgH / rect.height
+  const layout = computeObjectContainLayout(rect.width, rect.height, imgW, imgH)
+  return clientToImageCoord(e.clientX, e.clientY, rect, layout)
+}
+
+function imageToBufferCoord(
+  ix: number,
+  iy: number,
+  layout: ObjectContainLayout,
+  bufW: number,
+  bufH: number,
+): ImagePoint {
   return {
-    x: clamp((e.clientX - rect.left) * scaleX, 0, imgW),
-    y: clamp((e.clientY - rect.top) * scaleY, 0, imgH),
+    x: (layout.offsetX + ix * layout.s) * bufW / layout.containerW,
+    y: (layout.offsetY + iy * layout.s) * bufH / layout.containerH,
   }
+}
+
+function imageRectToBuffer(
+  r: ImageRect,
+  layout: ObjectContainLayout,
+  bufW: number,
+  bufH: number,
+): ImageRect {
+  const tl = imageToBufferCoord(r.x, r.y, layout, bufW, bufH)
+  const br = imageToBufferCoord(r.x + r.w, r.y + r.h, layout, bufW, bufH)
+  return { x: tl.x, y: tl.y, w: br.x - tl.x, h: br.y - tl.y }
+}
+
+/** Approximate image-pixel → canvas-buffer scale for stroke widths and labels. */
+function imagePixelScaleInBuffer(layout: ObjectContainLayout, bufH: number): number {
+  return layout.s * bufH / layout.containerH
 }
 
 function normaliseRect(a: ImagePoint, b: ImagePoint): ImageRect {
@@ -96,6 +170,49 @@ function clampRect(r: ImageRect, bounds: ImageRect): ImageRect {
 }
 
 /**
+ * Largest rectangle the user can select starting from `start`: at most
+ * `MAX_EDIT_SELECTION_PX` in any direction from the start point, clipped to
+ * `imageBounds`.
+ */
+function computeDynamicMaxRect(start: ImagePoint, imageBounds: ImageRect): ImageRect {
+  const limit = Math.max(0, MAX_EDIT_SELECTION_PX)
+  const x1 = Math.max(imageBounds.x, start.x - limit)
+  const y1 = Math.max(imageBounds.y, start.y - limit)
+  const x2 = Math.min(imageBounds.x + imageBounds.w, start.x + limit)
+  const y2 = Math.min(imageBounds.y + imageBounds.h, start.y + limit)
+  return { x: x1, y: y1, w: Math.max(0, x2 - x1), h: Math.max(0, y2 - y1) }
+}
+
+/** Normalise and clamp an in-progress or committed drag to the dynamic max box. */
+function selectionFromDrag(drag: DragState, imageBounds: ImageRect): ImageRect {
+  const dynamicMax = computeDynamicMaxRect(drag.start, imageBounds)
+  return clampRect(normaliseRect(drag.start, drag.current), dynamicMax)
+}
+
+/** Snap drag corners to the clamped selection so overlay and preview stay aligned. */
+function committedDragFromSelection(
+  drag: DragState,
+  sel: ImageRect,
+): DragState {
+  return {
+    start: { x: sel.x, y: sel.y },
+    current: { x: sel.x + sel.w, y: sel.y + sel.h },
+    committed: true,
+  }
+}
+
+/** Build a filesystem-safe timestamp for download filenames. */
+function timestampForFilename(date: Date = new Date()): string {
+  const yyyy = date.getFullYear()
+  const mm = String(date.getMonth() + 1).padStart(2, '0')
+  const dd = String(date.getDate()).padStart(2, '0')
+  const hh = String(date.getHours()).padStart(2, '0')
+  const min = String(date.getMinutes()).padStart(2, '0')
+  const ss = String(date.getSeconds()).padStart(2, '0')
+  return `${yyyy}-${mm}-${dd}_${hh}-${min}-${ss}`
+}
+
+/**
  * Minimal Promise-based image loader used by the direct-plan fast path.
  * Avoids importing the private `loadImageElement` from imageProcessor.
  */
@@ -112,11 +229,9 @@ function loadImg(url: string): Promise<HTMLImageElement> {
 // Canvas drawing helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-function drawRect(
+function drawBufferRect(
   ctx: CanvasRenderingContext2D,
   r: ImageRect,
-  scaleX: number,
-  scaleY: number,
   options: {
     strokeStyle: string
     fillStyle?: string
@@ -131,34 +246,58 @@ function drawRect(
   ctx.setLineDash(dash)
   if (fillStyle) {
     ctx.fillStyle = fillStyle
-    ctx.fillRect(r.x * scaleX, r.y * scaleY, r.w * scaleX, r.h * scaleY)
+    ctx.fillRect(r.x, r.y, r.w, r.h)
   }
-  ctx.strokeRect(r.x * scaleX, r.y * scaleY, r.w * scaleX, r.h * scaleY)
+  ctx.strokeRect(r.x, r.y, r.w, r.h)
   ctx.restore()
+}
+
+function drawImageRect(
+  ctx: CanvasRenderingContext2D,
+  r: ImageRect,
+  layout: ObjectContainLayout,
+  bufW: number,
+  bufH: number,
+  options: {
+    strokeStyle: string
+    fillStyle?: string
+    lineWidth?: number
+    dash?: number[]
+  },
+): void {
+  const buf = imageRectToBuffer(r, layout, bufW, bufH)
+  const pixelScale = imagePixelScaleInBuffer(layout, bufH)
+  drawBufferRect(ctx, buf, {
+    ...options,
+    lineWidth: (options.lineWidth ?? 1.5) * pixelScale,
+  })
 }
 
 /**
  * Draw a white label just outside the top-left corner of a rectangle.
  * Flips below the top edge when the rectangle is near the canvas top.
  */
-function drawLabel(
+function drawImageLabel(
   ctx: CanvasRenderingContext2D,
   r: ImageRect,
-  scaleX: number,
-  scaleY: number,
+  layout: ObjectContainLayout,
+  bufW: number,
+  bufH: number,
   text: string,
   fontPx: number = 80,
 ): void {
-  const scaledFont = fontPx * scaleY
-  const pad = 6 * scaleY
-  const cx = r.x * scaleX + pad
-  const aboveY = r.y * scaleY - pad
-  const cy = aboveY >= scaledFont ? aboveY : r.y * scaleY + scaledFont + pad
+  const buf = imageRectToBuffer(r, layout, bufW, bufH)
+  const pixelScale = imagePixelScaleInBuffer(layout, bufH)
+  const scaledFont = fontPx * pixelScale
+  const pad = 6 * pixelScale
+  const cx = buf.x + pad
+  const aboveY = buf.y - pad
+  const cy = aboveY >= scaledFont ? aboveY : buf.y + scaledFont + pad
   ctx.save()
   ctx.font = `600 ${scaledFont}px ui-sans-serif, system-ui, sans-serif`
   ctx.fillStyle = 'rgba(255,255,255,0.95)'
   ctx.shadowColor = 'rgba(0,0,0,0.85)'
-  ctx.shadowBlur = 6 * scaleY
+  ctx.shadowBlur = 6 * pixelScale
   ctx.fillText(text, cx, cy)
   ctx.restore()
 }
@@ -173,6 +312,7 @@ function renderOverlay(
   imgH: number,
   drag: DragState | null,
   inpaintState: InpaintState | null,
+  changeMaskCanvas: HTMLCanvasElement | null,
 ): void {
   const ctx = canvas.getContext('2d')
   if (!ctx) return
@@ -181,12 +321,12 @@ function renderOverlay(
   const bufH = canvas.height
   ctx.clearRect(0, 0, bufW, bufH)
 
-  const scaleX = bufW / imgW
-  const scaleY = bufH / imgH
+  const cssRect = canvas.getBoundingClientRect()
+  const layout = computeObjectContainLayout(cssRect.width, cssRect.height, imgW, imgH)
 
   // Faint image-boundary guide — always visible.
   const imageBounds: ImageRect = { x: 0, y: 0, w: imgW, h: imgH }
-  drawRect(ctx, imageBounds, scaleX, scaleY, {
+  drawImageRect(ctx, imageBounds, layout, bufW, bufH, {
     strokeStyle: 'rgba(255,255,255,0.4)',
     lineWidth: 1.5,
     dash: [6, 4],
@@ -194,28 +334,28 @@ function renderOverlay(
 
   if (!drag) return
 
-  // The selection is clamped to the full image bounds (no artificial size cap).
-  const rawSelect = normaliseRect(drag.start, drag.current)
-  const currentSelect = clampRect(rawSelect, imageBounds)
+  // Prefer the committed region; fall back to the in-progress drag.
+  const currentSelect =
+    inpaintState?.region.selectionRect ?? selectionFromDrag(drag, imageBounds)
 
   if (currentSelect.w < 2 || currentSelect.h < 2) return
 
   // Context strip around the selection.
   const currentStrip = outsetRect(currentSelect, EDIT_STRIP_PX, imageBounds)
-  drawRect(ctx, currentStrip, scaleX, scaleY, {
+  drawImageRect(ctx, currentStrip, layout, bufW, bufH, {
     strokeStyle: 'rgba(255,255,255,1)',
     fillStyle: 'rgba(60,140,255,0.18)',
     lineWidth: 6,
   })
-  drawLabel(ctx, currentStrip, scaleX, scaleY, 'Context')
+  drawImageLabel(ctx, currentStrip, layout, bufW, bufH, 'Context')
 
   // Selection rectangle.
-  drawRect(ctx, currentSelect, scaleX, scaleY, {
+  drawImageRect(ctx, currentSelect, layout, bufW, bufH, {
     strokeStyle: 'rgba(255,255,255,1)',
     fillStyle: 'rgba(30,100,220,0.22)',
     lineWidth: 6,
   })
-  drawLabel(ctx, currentSelect, scaleX, scaleY, 'Selection')
+  drawImageLabel(ctx, currentSelect, layout, bufW, bufH, 'Selection')
 
   // Tile grid overlay (visible during tiling / done phase).
   if (
@@ -226,12 +366,35 @@ function renderOverlay(
     const { tilePlan, tileResults, generatingTileIdx } = inpaintState
     const { contextRect } = inpaintState.region
 
+    // ── Change mask: blue-tinted diff overlay at context rect position ────────
+    // Build a tinted canvas from the diff mask and paint it over the image area.
+    if (changeMaskCanvas) {
+      const bufContext = imageRectToBuffer(contextRect, layout, bufW, bufH)
+      const cX = Math.round(bufContext.x)
+      const cY = Math.round(bufContext.y)
+      const cW = Math.max(1, Math.round(bufContext.w))
+      const cH = Math.max(1, Math.round(bufContext.h))
+
+      const tintCanvas = document.createElement('canvas')
+      tintCanvas.width  = cW
+      tintCanvas.height = cH
+      const tintCtx = tintCanvas.getContext('2d')
+      if (tintCtx) {
+        tintCtx.fillStyle = '#1e8cff'
+        tintCtx.fillRect(0, 0, cW, cH)
+        tintCtx.globalCompositeOperation = 'destination-in'
+        tintCtx.drawImage(changeMaskCanvas, 0, 0, cW, cH)
+      }
+      ctx.globalAlpha = 0.35
+      ctx.drawImage(tintCanvas, cX, cY)
+      ctx.globalAlpha = 1
+    }
+
     for (let i = 0; i < tilePlan.tiles.length; i++) {
       const tile = tilePlan.tiles[i]
-      if (!tile.maskSubRect) continue
-
       const isGenerating = generatingTileIdx === i
-      const isDone = tileResults[i] !== null
+      const isDone       = tileResults[i] !== null
+      const hasMask      = tile.maskSubRect !== null
 
       const tileRect: ImageRect = {
         x: contextRect.x + tile.x,
@@ -240,23 +403,75 @@ function renderOverlay(
         h: tile.h,
       }
 
-      let strokeStyle = 'rgba(255,255,255,0.3)'
-      let fillStyle: string | undefined
-      if (isDone) {
-        strokeStyle = 'rgba(40,200,80,0.8)'
-        fillStyle = 'rgba(40,200,80,0.1)'
-      }
-      if (isGenerating) {
-        strokeStyle = 'rgba(60,140,255,0.9)'
-        fillStyle = 'rgba(60,140,255,0.15)'
+      // ── Tile boundary ───────────────────────────────────────────────────────
+      if (hasMask) {
+        // Masked tile — colour by status.
+        let strokeStyle = 'rgba(255,255,255,0.5)'
+        let fillStyle: string | undefined
+        if (isGenerating) {
+          strokeStyle = 'rgba(60,140,255,0.9)'
+          fillStyle   = 'rgba(60,140,255,0.08)'
+        } else if (isDone) {
+          strokeStyle = 'rgba(40,200,80,0.8)'
+          fillStyle   = 'rgba(40,200,80,0.06)'
+        }
+        drawImageRect(ctx, tileRect, layout, bufW, bufH, {
+          strokeStyle,
+          fillStyle,
+          lineWidth: 2,
+          dash: isDone || isGenerating ? [] : [4, 3],
+        })
+      } else {
+        // Pure-context tile — dim ghost outline only.
+        drawImageRect(ctx, tileRect, layout, bufW, bufH, {
+          strokeStyle: 'rgba(255,255,255,0.15)',
+          lineWidth: 1,
+          dash: [3, 5],
+        })
       }
 
-      drawRect(ctx, tileRect, scaleX, scaleY, {
-        strokeStyle,
-        fillStyle,
-        lineWidth: 2,
-        dash: isDone || isGenerating ? [] : [4, 3],
-      })
+      // ── maskSubRect and context ring (only for masked tiles, pre-done) ─────
+      if (hasMask && tile.maskSubRect && !isDone) {
+        const ms = tile.maskSubRect
+        const maskRect: ImageRect = {
+          x: contextRect.x + tile.x + ms.x,
+          y: contextRect.y + tile.y + ms.y,
+          w: ms.w,
+          h: ms.h,
+        }
+
+        // Context ring: the part of the tile outside maskSubRect.
+        // Visualised as a cool blue tint — shows what the model sees as
+        // "source pixels" (high-res, unchanged).
+        drawImageRect(ctx, tileRect, layout, bufW, bufH, {
+          strokeStyle: 'transparent',
+          fillStyle: isGenerating ? 'rgba(60,140,255,0.12)' : 'rgba(100,160,255,0.1)',
+          lineWidth: 0,
+        })
+
+        // Plan zone: the maskSubRect — this is where blurry plan pixels are
+        // baked in and the model must sharpen them.
+        drawImageRect(ctx, maskRect, layout, bufW, bufH, {
+          strokeStyle: isGenerating ? 'rgba(60,140,255,0.9)' : 'rgba(255,180,40,0.9)',
+          fillStyle:   isGenerating ? 'rgba(60,140,255,0.18)' : 'rgba(255,180,40,0.18)',
+          lineWidth: 1.5,
+        })
+
+        // Labels inside the plan zone and in the context ring.
+        drawImageLabel(ctx, maskRect, layout, bufW, bufH, 'Plan')
+
+        // Context ring label: place it at the top-left corner of the tile
+        // (which is guaranteed to be outside maskSubRect when the ring exists).
+        if (ms.x > 4 || ms.y > 4) {
+          const ringLabelRect: ImageRect = {
+            x: contextRect.x + tile.x,
+            y: contextRect.y + tile.y,
+            w: Math.max(ms.x, 24),
+            h: Math.max(ms.y, 24),
+          }
+          drawImageLabel(ctx, ringLabelRect, layout, bufW, bufH, 'Source')
+        }
+      }
     }
   }
 }
@@ -388,33 +603,10 @@ async function runGlobalPlanStage(args: {
 }
 
 /**
- * Stage 2 — change-mask extraction. Calls the LLM 'extract-mask' phase with the
- * clean context crop and the plan, then builds the display-only overlay.
+ * Stage 2 (removed) — change-mask extraction was replaced by the client-side
+ * computeChangeMask pixel diff. This function is no longer called.
+ * Kept as a tombstone to document the removal; delete after next cleanup pass.
  */
-async function runChangeMaskStage(args: {
-  lowResContextUrl: string | null
-  globalPlanUrl: string
-  apiKey: string
-  model: string
-}): Promise<{ globalMaskUrl: string; globalMaskOverlayUrl: string | null }> {
-  const res = await fetch('/api/edit', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      phase: 'extract-mask',
-      sourceContextUrl: args.lowResContextUrl,
-      globalPlanUrl: args.globalPlanUrl,
-      apiKey: args.apiKey,
-      model: args.model,
-    }),
-  })
-  const data = (await res.json()) as EditPhaseResponse
-  if (!res.ok || !data.resultUrl) {
-    throw new Error(data.error ?? 'Mask extraction failed')
-  }
-  const overlay = await buildMaskOverlay(args.globalPlanUrl, data.resultUrl).catch(() => null)
-  return { globalMaskUrl: data.resultUrl, globalMaskOverlayUrl: overlay ?? null }
-}
 
 /**
  * Stage 3 — tiling setup. Builds the running composite canvas (pre-filled with
@@ -441,9 +633,13 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   const isDraggingRef = useRef(false)
   /** Running composite surface for the tiled inpaint pass. */
   const inpaintCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  /** Client-computed pixel-diff change mask (computeChangeMask result). */
+  const changeMaskCanvasRef = useRef<HTMLCanvasElement | null>(null)
 
   const [drag, setDrag] = useState<DragState | null>(null)
   const [inpaintState, setInpaintState] = useState<InpaintState | null>(null)
+  /** Bumped when the displayed image size changes so the overlay stays aligned. */
+  const [layoutTick, setLayoutTick] = useState(0)
 
   // ── Sync canvas buffer to natural image dimensions ─────────────────────────
   useEffect(() => {
@@ -453,24 +649,33 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     canvas.height = dimensions.height
   }, [dimensions])
 
+  // ── Redraw overlay when the fitted image resizes (window / sidebar layout) ─
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const ro = new ResizeObserver(() => setLayoutTick((t) => t + 1))
+    ro.observe(canvas)
+    return () => ro.disconnect()
+  }, [dimensions, image])
+
   // ── Redraw overlay on drag or inpaint state changes ────────────────────────
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas || !dimensions) return
-    renderOverlay(canvas, dimensions.width, dimensions.height, drag, inpaintState)
-  }, [drag, dimensions, inpaintState])
+    renderOverlay(canvas, dimensions.width, dimensions.height, drag, inpaintState, changeMaskCanvasRef.current)
+  }, [drag, dimensions, inpaintState, layoutTick])
 
   // ── Build low-res context crop + annotated preview when selection commits ────
   useEffect(() => {
     if (!drag?.committed || !image || !dimensions) return
 
     const imageBounds: ImageRect = { x: 0, y: 0, w: dimensions.width, h: dimensions.height }
-    const sel = clampRect(normaliseRect(drag.start, drag.current), imageBounds)
+    const sel = selectionFromDrag(drag, imageBounds)
     if (sel.w < 1 || sel.h < 1) return
 
     const contextRect = outsetRect(sel, EDIT_STRIP_PX, imageBounds)
 
-    buildLowResContextCrop(image, contextRect).then(({ dataUrl, scale }) => {
+    buildLowResContextCrop(image, contextRect).then(({ dataUrl }) => {
       // Annotated preview: draw the selection box on top of the clean crop.
       const selInCtx = {
         x: sel.x - contextRect.x,
@@ -487,14 +692,17 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
         const ctx = canvas.getContext('2d')
         if (ctx) {
           ctx.drawImage(img, 0, 0)
-          const lrX = selInCtx.x * scale
-          const lrY = selInCtx.y * scale
-          const lrW = selInCtx.w * scale
-          const lrH = selInCtx.h * scale
+          // Map through the crop's actual output size (handles rounding in buildLowResContextCrop).
+          const scaleX = img.naturalWidth / contextRect.w
+          const scaleY = img.naturalHeight / contextRect.h
+          const lrX = selInCtx.x * scaleX
+          const lrY = selInCtx.y * scaleY
+          const lrW = selInCtx.w * scaleX
+          const lrH = selInCtx.h * scaleY
           ctx.fillStyle = 'rgba(30,100,220,0.18)'
           ctx.fillRect(lrX, lrY, lrW, lrH)
           ctx.strokeStyle = 'rgba(255,255,255,0.9)'
-          ctx.lineWidth = Math.max(1.5, scale * 2)
+          ctx.lineWidth = Math.max(1.5, Math.min(scaleX, scaleY) * 2)
           ctx.strokeRect(lrX, lrY, lrW, lrH)
         }
         const previewUrl = canvas.toDataURL('image/jpeg', 0.92)
@@ -540,12 +748,13 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       const canvas = canvasRef.current
       if (!canvas) return
       const pt = toImageCoord(e, canvas, dimensions.width, dimensions.height)
+      const imageBounds: ImageRect = { x: 0, y: 0, w: dimensions.width, h: dimensions.height }
 
       setDrag((prev) => {
         if (!prev) return null
-        const raw = normaliseRect(prev.start, pt)
-        if (raw.w < 8 || raw.h < 8) return null
-        return { ...prev, current: pt, committed: true }
+        const sel = selectionFromDrag({ ...prev, current: pt }, imageBounds)
+        if (sel.w < 8 || sel.h < 8) return null
+        return committedDragFromSelection({ ...prev, current: pt }, sel)
       })
     },
     [dimensions],
@@ -555,20 +764,21 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     if (isDraggingRef.current) {
       isDraggingRef.current = false
       setDrag((prev) => {
-        if (!prev) return null
-        const raw = normaliseRect(prev.start, prev.current)
-        if (raw.w < 8 || raw.h < 8) return null
-        return { ...prev, committed: true }
+        if (!prev || !dimensions) return null
+        const imageBounds: ImageRect = { x: 0, y: 0, w: dimensions.width, h: dimensions.height }
+        const sel = selectionFromDrag(prev, imageBounds)
+        if (sel.w < 8 || sel.h < 8) return null
+        return committedDragFromSelection(prev, sel)
       })
     }
-  }, [])
+  }, [dimensions])
 
   // ── Initialise InpaintState when drag commits ──────────────────────────────
   useEffect(() => {
     if (!drag?.committed || !dimensions || inpaintState) return
 
     const imageBounds: ImageRect = { x: 0, y: 0, w: dimensions.width, h: dimensions.height }
-    const sel = clampRect(normaliseRect(drag.start, drag.current), imageBounds)
+    const sel = selectionFromDrag(drag, imageBounds)
     if (sel.w < 1 || sel.h < 1) return
 
     const contextRect = outsetRect(sel, EDIT_STRIP_PX, imageBounds)
@@ -587,8 +797,8 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       lowResPreviewUrl: null,
       globalPlanScale: 1,
       globalPlanUrl: null,
-      globalMaskUrl: null,
-      globalMaskOverlayUrl: null,
+      changeMaskUrl: null,
+      changeMaskOverlayUrl: null,
       tilePlan: null,
       tileResults: [],
       generatingTileIdx: null,
@@ -600,10 +810,9 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
   /**
    * Run the global plan, then — if the context fits within MAX_AI_DIMENSION —
-   * composite the plan directly and jump to 'done' (fast path). Otherwise run
-   * the change mask and set up tiling. Shared by the initial Generate action
-   * and the "re-run plan" action. Tiles are NOT generated here in either path;
-   * the user runs each one manually afterward (full path only).
+   * composite the plan directly and jump to 'done' (fast path). Otherwise
+   * compute the change mask client-side via pixel diff and set up tiling.
+   * No LLM mask-extraction call is made in either path.
    */
   const runPlanAndMask = useCallback(
     async (editPrompt: string, referenceImages: ReferenceImage[], region: InpaintRegion, lowResContextUrl: string | null) => {
@@ -617,14 +826,13 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
           model,
         })
         setInpaintState((prev) =>
-          prev ? { ...prev, globalPlanUrl, globalPlanScale, phase: 'masking' } : null,
+          prev ? { ...prev, globalPlanUrl, globalPlanScale, phase: 'tiling' } : null,
         )
 
         const { contextRect } = region
 
-        // Fast path — context fits in a single tile. Skip mask extraction and
-        // tiling: draw the plan result directly into the inpaint canvas so the
-        // user can accept immediately without any further LLM calls.
+        // Fast path — context fits in a single tile. Skip mask and tiling:
+        // draw the plan result directly into the inpaint canvas.
         if (contextRect.w <= MAX_AI_DIMENSION && contextRect.h <= MAX_AI_DIMENSION) {
           const canvas = await initInpaintCanvas(image ?? '', contextRect)
           const planImg = await loadImg(globalPlanUrl)
@@ -648,13 +856,25 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
           return
         }
 
-        // Full path — context is too large for a single tile; run mask + tiles.
-        const { globalMaskUrl, globalMaskOverlayUrl } = await runChangeMaskStage({
-          lowResContextUrl,
-          globalPlanUrl,
-          apiKey,
-          model,
-        })
+        // Full path — compute change mask client-side, then set up tiles.
+        // The diff compares the original low-res context (PNG, lossless) with
+        // the plan result. Threshold 10 absorbs JPEG compression noise in the
+        // plan without masking real edits.
+        if (lowResContextUrl) {
+          changeMaskCanvasRef.current = await computeChangeMask(lowResContextUrl, globalPlanUrl, 10)
+        } else {
+          changeMaskCanvasRef.current = null
+        }
+
+        // Build display-only visualisations of the mask (B&W + blue overlay)
+        // and store them in state so the sidebar and canvas overlay can render them.
+        let changeMaskUrl: string | null = null
+        let changeMaskOverlayUrl: string | null = null
+        if (changeMaskCanvasRef.current) {
+          const visuals = await buildChangeMaskVisuals(changeMaskCanvasRef.current, globalPlanUrl)
+          changeMaskUrl = visuals.maskUrl
+          changeMaskOverlayUrl = visuals.overlayUrl
+        }
 
         const { canvas, tilePlan } = await buildTilingSetup(image ?? '', region)
         inpaintCanvasRef.current = canvas
@@ -663,8 +883,8 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
           prev
             ? {
                 ...prev,
-                globalMaskUrl,
-                globalMaskOverlayUrl,
+                changeMaskUrl,
+                changeMaskOverlayUrl,
                 phase: 'tiling',
                 tilePlan,
                 tileResults: Array<string | null>(tilePlan.tiles.length).fill(null),
@@ -700,13 +920,14 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     [inpaintState, image, runPlanAndMask],
   )
 
-  // ── Callback: re-run the global plan (cascades to mask, resets tiles) ───────
+  // ── Callback: re-run the global plan (cascades to tiling, resets tiles) ─────
 
   const handleRerunPlan = useCallback(async () => {
     if (!inpaintState || !image) return
     const { region, editPrompt, referenceImages, lowResContextUrl } = inpaintState
 
     inpaintCanvasRef.current = null
+    changeMaskCanvasRef.current = null
     setInpaintState((prev) =>
       prev
         ? {
@@ -714,8 +935,8 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
             phase: 'planning',
             error: null,
             globalPlanUrl: null,
-            globalMaskUrl: null,
-            globalMaskOverlayUrl: null,
+            changeMaskUrl: null,
+            changeMaskOverlayUrl: null,
             tilePlan: null,
             tileResults: [],
             generatingTileIdx: null,
@@ -726,59 +947,6 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     await runPlanAndMask(editPrompt, referenceImages, region, lowResContextUrl)
   }, [inpaintState, image, runPlanAndMask])
 
-  // ── Callback: re-run only the change mask (reuses the existing plan) ────────
-
-  const handleRerunMask = useCallback(async () => {
-    if (!inpaintState || !image || !inpaintState.globalPlanUrl) return
-    const { region, globalPlanUrl, lowResContextUrl } = inpaintState
-
-    inpaintCanvasRef.current = null
-    setInpaintState((prev) =>
-      prev
-        ? {
-            ...prev,
-            phase: 'masking',
-            error: null,
-            globalMaskUrl: null,
-            globalMaskOverlayUrl: null,
-            tilePlan: null,
-            tileResults: [],
-            generatingTileIdx: null,
-          }
-        : null,
-    )
-
-    try {
-      const { globalMaskUrl, globalMaskOverlayUrl } = await runChangeMaskStage({
-        lowResContextUrl,
-        globalPlanUrl,
-        apiKey,
-        model,
-      })
-
-      const { canvas, tilePlan } = await buildTilingSetup(image, region)
-      inpaintCanvasRef.current = canvas
-
-      setInpaintState((prev) =>
-        prev
-          ? {
-              ...prev,
-              globalMaskUrl,
-              globalMaskOverlayUrl,
-              phase: 'tiling',
-              tilePlan,
-              tileResults: Array<string | null>(tilePlan.tiles.length).fill(null),
-              generatingTileIdx: null,
-            }
-          : null,
-      )
-    } catch (e) {
-      setInpaintState((prev) =>
-        prev ? { ...prev, phase: 'tiling', error: e instanceof Error ? e.message : 'Mask extraction failed' } : null,
-      )
-    }
-  }, [inpaintState, image, apiKey, model])
-
   // ── Callback: generate / re-run a single tile ──────────────────────────────
   // This is the ONLY path that produces tile pixels — tiles never run
   // automatically. Used by the per-tile buttons and by "Generate all".
@@ -786,13 +954,13 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   const generateTile = useCallback(
     async (idx: number) => {
       const canvas = inpaintCanvasRef.current
-      if (!inpaintState || !image || !inpaintState.tilePlan || !inpaintState.globalPlanUrl || !inpaintState.globalMaskUrl || !canvas) return
+      if (!inpaintState || !image || !inpaintState.tilePlan || !inpaintState.globalPlanUrl || !canvas) return
 
       const tile = inpaintState.tilePlan.tiles[idx]
       if (!tile.maskSubRect) return
 
       const { contextRect } = inpaintState.region
-      const { editPrompt, referenceImages, globalPlanUrl, globalMaskUrl, globalPlanScale } = inpaintState
+      const { editPrompt, referenceImages, globalPlanUrl, globalPlanScale } = inpaintState
 
       setInpaintState((prev) => (prev ? { ...prev, generatingTileIdx: idx, error: null } : null))
 
@@ -803,7 +971,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
           tile,
           globalPlanUrl,
           globalPlanScale,
-          globalMaskUrl,
+          changeMaskCanvasRef.current ?? undefined,
         )
 
         const tileRes = await fetch('/api/edit', {
@@ -860,14 +1028,15 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
   const handleRerun = useCallback(() => {
     inpaintCanvasRef.current = null
+    changeMaskCanvasRef.current = null
     setInpaintState((prev) =>
       prev
         ? {
             ...prev,
             phase: 'input',
             globalPlanUrl: null,
-            globalMaskUrl: null,
-            globalMaskOverlayUrl: null,
+            changeMaskUrl: null,
+            changeMaskOverlayUrl: null,
             tilePlan: null,
             tileResults: [],
             generatingTileIdx: null,
@@ -943,6 +1112,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
   const handleClose = useCallback(() => {
     inpaintCanvasRef.current = null
+    changeMaskCanvasRef.current = null
     setInpaintState(null)
     setDrag(null)
   }, [])
@@ -964,10 +1134,10 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     <div className="flex flex-1 overflow-hidden">
 
       {/* ── Image area ──────────────────────────────────────────────────────── */}
-      <div className="flex flex-1 flex-col items-center justify-center px-6 pb-6 pt-2">
-        <div className="relative anim-fade">
+      <div className="flex flex-1 flex-col items-center justify-center px-6 pb-6 pt-2 min-w-0 min-h-0">
+        <div className="relative anim-fade flex min-h-0 w-full flex-1 flex-col min-w-0">
           <div
-            className="relative overflow-hidden checker rounded-[var(--radius-lg)]"
+            className="relative min-h-0 w-full flex-1 overflow-hidden checker rounded-[var(--radius-lg)]"
             style={{
               border: '1px solid var(--border)',
               boxShadow:
@@ -977,11 +1147,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
             <img
               src={image}
               alt=""
-              className="block object-contain anim-fade"
-              style={{
-                maxHeight: 'calc(100vh - 200px)',
-                maxWidth: `min(900px, calc(100vw - ${SIDEBAR_W + 64}px))`,
-              }}
+              className="block h-full w-full object-contain anim-fade"
               draggable={false}
             />
 
@@ -1043,15 +1209,34 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
           <span className="text-[13px] font-semibold" style={{ color: 'var(--text-primary)' }}>
             Edit
           </span>
-          {hasSelection && (
-            <button
-              className="btn btn-ghost text-[12px]"
-              style={{ padding: '2px 10px', height: 28 }}
-              onClick={handleClose}
-            >
-              Cancel
-            </button>
-          )}
+          <div className="flex items-center gap-2">
+            {!hasSelection && image && (
+              <button
+                className="btn btn-ghost text-[12px]"
+                style={{ padding: '2px 10px', height: 28 }}
+                onClick={() => {
+                  const link = document.createElement('a')
+                  link.href = image
+                  link.download = `edited_${timestampForFilename()}.png`
+                  document.body.appendChild(link)
+                  link.click()
+                  document.body.removeChild(link)
+                }}
+              >
+                <Icons.Download size={12} />
+                Save
+              </button>
+            )}
+            {hasSelection && (
+              <button
+                className="btn btn-ghost text-[12px]"
+                style={{ padding: '2px 10px', height: 28 }}
+                onClick={handleClose}
+              >
+                Cancel
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Sidebar body */}
@@ -1060,7 +1245,6 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
             inpaintState={inpaintState}
             onGenerate={(prompt, refs) => { void handleGenerate(prompt, refs) }}
             onRerunPlan={() => { void handleRerunPlan() }}
-            onRerunMask={() => { void handleRerunMask() }}
             onRerunTile={(idx) => { void generateTile(idx) }}
             onGenerateAllTiles={() => { void handleGenerateAllTiles() }}
             onRerun={handleRerun}
