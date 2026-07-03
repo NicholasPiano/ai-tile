@@ -4862,26 +4862,6 @@ export function planInpaintTiles(
 }
 
 /**
- * Create an off-screen canvas pre-filled with the source image pixels cropped
- * to `contextRect`. This is the running composite surface for the tiled inpaint
- * pass — equivalent to `bandCanvas` in the extend pipeline.
- */
-export async function initInpaintCanvas(
-  sourceImageUrl: string,
-  contextRect: { x: number; y: number; w: number; h: number },
-): Promise<HTMLCanvasElement> {
-  const img = await loadImageElement(sourceImageUrl)
-  const canvas = document.createElement('canvas')
-  canvas.width = contextRect.w
-  canvas.height = contextRect.h
-  const ctx = canvas.getContext('2d')
-  if (ctx) {
-    ctx.drawImage(img, contextRect.x, contextRect.y, contextRect.w, contextRect.h, 0, 0, contextRect.w, contextRect.h)
-  }
-  return canvas
-}
-
-/**
  * Crop the context perimeter from the source image and scale it so its longest
  * edge is at most `maxDim` pixels. Returns the data URL and the scale factor
  * (context-pixel → low-res-pixel) used.
@@ -4920,9 +4900,9 @@ export async function buildLowResContextCrop(
  *   - Changed pixels  → fully opaque   (RGBA [255, 255, 255, 255])
  *   - Unchanged pixels → fully transparent (RGBA [0, 0, 0, 0])
  *
- * This mask is used by buildInpaintTileInput to decide, for each pixel inside
- * the selection, whether to show the blurry plan (changed) or the crisp
- * source (unchanged). The result replaces the LLM mask-extraction call.
+ * This mask is used by buildGlobalInpaintComposite to decide, for each pixel
+ * inside the selection, whether to show the softened plan (changed) or the
+ * crisp source (unchanged). The result replaces the LLM mask-extraction call.
  *
  * @param threshold  Per-channel maximum difference considered "same".
  *                   Default 10 absorbs JPEG compression noise in the plan
@@ -5061,101 +5041,131 @@ export async function buildChangeMaskVisuals(
 
 
 /**
- * Build the input image for one inpaint tile.
+ * Build the shared full-resolution composite for the tiled inpaint pass.
  *
- *   1. Fill the entire tile canvas with source pixels (high-res, unchanged).
- *   2. When a `planImageUrl`, `globalPlanScale`, and `changeMask` are provided,
- *      bake blurry plan pixels into `maskSubRect` — but only for pixels the
- *      change mask marks as actually changed. Pixels inside the selection that
- *      the plan left unchanged keep their crisp high-res source values.
+ *   1. Base layer: crisp source pixels for the ENTIRE context region.
+ *   2. Plan layer: the global plan image upscaled to full context resolution,
+ *      with an adaptive blur applied — the blur radius scales with how much
+ *      upscaling is actually happening (mirrors `drawSoftenedPlanningGuide`
+ *      in the extend pipeline), so a plan crop close to native resolution
+ *      gets little/no extra softening while a heavily-upscaled low-res plan
+ *      gets enough to hide blocky resampling artifacts.
+ *   3. Feathered mask: the raw pixel-diff change mask is blurred before use
+ *      so the plan layer fades in/out smoothly across the diff boundary
+ *      instead of a hard, jagged cut — and so the transition band straddles
+ *      rather than sits exactly on the boundary.
+ *   4. The masked, softened plan layer is composited over the crisp base —
+ *      pixels the plan left unchanged keep their crisp source values.
  *
- *      The visual contrast between blurry plan pixels and crisp source pixels
- *      is the signal the refinement model uses to locate the edit zone — no
- *      blue border annotation is needed or drawn.
+ * Deliberately NOT clipped to the user's selection rectangle: the change
+ * mask (step 3) is the sole authority on what shows plan content. If the
+ * model legitimately changed a few pixels just outside the drawn selection
+ * (e.g. a shadow or highlight blending into the context band), those pixels
+ * are allowed through rather than forced back to crisp source. Tiles that
+ * have no overlap with the selection at all are still skipped upstream by
+ * `planInpaintTiles`/`generateTile`, so this only affects bleed near the
+ * selection boundary, not the whole context ring.
  *
- * Context pixels (everything outside `maskSubRect`) always come from the
- * original source image.
+ * Building this ONCE at full context resolution (rather than independently
+ * per tile) guarantees every tile crops identical shared pixels in overlap
+ * regions, eliminating a source of tile-to-tile seam mismatch. It also lets
+ * `cropInpaintTileInput` reduce tile-input construction to a plain crop —
+ * mirroring `buildTileInput` in the extend pipeline, which crops directly
+ * from the shared running band canvas.
  */
-export async function buildInpaintTileInput(
+export async function buildGlobalInpaintComposite(
   sourceImageUrl: string,
   contextRect: { x: number; y: number; w: number; h: number },
-  tileSpec: InpaintTileSpec,
-  planImageUrl?: string,
-  globalPlanScale?: number,
+  planImageUrl: string,
+  /** Context-pixel → plan-pixel scale factor from buildGlobalPlanInput. */
+  globalPlanScale: number,
   /** Per-pixel diff mask from computeChangeMask. Changed pixels are opaque;
-   *  unchanged pixels are transparent. Used to preserve crisp source content
-   *  inside the selection where the plan made no changes. */
-  changeMask?: HTMLCanvasElement,
-): Promise<string> {
-  const img = await loadImageElement(sourceImageUrl)
+   *  unchanged pixels are transparent. Null skips the plan layer entirely
+   *  (composite is pure crisp source). */
+  changeMask: HTMLCanvasElement | null,
+): Promise<HTMLCanvasElement> {
+  const [sourceImg, planImg] = await Promise.all([
+    loadImageElement(sourceImageUrl),
+    loadImageElement(planImageUrl),
+  ])
 
-  const canvas = document.createElement('canvas')
-  canvas.width = tileSpec.w
-  canvas.height = tileSpec.h
-  const ctx = canvas.getContext('2d')
-  if (!ctx) return ''
+  const w = contextRect.w
+  const h = contextRect.h
 
-  // Tile top-left in image-pixel coordinates.
-  const tileImgX = contextRect.x + tileSpec.x
-  const tileImgY = contextRect.y + tileSpec.y
+  const composite = document.createElement('canvas')
+  composite.width = w
+  composite.height = h
+  const cctx = composite.getContext('2d')
+  if (!cctx) return composite
 
-  // Step 1: fill with source pixels.
-  ctx.drawImage(img, tileImgX, tileImgY, tileSpec.w, tileSpec.h, 0, 0, tileSpec.w, tileSpec.h)
+  // Step 1: crisp source base for the entire context region.
+  cctx.drawImage(sourceImg, contextRect.x, contextRect.y, w, h, 0, 0, w, h)
 
-  if (tileSpec.maskSubRect && planImageUrl && typeof globalPlanScale === 'number' && globalPlanScale > 0) {
-    const { x: mX, y: mY, w: mW, h: mH } = tileSpec.maskSubRect
+  if (!changeMask) return composite
 
-    const planImg = await loadImageElement(planImageUrl)
+  const planLayer = document.createElement('canvas')
+  planLayer.width = w
+  planLayer.height = h
+  const pctx = planLayer.getContext('2d')
+  if (!pctx) return composite
 
-    // Source coordinates of this selection sub-rect in the global plan image.
-    const selInCtxX = tileSpec.x + mX
-    const selInCtxY = tileSpec.y + mY
-    const planSrcX = Math.max(0, Math.round(selInCtxX * globalPlanScale))
-    const planSrcY = Math.max(0, Math.round(selInCtxY * globalPlanScale))
-    const planSrcW = Math.max(1, Math.round(mW * globalPlanScale))
-    const planSrcH = Math.max(1, Math.round(mH * globalPlanScale))
+  // Step 2: plan layer upscaled to full context resolution, with adaptive
+  // blur proportional to the upscale factor (context-pixel / plan-pixel).
+  const upscale = globalPlanScale > 0 ? 1 / globalPlanScale : 1
+  const blurPx = upscale > 1.25
+    ? Math.min(48, Math.max(8, Math.round(upscale * 1.5)))
+    : 0
 
-    // Step 2a: downsample the plan region 4× so the model can clearly
-    // distinguish blurry plan pixels from crisp source pixels.
-    const PLAN_BLUR_DIVISOR = 4
-    const blurW = Math.max(1, Math.round(planSrcW / PLAN_BLUR_DIVISOR))
-    const blurH = Math.max(1, Math.round(planSrcH / PLAN_BLUR_DIVISOR))
-    const blurCanvas = document.createElement('canvas')
-    blurCanvas.width = blurW
-    blurCanvas.height = blurH
-    const blurCtx = blurCanvas.getContext('2d')
-    if (blurCtx) {
-      blurCtx.drawImage(planImg, planSrcX, planSrcY, planSrcW, planSrcH, 0, 0, blurW, blurH)
-    }
+  pctx.imageSmoothingEnabled = true
+  pctx.imageSmoothingQuality = 'high'
+  if (blurPx > 0) pctx.filter = `blur(${blurPx}px)`
+  pctx.drawImage(planImg, 0, 0, w, h)
+  pctx.filter = 'none'
 
-    // Step 2b: draw the blurry plan back at full maskSubRect size into a
-    // temporary plan-zone canvas.
-    const planZoneCanvas = document.createElement('canvas')
-    planZoneCanvas.width = mW
-    planZoneCanvas.height = mH
-    const planZoneCtx = planZoneCanvas.getContext('2d')
-    if (planZoneCtx) {
-      planZoneCtx.drawImage(blurCanvas, 0, 0, blurW, blurH, 0, 0, mW, mH)
-    }
+  // Step 3: feathered mask — blur softens the diff boundary into a gradient
+  // and spreads it slightly past the exact edge on both sides.
+  const featherPx = Math.max(8, Math.round(Math.min(w, h) * 0.015))
+  const maskLayer = document.createElement('canvas')
+  maskLayer.width = w
+  maskLayer.height = h
+  const mctx = maskLayer.getContext('2d')
+  if (mctx) {
+    mctx.filter = `blur(${featherPx}px)`
+    mctx.drawImage(changeMask, 0, 0, w, h)
+    mctx.filter = 'none'
 
-    // Step 2c: apply the change mask so that only pixels that actually changed
-    // relative to the original stay opaque in the plan zone. Unchanged pixels
-    // become transparent and will reveal the crisp source drawn in Step 1.
-    if (changeMask && planZoneCtx) {
-      planZoneCtx.globalCompositeOperation = 'destination-in'
-      planZoneCtx.drawImage(
-        changeMask,
-        planSrcX, planSrcY, planSrcW, planSrcH,
-        0, 0, mW, mH,
-      )
-      planZoneCtx.globalCompositeOperation = 'source-over'
-    }
-
-    // Step 2d: composite the masked plan zone onto the tile canvas.
-    ctx.drawImage(planZoneCanvas, mX, mY)
+    pctx.globalCompositeOperation = 'destination-in'
+    pctx.drawImage(maskLayer, 0, 0)
+    pctx.globalCompositeOperation = 'source-over'
   }
 
-  return canvas.toDataURL('image/jpeg', 0.92)
+  // Step 4: composite the masked, softened plan layer over the crisp base.
+  cctx.drawImage(planLayer, 0, 0)
+
+  return composite
+}
+
+/**
+ * Crop one tile's region out of the shared running inpaint canvas.
+ *
+ * Mirrors `buildTileInput` in the extend pipeline: by the time a tile is
+ * generated, the running canvas already contains the global composite (crisp
+ * source + softened plan-in-mask) plus the sharpened results of any
+ * already-processed neighbour tiles (per the scan-order feathering in
+ * `planInpaintTiles`), so a plain crop gives the model real neighbour context
+ * for free — no per-tile reconstruction of blur or masking is needed.
+ */
+export function cropInpaintTileInput(
+  runningCanvas: HTMLCanvasElement,
+  tileSpec: { x: number; y: number; w: number; h: number },
+): string {
+  const tile = document.createElement('canvas')
+  tile.width = tileSpec.w
+  tile.height = tileSpec.h
+  const ctx = tile.getContext('2d')
+  if (!ctx) return ''
+  ctx.drawImage(runningCanvas, tileSpec.x, tileSpec.y, tileSpec.w, tileSpec.h, 0, 0, tileSpec.w, tileSpec.h)
+  return tile.toDataURL('image/jpeg', 0.92)
 }
 
 /**
@@ -5220,26 +5230,20 @@ export async function compositeInpaintTileResult(
     return
   }
 
-  // The band canvas is pre-filled with the original source for the ENTIRE
-  // context region (see initInpaintCanvas), so the context ring outside the
-  // selection is already correct and must never be overwritten.
-  if (!maskSubRect) {
-    // Pure-context tile — nothing to composite.
-    return
-  }
+  // `generateTile` never calls this for a pure-context tile (no selection
+  // overlap at all), but guard anyway — nothing to composite in that case.
+  if (!maskSubRect) return
 
-  // Composite ONLY the selection (maskSubRect) of the AI tile onto the band.
-  // Earlier versions drew the whole tile and then "restored" the surrounding
-  // source — first via an even-odd clip, then via a clearRect ring — and BOTH
-  // wiped the edit when the global-plan scaling produced fractional
-  // coordinates. Drawing just the selection crop removes the destructive
-  // restore step entirely: the ring is left untouched, the selection gets the
-  // AI pixels.
-  bandCtx.drawImage(
-    tileCanvas,
-    maskSubRect.x, maskSubRect.y, maskSubRect.w, maskSubRect.h,
-    tX + maskSubRect.x, tY + maskSubRect.y, maskSubRect.w, maskSubRect.h,
-  )
+  // Composite the WHOLE feathered tile onto the band, not just the
+  // selection sub-rect. Earlier versions clipped strictly to `maskSubRect`
+  // to guarantee the context ring stayed byte-for-byte original — but that
+  // also discarded any legitimate bleed the model produced just outside the
+  // selection (e.g. a shadow or highlight blending into the context band).
+  // The tile canvas built above already carries the discipline that matters:
+  // source-filled base (step A) means any pixel the model left untouched or
+  // returned transparent falls back to crisp source automatically, so a
+  // full-tile stamp only changes pixels the model actually touched.
+  bandCtx.drawImage(tileCanvas, 0, 0, tW, tH, tX, tY, tW, tH)
 
   // ── Diagnostic: trace the edit through each stage at the selection centre ──
   //   src        = original source pixel

@@ -4,7 +4,6 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   EDIT_STRIP_PX,
   MAX_AI_DIMENSION,
-  MAX_EDIT_SELECTION_PX,
   type InpaintState,
   type InpaintRegion,
   type InpaintTilePlan,
@@ -16,10 +15,10 @@ import {
   buildLowResContextCrop,
   buildGlobalPlanInput,
   planInpaintTiles,
-  initInpaintCanvas,
   computeChangeMask,
   buildChangeMaskVisuals,
-  buildInpaintTileInput,
+  buildGlobalInpaintComposite,
+  cropInpaintTileInput,
   compositeInpaintTileResult,
   compositeInpaintFinal,
 } from '@/app/utils/imageProcessor'
@@ -169,24 +168,9 @@ function clampRect(r: ImageRect, bounds: ImageRect): ImageRect {
   return { x, y, w: x2 - x, h: y2 - y }
 }
 
-/**
- * Largest rectangle the user can select starting from `start`: at most
- * `MAX_EDIT_SELECTION_PX` in any direction from the start point, clipped to
- * `imageBounds`.
- */
-function computeDynamicMaxRect(start: ImagePoint, imageBounds: ImageRect): ImageRect {
-  const limit = Math.max(0, MAX_EDIT_SELECTION_PX)
-  const x1 = Math.max(imageBounds.x, start.x - limit)
-  const y1 = Math.max(imageBounds.y, start.y - limit)
-  const x2 = Math.min(imageBounds.x + imageBounds.w, start.x + limit)
-  const y2 = Math.min(imageBounds.y + imageBounds.h, start.y + limit)
-  return { x: x1, y: y1, w: Math.max(0, x2 - x1), h: Math.max(0, y2 - y1) }
-}
-
-/** Normalise and clamp an in-progress or committed drag to the dynamic max box. */
+/** Normalise and clamp an in-progress or committed drag to the image bounds. */
 function selectionFromDrag(drag: DragState, imageBounds: ImageRect): ImageRect {
-  const dynamicMax = computeDynamicMaxRect(drag.start, imageBounds)
-  return clampRect(normaliseRect(drag.start, drag.current), dynamicMax)
+  return clampRect(normaliseRect(drag.start, drag.current), imageBounds)
 }
 
 /** Snap drag corners to the clamped selection so overlay and preview stay aligned. */
@@ -210,19 +194,6 @@ function timestampForFilename(date: Date = new Date()): string {
   const min = String(date.getMinutes()).padStart(2, '0')
   const ss = String(date.getSeconds()).padStart(2, '0')
   return `${yyyy}-${mm}-${dd}_${hh}-${min}-${ss}`
-}
-
-/**
- * Minimal Promise-based image loader used by the direct-plan fast path.
- * Avoids importing the private `loadImageElement` from imageProcessor.
- */
-function loadImg(url: string): Promise<HTMLImageElement> {
-  return new Promise<HTMLImageElement>((resolve, reject) => {
-    const img = new window.Image()
-    img.onload = () => resolve(img)
-    img.onerror = () => reject(new Error('Failed to load image'))
-    img.src = url
-  })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -543,19 +514,24 @@ export interface EditStudioProps {
  *
  * Renders the source image with a transparent canvas overlay for interactive
  * selection drawing. Once the user commits a selection the sidebar transitions
- * to the input form. On submit, only the plan runs automatically. If the
- * context rect fits within MAX_AI_DIMENSION the plan result is composited
- * directly and the user can accept immediately (fast path). Otherwise the mask
- * and tile steps follow:
+ * to the input form. On submit:
  *
- *   1. Generate → buildGlobalPlanInput → /api/edit 'plan'        → globalPlanUrl
- *   Fast path (context ≤ MAX_AI_DIMENSION):
- *   1a.         → draw globalPlanUrl into inpaint canvas → phase 'done'
- *   Full path:
- *   2.          → /api/edit 'extract-mask' → globalMaskUrl → buildMaskOverlay
- *   3.          → planInpaintTiles + initInpaintCanvas (phase → 'tiling', idle)
- *   4. Per tile (manual): buildInpaintTileInput → /api/edit 'refine'
- *        → compositeInpaintTileResult   (generateTile / Generate-all)
+ *   1. Generate → buildGlobalPlanInput → /api/edit 'plan'    → globalPlanUrl
+ *   2.          → computeChangeMask (client-side pixel diff, no LLM call)
+ *   3.          → buildGlobalInpaintComposite: ONE full-resolution canvas —
+ *                 crisp source everywhere, softened/feathered plan content
+ *                 baked into actually-changed pixels. Not clipped to the
+ *                 selection rectangle — the change mask alone decides what
+ *                 shows plan content, so legitimate bleed into the context
+ *                 band (e.g. a shadow/highlight) is kept rather than discarded.
+ *   Fast path (context ≤ MAX_AI_DIMENSION): the composite above IS the final
+ *     result — no refine pass needed, jump straight to phase 'done'.
+ *   Full path (context > MAX_AI_DIMENSION):
+ *   3a.         → planInpaintTiles (phase → 'tiling', idle)
+ *   4. Per tile (manual): cropInpaintTileInput (plain crop from the shared
+ *        running canvas — already-sharpened neighbour tiles show through
+ *        automatically) → /api/edit 'refine' → compositeInpaintTileResult
+ *        (stamps the whole tile, same no-clip rule) (generateTile / Generate-all)
  *   5. Accept → compositeInpaintFinal → onAccept
  *
  * Re-run controls exist for the plan (cascades to mask/tiles), the mask
@@ -609,15 +585,26 @@ async function runGlobalPlanStage(args: {
  */
 
 /**
- * Stage 3 — tiling setup. Builds the running composite canvas (pre-filled with
- * source) and the tile plan. Tiles are NOT generated here; each is run on
- * demand by the user.
+ * Stage 3 — tiling setup. Builds the shared running composite canvas (crisp
+ * source everywhere, softened global-plan content baked into the actually-
+ * changed selection pixels — see `buildGlobalInpaintComposite`) and the tile
+ * plan. Tiles are NOT generated here; each is run on demand by the user,
+ * cropping directly from this canvas.
  */
 async function buildTilingSetup(
   image: string,
   region: InpaintRegion,
+  globalPlanUrl: string,
+  globalPlanScale: number,
+  changeMask: HTMLCanvasElement | null,
 ): Promise<{ canvas: HTMLCanvasElement; tilePlan: InpaintTilePlan }> {
-  const canvas = await initInpaintCanvas(image, region.contextRect)
+  const canvas = await buildGlobalInpaintComposite(
+    image,
+    region.contextRect,
+    globalPlanUrl,
+    globalPlanScale,
+    changeMask,
+  )
   const selInCtx = {
     x: region.selectionRect.x - region.contextRect.x,
     y: region.selectionRect.y - region.contextRect.y,
@@ -831,35 +818,13 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
         const { contextRect } = region
 
-        // Fast path — context fits in a single tile. Skip mask and tiling:
-        // draw the plan result directly into the inpaint canvas.
-        if (contextRect.w <= MAX_AI_DIMENSION && contextRect.h <= MAX_AI_DIMENSION) {
-          const canvas = await initInpaintCanvas(image ?? '', contextRect)
-          const planImg = await loadImg(globalPlanUrl)
-          const ctx = canvas.getContext('2d')
-          if (ctx) {
-            ctx.clearRect(0, 0, canvas.width, canvas.height)
-            ctx.drawImage(planImg, 0, 0, canvas.width, canvas.height)
-          }
-          inpaintCanvasRef.current = canvas
-          setInpaintState((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  phase: 'done',
-                  tilePlan: null,
-                  tileResults: [],
-                  generatingTileIdx: null,
-                }
-              : null,
-          )
-          return
-        }
-
-        // Full path — compute change mask client-side, then set up tiles.
-        // The diff compares the original low-res context (PNG, lossless) with
-        // the plan result. Threshold 10 absorbs JPEG compression noise in the
-        // plan without masking real edits.
+        // Change mask — client-side pixel diff between the original low-res
+        // context and the plan result. Threshold 10 absorbs JPEG compression
+        // noise in the plan without masking real edits. Computed for both the
+        // fast and full paths now, since both rely on it (via
+        // buildGlobalInpaintComposite) to decide which pixels show plan
+        // content — there is no selection-rectangle clip anywhere in this
+        // pipeline; the mask alone is the authority.
         if (lowResContextUrl) {
           changeMaskCanvasRef.current = await computeChangeMask(lowResContextUrl, globalPlanUrl, 10)
         } else {
@@ -876,7 +841,41 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
           changeMaskOverlayUrl = visuals.overlayUrl
         }
 
-        const { canvas, tilePlan } = await buildTilingSetup(image ?? '', region)
+        // Fast path — context fits in a single tile, so there's no refine
+        // pass: the mask-blended composite below IS the final result.
+        if (contextRect.w <= MAX_AI_DIMENSION && contextRect.h <= MAX_AI_DIMENSION) {
+          const canvas = await buildGlobalInpaintComposite(
+            image ?? '',
+            contextRect,
+            globalPlanUrl,
+            globalPlanScale,
+            changeMaskCanvasRef.current,
+          )
+          inpaintCanvasRef.current = canvas
+          setInpaintState((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  changeMaskUrl,
+                  changeMaskOverlayUrl,
+                  phase: 'done',
+                  tilePlan: null,
+                  tileResults: [],
+                  generatingTileIdx: null,
+                }
+              : null,
+          )
+          return
+        }
+
+        // Full path — set up tiles over the same mask-blended composite.
+        const { canvas, tilePlan } = await buildTilingSetup(
+          image ?? '',
+          region,
+          globalPlanUrl,
+          globalPlanScale,
+          changeMaskCanvasRef.current,
+        )
         inpaintCanvasRef.current = canvas
 
         setInpaintState((prev) =>
@@ -921,10 +920,14 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   )
 
   // ── Callback: re-run the global plan (cascades to tiling, resets tiles) ─────
+  // The description can be edited in the sidebar after the initial generation,
+  // so this always re-runs with whatever text is currently in the panel
+  // (falling back to the last-submitted description if it was cleared).
 
-  const handleRerunPlan = useCallback(async () => {
+  const handleRerunPlan = useCallback(async (editPrompt: string) => {
     if (!inpaintState || !image) return
-    const { region, editPrompt, referenceImages, lowResContextUrl } = inpaintState
+    const { region, referenceImages, lowResContextUrl } = inpaintState
+    const nextEditPrompt = editPrompt.trim() || inpaintState.editPrompt
 
     inpaintCanvasRef.current = null
     changeMaskCanvasRef.current = null
@@ -933,6 +936,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
         ? {
             ...prev,
             phase: 'planning',
+            editPrompt: nextEditPrompt,
             error: null,
             globalPlanUrl: null,
             changeMaskUrl: null,
@@ -944,7 +948,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
         : null,
     )
 
-    await runPlanAndMask(editPrompt, referenceImages, region, lowResContextUrl)
+    await runPlanAndMask(nextEditPrompt, referenceImages, region, lowResContextUrl)
   }, [inpaintState, image, runPlanAndMask])
 
   // ── Callback: generate / re-run a single tile ──────────────────────────────
@@ -960,20 +964,21 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       if (!tile.maskSubRect) return
 
       const { contextRect } = inpaintState.region
-      const { editPrompt, referenceImages, globalPlanUrl, globalPlanScale } = inpaintState
+      const { editPrompt } = inpaintState
 
       setInpaintState((prev) => (prev ? { ...prev, generatingTileIdx: idx, error: null } : null))
 
       try {
-        const tileInputUrl = await buildInpaintTileInput(
-          image,
-          contextRect,
-          tile,
-          globalPlanUrl,
-          globalPlanScale,
-          changeMaskCanvasRef.current ?? undefined,
-        )
+        // Plain crop from the shared running canvas — it already contains the
+        // softened global-plan content baked into changed selection pixels,
+        // plus the sharpened output of any already-processed neighbour tiles.
+        // Mirrors the extend pipeline's crop-from-band-canvas approach.
+        const tileInputUrl = cropInpaintTileInput(canvas, tile)
 
+        // Reference images are intentionally omitted here — they steer the
+        // global plan's style/composition, but a tile only needs to sharpen
+        // the blurry plan crop it was given. Re-sending them risks pulling
+        // the tile back toward the global brief instead of local fidelity.
         const tileRes = await fetch('/api/edit', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -981,7 +986,8 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
             phase: 'refine',
             imageDataUrl: tileInputUrl,
             editPrompt,
-            referenceImages,
+            tileIndex: tile.row * tile.totalCols + tile.col + 1,
+            tileCount: tile.totalRows * tile.totalCols,
             apiKey,
             model,
           }),
@@ -1125,7 +1131,6 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
   const isProcessing =
     inpaintState?.phase === 'planning' ||
-    inpaintState?.phase === 'masking' ||
     inpaintState?.phase === 'tiling'
 
   const hasSelection = !!drag?.committed || !!inpaintState
@@ -1244,7 +1249,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
           <EditPanel
             inpaintState={inpaintState}
             onGenerate={(prompt, refs) => { void handleGenerate(prompt, refs) }}
-            onRerunPlan={() => { void handleRerunPlan() }}
+            onRerunPlan={(editPrompt) => { void handleRerunPlan(editPrompt) }}
             onRerunTile={(idx) => { void generateTile(idx) }}
             onGenerateAllTiles={() => { void handleGenerateAllTiles() }}
             onRerun={handleRerun}

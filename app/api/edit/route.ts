@@ -67,8 +67,9 @@ function extractImageFromAny(node: unknown): string | null {
  *
  *   phase: 'refine'
  *     imageDataUrl      — full-res tile with plan content baked in + blue border
- *     editPrompt        — what was changed (passed to tile-refinement prompt)
- *     referenceImages?  — optional style reference images
+ *     editPrompt        — original edit description, passed only as loose context
+ *                         (reference images are NOT sent for this phase — the
+ *                         blurry plan crop is the only content signal a tile needs)
  *
  * All phases return { resultUrl: string }.
  */
@@ -83,6 +84,9 @@ export async function POST(request: NextRequest) {
       referenceImages?: ReferenceImage[]
       apiKey?: string
       model?: string
+      /** 1-indexed tile position + total tile count, refine phase only. */
+      tileIndex?: number
+      tileCount?: number
     }
 
     const {
@@ -94,6 +98,8 @@ export async function POST(request: NextRequest) {
       referenceImages,
       apiKey,
       model,
+      tileIndex,
+      tileCount,
     } = body
 
     if (!phase || !['plan', 'extract-mask', 'refine'].includes(phase)) {
@@ -152,14 +158,21 @@ export async function POST(request: NextRequest) {
       const prompt =
         phase === 'plan'
           ? buildGlobalPlanPrompt(editPrompt.trim())
-          : buildTileRefinementPrompt(editPrompt.trim())
+          : buildTileRefinementPrompt(
+              editPrompt.trim(),
+              typeof tileIndex === 'number' && typeof tileCount === 'number'
+                ? { index: tileIndex, total: tileCount }
+                : undefined,
+            )
 
       content = [
         { type: 'image_url', image_url: { url: imageDataUrl } },
       ]
 
-      // Append any user-supplied reference images.
-      if (Array.isArray(referenceImages)) {
+      // Reference images only apply to the global plan — they steer overall
+      // composition/style. Tiles refine an already-decided blurry preview and
+      // must not be pulled back toward the global style brief.
+      if (phase === 'plan' && Array.isArray(referenceImages)) {
         for (const ref of referenceImages) {
           if (ref.dataUrl) {
             content.push({ type: 'image_url', image_url: { url: ref.dataUrl } })

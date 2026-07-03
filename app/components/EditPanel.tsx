@@ -11,8 +11,12 @@ import type { InpaintState, ReferenceImage } from '@/app/lib/app'
 export interface EditPanelProps {
   inpaintState: InpaintState
   onGenerate: (editPrompt: string, referenceImages: ReferenceImage[]) => void
-  /** Re-run the global plan (cascades to diff-mask computation + resets tiles). */
-  onRerunPlan: () => void
+  /**
+   * Re-run the global plan with the given description (cascades to diff-mask
+   * computation + resets tiles). The description can be edited after the
+   * initial generation, so this always reflects the panel's current text.
+   */
+  onRerunPlan: (editPrompt: string) => void
   /** Generate or re-generate a single tile. */
   onRerunTile: (tileIdx: number) => void
   /** Sequentially generate every masked tile that has no result yet. */
@@ -73,17 +77,6 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 
 function Spinner() {
   return <Icons.Spinner size={14} />
-}
-
-function LockedPrompt({ value }: { value: string }) {
-  return (
-    <p
-      className="rounded-lg border px-3 py-2 text-[12px] italic"
-      style={{ borderColor: 'var(--border)', background: 'var(--bg-elev)', color: 'var(--text-secondary)' }}
-    >
-      {value}
-    </p>
-  )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -335,36 +328,44 @@ export function EditPanel({
         <div className="flex flex-col gap-3 p-4">
           <SectionLabel>Edit description</SectionLabel>
 
+          {/* Editable both before the first generation and afterward — a
+              changed description takes effect the next time the plan (or a
+              tile) is (re-)generated. Disabled only while a call is in flight. */}
+          <textarea
+            className="w-full resize-none rounded-lg border bg-transparent px-3 py-2 text-[12px] outline-none transition-colors disabled:opacity-50"
+            style={{ borderColor: 'var(--border)', color: 'var(--text)', minHeight: 80 }}
+            placeholder="e.g. replace the tree with a stone tower, keep the lighting identical"
+            value={editPrompt}
+            onChange={(e) => setEditPrompt(e.target.value)}
+            onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--accent)' }}
+            onBlur={(e) => { e.currentTarget.style.borderColor = 'var(--border)' }}
+            rows={3}
+            disabled={isProcessing}
+          />
+
+          {!pastInput && <ReferenceImageUploader images={referenceImages} onChange={setReferenceImages} />}
+
+          {error && phase === 'input' && <ErrorBanner message={error} />}
+
           {!pastInput ? (
-            // Active input stage.
-            <>
-              <textarea
-                className="w-full resize-none rounded-lg border bg-transparent px-3 py-2 text-[12px] outline-none transition-colors"
-                style={{ borderColor: 'var(--border)', color: 'var(--text)', minHeight: 80 }}
-                placeholder="e.g. replace the tree with a stone tower, keep the lighting identical"
-                value={editPrompt}
-                onChange={(e) => setEditPrompt(e.target.value)}
-                onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--accent)' }}
-                onBlur={(e) => { e.currentTarget.style.borderColor = 'var(--border)' }}
-                rows={3}
-              />
-
-              <ReferenceImageUploader images={referenceImages} onChange={setReferenceImages} />
-
-              {error && phase === 'input' && <ErrorBanner message={error} />}
-
-              <button
-                className="btn btn-primary w-full"
-                disabled={!editPrompt.trim() || !lowResPreviewUrl}
-                onClick={() => onGenerate(editPrompt, referenceImages)}
-              >
-                <Icons.Play size={13} />
-                Generate
-              </button>
-            </>
+            <button
+              className="btn btn-primary w-full"
+              disabled={!editPrompt.trim() || !lowResPreviewUrl}
+              onClick={() => onGenerate(editPrompt, referenceImages)}
+            >
+              <Icons.Play size={13} />
+              Generate
+            </button>
           ) : (
-            // Locked — show the prompt that was submitted.
-            <LockedPrompt value={inpaintState.editPrompt} />
+            <button
+              className="btn btn-ghost w-full"
+              disabled={isProcessing || !editPrompt.trim()}
+              onClick={() => onRerunPlan(editPrompt)}
+              title="Re-generate the global plan with this description (also re-runs the change mask and clears tiles)"
+            >
+              <Icons.Refresh size={13} />
+              Re-run plan with this description
+            </button>
           )}
         </div>
 
@@ -379,9 +380,9 @@ export function EditPanel({
                   <button
                     className="btn btn-ghost text-[11px]"
                     style={{ padding: '2px 8px', height: 24 }}
-                    onClick={onRerunPlan}
-                    disabled={isProcessing}
-                    title="Re-generate the global plan (also re-runs the change mask)"
+                    onClick={() => onRerunPlan(editPrompt)}
+                    disabled={isProcessing || !editPrompt.trim()}
+                    title="Re-generate the global plan with the current description (also re-runs the change mask)"
                   >
                     <Icons.Refresh size={11} />
                     Re-run

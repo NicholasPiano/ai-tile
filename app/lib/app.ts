@@ -89,21 +89,6 @@ export type Mode = 'extender' | 'edit' | 'parallax' | 'tile' | 'sprite' | 'props
 export const EDIT_STRIP_PX = 256
 
 /**
- * Maximum width or height of the inpaint selection in image pixels.
- *
- * The region sent to the model is the selection plus `EDIT_STRIP_PX` on every
- * side, so its total dimension is `selection + 2 × EDIT_STRIP_PX`. That total
- * must stay within `MAX_AI_DIMENSION` (1536 px), giving:
- *
- *   MAX_EDIT_SELECTION_PX = MAX_AI_DIMENSION − 2 × EDIT_STRIP_PX
- *
- * The on-canvas selection guide is dynamic: it reflects the largest box
- * reachable from the drag-start point within both this limit and the image
- * edges.
- */
-export const MAX_EDIT_SELECTION_PX = MAX_AI_DIMENSION - 2 * EDIT_STRIP_PX
-
-/**
  * Longest edge (in pixels) of the low-resolution global plan image sent to
  * the LLM in the first stage of the tiled inpaint pipeline. Slightly below
  * the 1536 MAX_AI_DIMENSION to leave a small safety margin.
@@ -202,7 +187,9 @@ export interface InpaintState {
   lowResPreviewUrl: string | null
   /**
    * Scale factor from context-perimeter pixels to global-plan image pixels.
-   * Computed by buildGlobalPlanInput and used when constructing per-tile inputs.
+   * Computed by buildGlobalPlanInput and used by buildGlobalInpaintComposite
+   * to size the adaptive blur applied when upscaling the plan into the shared
+   * tile composite.
    */
   globalPlanScale: number
   /** LLM global plan result URL (low-res, from the 'plan' API call). */

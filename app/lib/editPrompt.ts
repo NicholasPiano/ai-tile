@@ -84,33 +84,79 @@ export function buildMaskExtractionPrompt(): string {
 // Stage 3 — per-tile high-resolution refinement
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Position of one tile within the larger inpaint tile grid. */
+export interface TilePositionContext {
+  /** 1-indexed position of this tile among all tiles in the grid. */
+  index: number
+  /** Total number of tiles in the grid. */
+  total: number
+}
+
 /**
  * Prompt for per-tile high-resolution refinement.
  *
  * The model receives a single image where the edit zone contains blurry pixels
- * (4× downsampled plan) and everything outside is crisp source. The blurry /
- * crisp contrast is the sole zone marker — no border annotation.
+ * (softened, upscaled plan content) and everything outside is crisp — either
+ * original source or, at shared edges, already-sharpened neighbouring tiles.
+ * The blurry / crisp contrast is the sole zone marker — no border annotation.
+ *
+ * This is a super-resolution / detail pass, NOT a second inpaint. The global
+ * plan already decided composition and content; this stage's only job is to
+ * render the blurry preview at full resolution, matching the crisp
+ * surroundings. The original edit description is included purely as loose
+ * context — a tile is often a small, cropped fragment of the full selection
+ * (sometimes an almost-featureless sliver of it) and must NOT be redrawn as
+ * if it had to depict the whole instruction on its own.
  */
-export function buildTileRefinementPrompt(editDescription: string): string {
-  return [
-    'You are an expert image editor.',
+export function buildTileRefinementPrompt(
+  editDescription: string,
+  tilePosition?: TilePositionContext,
+): string {
+  const lines = [
+    'You are an expert photo detail-enhancement tool performing a super-resolution pass.',
     '',
-    'You have been given an image. Part of it is BLURRY — this is the area you',
-    'need to work on. Everything else is CRISP — leave those pixels exactly unchanged.',
+    'You have been given an image. Part of it is BLURRY — a low-resolution preview',
+    'of already-decided content. Everything else is CRISP — leave those pixels',
+    'exactly unchanged.',
     '',
-    `Edit instruction: ${editDescription}`,
+    'YOUR ONLY JOB: sharpen the blurry area into full-resolution detail that matches',
+    'what it is already previewing. This is NOT a request to invent new content —',
+    'the composition, shapes, and colours in the blurry area are already correct;',
+    'you are only adding resolution and texture.',
     '',
     'TASK:',
     '1. Find the blurry area.',
-    '2. Redraw it at full resolution so it matches the edit instruction, blends',
-    '   seamlessly with the crisp surroundings, and looks like it was always',
-    '   part of the same image.',
+    '2. Redraw it at full resolution as a faithful, detailed version of that exact',
+    '   blurry content — same shapes, same colours, same layout — now sharp and',
+    '   richly detailed, blending seamlessly with the crisp surroundings.',
     '3. Leave every crisp pixel unchanged.',
     '',
     'The crisp pixels define the rendering style — match their texture, lighting,',
     'colour, and level of detail exactly in the redrawn area.',
     '',
     'Do NOT copy or shift content from the crisp area into the blurry area.',
-    'Return the image at exactly the same pixel dimensions.',
-  ].join('\n')
+    'Do NOT add objects, shapes, or scene elements that are not already implied by',
+    'the blurry preview, even if they would fit the description below.',
+    '',
+    `For loose context only, this tile is a small crop from a larger edit whose`,
+    `overall goal was: "${editDescription}". This tile may show only a tiny,`,
+    'unremarkable fragment of that larger edit (e.g. plain sky, a patch of texture,',
+    'or empty background) — if so, that is correct and expected. Use the',
+    'description only to resolve genuine ambiguity in the blurry pixels; never as',
+    'a reason to depict the full instruction within this one tile.',
+  ]
+
+  if (tilePosition && tilePosition.total > 1) {
+    lines.push(
+      '',
+      `TILE CONTEXT: This is tile ${tilePosition.index} of ${tilePosition.total} in a larger edit`,
+      'region. Crisp pixels near an edge may already show sharpened content from a',
+      'neighbouring tile processed just before this one — continue it seamlessly.',
+      'Do NOT repeat, mirror, or duplicate content from neighbouring tiles.',
+    )
+  }
+
+  lines.push('', 'Return the image at exactly the same pixel dimensions.')
+
+  return lines.join('\n')
 }
