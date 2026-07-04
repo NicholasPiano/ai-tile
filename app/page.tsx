@@ -156,6 +156,11 @@ export default function Home() {
   /** Non-skipped index of the tile whose modal is currently open, or null. */
   const [activeTileModalIdx, setActiveTileModalIdx] = useState<number | null>(null)
 
+  /** True while "Generate all" is auto-looping through the remaining tiles. */
+  const [isAutoGeneratingTiles, setIsAutoGeneratingTiles] = useState(false)
+  /** Set to true to stop the auto-generate-all loop after the current tile. */
+  const autoGenerateTilesStopRef = useRef(false)
+
   /** Returns the index of the first non-accepted tile, or null if all done. */
   function getNextPendingTileIdx(accepted: boolean[]): number | null {
     for (let i = 0; i < accepted.length; i++) {
@@ -1048,7 +1053,12 @@ export default function Home() {
         if (!prev) return null
         const next = [...prev.tilePreviews]
         next[nsIdx] = raw
-        return { ...prev, tilePreviews: next, generatingTileIdx: null, generatingPlanOnly: false }
+        const updated = { ...prev, tilePreviews: next, generatingTileIdx: null, generatingPlanOnly: false }
+        // Sync the ref immediately (not just on next render) so callers that
+        // chain straight into acceptTile — e.g. the "Generate all" loop —
+        // read the freshly-generated preview instead of a stale null.
+        pendingTiledPlanRef.current = updated
+        return updated
       })
     } catch (err) {
       const e = err as Error & { status?: number }
@@ -1145,6 +1155,8 @@ export default function Home() {
 
   /** Cancel the current tiled extension plan and reset all related state. */
   const cancelTiledPlan = useCallback(() => {
+    autoGenerateTilesStopRef.current = true
+    setIsAutoGeneratingTiles(false)
     setPendingTiledPlan(null)
     bandCanvasRef.current = null
     setActiveTileModalIdx(null)
@@ -1272,6 +1284,86 @@ export default function Home() {
   useEffect(() => {
     generateGlobalPlanRef.current = generateGlobalPlan
   }, [generateGlobalPlan])
+
+  /**
+   * Poll for an in-flight Phase-1 global plan to finish. We poll the ref
+   * rather than depending on React state timing, and rather than storing the
+   * in-flight promise, since the plan can also be re-run independently from
+   * "Re-run global plan" while this loop is waiting.
+   */
+  const waitForGlobalPlan = async () => {
+    while (
+      pendingTiledPlanRef.current?.isGlobalPlanGenerating &&
+      !autoGenerateTilesStopRef.current
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 150))
+    }
+  }
+
+  /**
+   * "Generate all" — sequentially generates and auto-accepts every remaining
+   * tile in the current plan, so the user doesn't have to open the per-tile
+   * modal and click Generate/Accept for each cell. Reuses the exact same
+   * `generateTile` / `acceptTile` calls as the manual flow; only the looping
+   * and auto-accept behaviour is new here.
+   */
+  const generateAllTiles = useCallback(async () => {
+    const plan = pendingTiledPlanRef.current
+    if (!plan) return
+    if (isAutoGeneratingTiles || plan.generatingTileIdx !== null) return
+
+    autoGenerateTilesStopRef.current = false
+    setIsAutoGeneratingTiles(true)
+    // Close any open per-tile modal so it can't fight the loop's own updates.
+    setActiveTileModalIdx(null)
+
+    try {
+      // Multi-tile, non-keyed extensions rely on the Phase 1 global plan for
+      // composition guidance — wait for one already in flight, or kick one
+      // off if it hasn't run yet, before generating any tile.
+      const isKeyedLayer = !!plan.layerRole && plan.layerRole !== 'sky'
+      const needsGlobalPlan = plan.nonSkippedCount > 1 && !isKeyedLayer
+      if (needsGlobalPlan) {
+        if (pendingTiledPlanRef.current?.isGlobalPlanGenerating) {
+          await waitForGlobalPlan()
+        }
+        if (
+          !autoGenerateTilesStopRef.current &&
+          !pendingTiledPlanRef.current?.globalPlanResult
+        ) {
+          await generateGlobalPlan(plan.direction)
+        }
+      }
+
+      while (!autoGenerateTilesStopRef.current) {
+        const current = pendingTiledPlanRef.current
+        if (!current) break
+        const nsIdx = getNextPendingTileIdx(current.tileAccepted)
+        if (nsIdx === null) break
+
+        setProgressMsg(`Generating tile ${nsIdx + 1}/${current.nonSkippedCount}…`)
+        await generateTile(nsIdx)
+        if (autoGenerateTilesStopRef.current) break
+
+        const generated = pendingTiledPlanRef.current
+        if (!generated || !generated.tilePreviews[nsIdx]) {
+          // generateTile already surfaced the failure via setError.
+          break
+        }
+
+        await acceptTile(nsIdx)
+      }
+    } finally {
+      setIsAutoGeneratingTiles(false)
+      autoGenerateTilesStopRef.current = false
+      setProgressMsg(null)
+    }
+  }, [isAutoGeneratingTiles, generateTile, acceptTile, generateGlobalPlan])
+
+  /** Stop the auto-generate-all loop — the current in-flight tile still finishes. */
+  const stopAutoGenerateTiles = useCallback(() => {
+    autoGenerateTilesStopRef.current = true
+  }, [])
 
   /**
    * Resolve which image (and which layer role, if any) the next extension
@@ -4588,6 +4680,11 @@ export default function Home() {
               ? () => void generateGlobalPlan(pendingTiledPlan.direction)
               : undefined
           }
+          onGenerateAllTiles={
+            pendingTiledPlan ? () => void generateAllTiles() : undefined
+          }
+          isAutoGeneratingTiles={isAutoGeneratingTiles}
+          onStopAutoGenerateTiles={stopAutoGenerateTiles}
         />
       )}
 

@@ -310,11 +310,23 @@ function TilingEdgeControl({
   onCancel,
   onRerunGlobalPlan,
   isGlobalPlanGenerating,
+  onGenerateAll,
+  isAutoGenerating,
+  onStopAutoGenerate,
+  canGenerateAll,
 }: {
   direction: Direction
   onCancel: () => void
   onRerunGlobalPlan?: () => void
   isGlobalPlanGenerating?: boolean
+  /** Kick off automatic sequential generation of every remaining tile. */
+  onGenerateAll?: () => void
+  /** True while the "Generate all" loop is running. */
+  isAutoGenerating?: boolean
+  /** Stop the "Generate all" loop after the current tile finishes. */
+  onStopAutoGenerate?: () => void
+  /** Whether at least one tile is still left to generate. */
+  canGenerateAll?: boolean
 }) {
   const position: React.CSSProperties = (
     {
@@ -350,12 +362,12 @@ function TilingEdgeControl({
       {onRerunGlobalPlan && (
         <button
           onClick={onRerunGlobalPlan}
-          disabled={isGlobalPlanGenerating}
+          disabled={isGlobalPlanGenerating || isAutoGenerating}
           title={isGlobalPlanGenerating ? 'Generating global plan…' : 'Re-run global plan'}
           className="flex h-8 w-8 items-center justify-center rounded-full transition-colors"
           style={{
             ...pillBtnStyle,
-            opacity: isGlobalPlanGenerating ? 0.6 : 1,
+            opacity: isGlobalPlanGenerating || isAutoGenerating ? 0.6 : 1,
           }}
           onMouseEnter={pillBtnHoverEnter}
           onMouseLeave={pillBtnHoverLeave}
@@ -364,6 +376,31 @@ function TilingEdgeControl({
             ? <Icons.Spinner size={13} />
             : <Icons.Refresh size={13} />
           }
+        </button>
+      )}
+
+      {/* Generate all — sequentially generates + auto-accepts every
+          remaining tile; only shown when the callback is provided */}
+      {onGenerateAll && (
+        <button
+          onClick={isAutoGenerating ? onStopAutoGenerate : onGenerateAll}
+          disabled={!isAutoGenerating && !canGenerateAll}
+          title={
+            isAutoGenerating
+              ? 'Stop generating tiles'
+              : canGenerateAll
+              ? 'Generate all remaining tiles automatically'
+              : 'All tiles generated'
+          }
+          className="flex h-8 w-8 items-center justify-center rounded-full transition-colors"
+          style={{
+            ...pillBtnStyle,
+            opacity: !isAutoGenerating && !canGenerateAll ? 0.4 : 1,
+          }}
+          onMouseEnter={pillBtnHoverEnter}
+          onMouseLeave={pillBtnHoverLeave}
+        >
+          {isAutoGenerating ? <Icons.Stop size={13} /> : <Icons.Play size={13} />}
         </button>
       )}
 
@@ -465,6 +502,9 @@ export function Workspace({
   onTileClick,
   onTileCancel,
   onRerunGlobalPlan,
+  onGenerateAllTiles,
+  isAutoGeneratingTiles,
+  onStopAutoGenerateTiles,
 }: {
   image: string
   dimensions: { width: number; height: number } | null
@@ -488,6 +528,12 @@ export function Workspace({
   onTileCancel?: () => void
   /** Re-run Phase 1 (global plan) for the entire extension. */
   onRerunGlobalPlan?: () => void
+  /** Sequentially generate + auto-accept every remaining tile. */
+  onGenerateAllTiles?: () => void
+  /** True while the "Generate all" loop is running. */
+  isAutoGeneratingTiles?: boolean
+  /** Stop the "Generate all" loop after the current tile finishes. */
+  onStopAutoGenerateTiles?: () => void
 }) {
   const isTiling = !!tilingState
 
@@ -605,7 +651,9 @@ export function Workspace({
         {tilingState && (
           <TilingBand
             state={tilingState}
-            onTileClick={onTileClick ?? (() => undefined)}
+            onTileClick={
+              isAutoGeneratingTiles ? () => undefined : onTileClick ?? (() => undefined)
+            }
           />
         )}
 
@@ -618,6 +666,10 @@ export function Workspace({
               onCancel={onTileCancel ?? (() => undefined)}
               onRerunGlobalPlan={onRerunGlobalPlan}
               isGlobalPlanGenerating={tilingState.isGlobalPlanGenerating}
+              onGenerateAll={onGenerateAllTiles}
+              isAutoGenerating={isAutoGeneratingTiles}
+              onStopAutoGenerate={onStopAutoGenerateTiles}
+              canGenerateAll={tilingState.nextPendingTileIdx !== null}
             />
           )
           : !isResult && (
