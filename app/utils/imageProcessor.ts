@@ -1881,16 +1881,47 @@ export function buildTileChunkInfo(
   nonSkippedCount: number,
 ): ChunkInfo {
   const blankR = tileSpec.blankRegion
-  const isHorizExt = direction === 'left' || direction === 'right'
+  const contextAtStart = direction === 'right' || direction === 'down'
+
+  let chunkWidth: number
+  let chunkHeight: number
+  let sourceX: number
+  let sourceY: number
+  let extensionSize: number
+
+  if (direction === 'left' || direction === 'right') {
+    chunkHeight = tileSpec.tileHeight
+    extensionSize = blankR.width
+    if (contextAtStart) {
+      chunkWidth = blankR.x
+      sourceX = 0
+    } else {
+      chunkWidth = tileSpec.tileWidth - blankR.width
+      sourceX = blankR.width
+    }
+    sourceY = blankR.y
+  } else {
+    chunkWidth = tileSpec.tileWidth
+    extensionSize = blankR.height
+    if (contextAtStart) {
+      chunkHeight = blankR.y
+      sourceY = 0
+    } else {
+      chunkHeight = tileSpec.tileHeight - blankR.height
+      sourceY = blankR.height
+    }
+    sourceX = blankR.x
+  }
+
   return {
     direction,
     originalWidth: tileSpec.tileWidth,
     originalHeight: tileSpec.tileHeight,
-    chunkWidth: isHorizExt ? blankR.x : tileSpec.tileWidth,
-    chunkHeight: isHorizExt ? tileSpec.tileHeight : blankR.y,
-    extensionSize: isHorizExt ? blankR.width : blankR.height,
-    sourceX: blankR.x,
-    sourceY: blankR.y,
+    chunkWidth,
+    chunkHeight,
+    extensionSize,
+    sourceX,
+    sourceY,
     scale: 1,
     tileIndex: nsIdx,
     tileCount: nonSkippedCount,
@@ -2170,14 +2201,14 @@ export function buildGlobalPlanningMap(
       const extOffsetX = direction === 'right' ? imageWidth  : 0
       const extOffsetY = direction === 'down'  ? imageHeight : 0
 
+      // Band coords share the scene origin on the extension side (band 0 → scene 0).
+      // Context-at-end directions (left / up) mirror the band layout but not the offset.
       const bandToSceneX = (bx: number): number => {
-        if (direction === 'right') return (imageWidth  - contextSize) + bx
-        if (direction === 'left')  return (extensionSize - contextSize) + bx
+        if (direction === 'right') return (imageWidth - contextSize) + bx
         return bx
       }
       const bandToSceneY = (by: number): number => {
         if (direction === 'down') return (imageHeight - contextSize) + by
-        if (direction === 'up')   return (extensionSize - contextSize) + by
         return by
       }
 
@@ -2341,22 +2372,18 @@ export function buildTilePlanningMap(
       const extOffsetX = direction === 'right' ? imageWidth  : 0
       const extOffsetY = direction === 'down'  ? imageHeight : 0
 
-      // The band canvas has `contextSize` rows/cols copied from the source
-      // image at one end and `extensionSize` rows/cols of the extension at the
-      // other.  Band coordinate → full-scene coordinate:
-      //   down  : bandX → sceneX = bandX,  bandY → sceneY = (imageHeight - contextSize) + bandY
-      //   up    : bandX → sceneX = bandX,  bandY → sceneY = (extensionSize - contextSize) + bandY
-      //             (= bandY - contextSize because extOffset=extensionSize and context at bottom)
-      //   right : bandX → sceneX = (imageWidth - contextSize) + bandX, bandY → sceneY = bandY
-      //   left  : bandX → sceneX = (extensionSize - contextSize) + bandX, bandY → sceneY = bandY
+      // Band coordinate → full-scene coordinate (band 0 aligns with scene 0 on
+      // the extension side; context-at-start dirs add the source inset):
+      //   down  : bandY → sceneY = (imageHeight - contextSize) + bandY
+      //   up    : bandY → sceneY = bandY
+      //   right : bandX → sceneX = (imageWidth - contextSize) + bandX
+      //   left  : bandX → sceneX = bandX
       const bandToSceneX = (bx: number): number => {
-        if (direction === 'right') return (imageWidth  - contextSize) + bx
-        if (direction === 'left')  return (extensionSize - contextSize) + bx
+        if (direction === 'right') return (imageWidth - contextSize) + bx
         return bx
       }
       const bandToSceneY = (by: number): number => {
         if (direction === 'down') return (imageHeight - contextSize) + by
-        if (direction === 'up')   return (extensionSize - contextSize) + by
         return by
       }
 
