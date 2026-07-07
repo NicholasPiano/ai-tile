@@ -1563,61 +1563,6 @@ function planTilingAxis(
   return { count, sizes, positions }
 }
 
-/**
- * Split one band axis with the context strip anchored at coordinate 0.
- *
- * The first tile always starts at position 0 (the context-strip origin).
- * Subsequent tiles stride forward using standard overlap so they never
- * duplicate a previous tile's position.
- */
-function planContextAtStartAxis(
-  bandDim: number,
-  contextSize: number,
-  maxDimension: number,
-  overlapPx: number,
-): TilingAxisPlan {
-  if (bandDim <= maxDimension) {
-    return { count: 1, sizes: [bandDim], positions: [0] }
-  }
-
-  const positions: number[] = [0]
-  const sizes: number[] = [Math.min(maxDimension, bandDim)]
-  let coveredEnd = sizes[0]
-
-  if (coveredEnd >= bandDim) {
-    sizes[0] = bandDim
-    return { count: 1, sizes, positions }
-  }
-
-  // Seed nextPos toward the context/extension boundary, but never
-  // place the next tile before the minimum stride from tile 0 — that
-  // would produce two tiles at the same (or overlapping) position when
-  // contextSize ≤ overlapPx.
-  let nextPos = Math.max(sizes[0] - overlapPx, contextSize - overlapPx)
-
-  while (coveredEnd < bandDim) {
-    // Always advance past the last placed tile.
-    nextPos = Math.max(nextPos, coveredEnd - overlapPx)
-
-    if (nextPos + maxDimension >= bandDim) {
-      const finalWidth = bandDim - nextPos
-      if (finalWidth <= 0) {
-        break
-      }
-      positions.push(nextPos)
-      sizes.push(finalWidth)
-      break
-    }
-
-    positions.push(nextPos)
-    sizes.push(maxDimension)
-    coveredEnd = nextPos + maxDimension
-    nextPos = coveredEnd - overlapPx
-  }
-
-  return { count: sizes.length, sizes, positions }
-}
-
 /** Mirror a tile grid so a context-at-start plan becomes context-at-end. */
 function mirrorAxisPlan(plan: TilingAxisPlan, bandDim: number): TilingAxisPlan {
   const mirrored = plan.positions.map((pos, i) => ({
@@ -1651,11 +1596,12 @@ function maxContextSize(imageDimension: number, extensionSize: number, maxDimens
 /**
  * Plan a tiled full-resolution extension.
  *
- * Splits the extension band into an overlapping grid of tiles ≤ maxDimension².
- * On the extension axis, columns/rows are aligned to the context boundary so
- * the first extension tile's seam edge sits inside the original context strip.
- * The cross axis uses equal-sized tiles. Returns tiles in context-to-extension
- * scan order:
+ * Splits the extension band into an overlapping grid of tiles ≤ maxDimension²,
+ * with both axes evenly distributing tile sizes (no tile is ever left as a
+ * tiny sliver). Tiling always starts at position 0 — the context-strip
+ * origin — on every axis, so the strip always sits inside whichever tile(s)
+ * cover the start of the band. Returns tiles in context-to-extension scan
+ * order:
  *   down  → rows top-to-bottom,    cols left-to-right
  *   up    → rows bottom-to-top,    cols left-to-right
  *   right → cols left-to-right,    rows top-to-bottom
@@ -1665,9 +1611,11 @@ function maxContextSize(imageDimension: number, extensionSize: number, maxDimens
  * before the first tile is generated, every tile after the first in each scan
  * axis sees real painted content on its already-processed edges.
  *
- * The context-strip size is chosen to pack the first tile to `maxDimension`
- * (i.e. contextSize = min(imageDimension, maxDimension − extensionSize)), so
- * the AI always sees the richest possible slice of the original image.
+ * The context-strip size is capped so a single tile covers the whole band
+ * whenever possible (i.e. contextSize = min(imageDimension, maxDimension −
+ * extensionSize), floored at 25% of maxDimension). Multi-tile plans only
+ * arise once that floor kicks in, at which point the strip is always much
+ * smaller than a single evenly-sized tile, so it's guaranteed to fit intact.
  */
 export function planExtensionTiles(params: PlanExtensionTilesParams): TiledExtensionPlan {
   const {
@@ -1695,21 +1643,25 @@ export function planExtensionTiles(params: PlanExtensionTilesParams): TiledExten
     bandHeight   = imageHeight
   }
 
+  // The context strip always sits at the start of the band (position 0), and
+  // planTilingAxis already anchors its first tile there — so the extension
+  // axis uses the exact same even-distribution logic as the cross axis. This
+  // guarantees uniformly-sized tiles across the whole band; the (much
+  // smaller, floor-clamped) context strip is always fully contained within
+  // whichever tile ends up at position 0.
   const isHorizontalExt = direction === 'left' || direction === 'right'
-  const contextAtStartPlan = (bandDim: number): TilingAxisPlan =>
-    planContextAtStartAxis(bandDim, contextSize, maxDimension, tileOverlapPx)
 
   const xPlan = isHorizontalExt
     ? (direction === 'right'
-      ? contextAtStartPlan(bandWidth)
-      : mirrorAxisPlan(contextAtStartPlan(bandWidth), bandWidth))
+      ? planTilingAxis(bandWidth, maxDimension, tileOverlapPx)
+      : mirrorAxisPlan(planTilingAxis(bandWidth, maxDimension, tileOverlapPx), bandWidth))
     : planTilingAxis(bandWidth, maxDimension, tileOverlapPx)
 
   const yPlan = isHorizontalExt
     ? planTilingAxis(bandHeight, maxDimension, tileOverlapPx)
     : (direction === 'down'
-      ? contextAtStartPlan(bandHeight)
-      : mirrorAxisPlan(contextAtStartPlan(bandHeight), bandHeight))
+      ? planTilingAxis(bandHeight, maxDimension, tileOverlapPx)
+      : mirrorAxisPlan(planTilingAxis(bandHeight, maxDimension, tileOverlapPx), bandHeight))
   const cols = xPlan.count
   const rows = yPlan.count
 

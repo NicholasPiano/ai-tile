@@ -962,7 +962,19 @@ export default function Home() {
 
     try {
       const latestPrompt = pendingTiledPlanRef.current?.tilePrompts[nsIdx] ?? ''
-      const effectivePrompt = latestPrompt.trim() || customPrompt.trim() || undefined
+      const trimmedTilePrompt = latestPrompt.trim() || undefined
+      // Phase 1/2 (planning) decide composition, so falling back to the
+      // global description there is reasonable. By Phase 3 (refine) the plan
+      // has already locked in composition — re-applying the global
+      // description risks introducing new content instead of a faithful
+      // high-res render, so only an explicit per-tile override should reach
+      // that call. Single-phase extensions (no plan at all — single tile or
+      // a keyed parallax layer) have no separate composition step, so they
+      // keep the global fallback for the one call they make.
+      const planningPrompt = trimmedTilePrompt || customPrompt.trim() || undefined
+      const refinePrompt = useTwoPhase
+        ? trimmedTilePrompt
+        : (trimmedTilePrompt || customPrompt.trim() || undefined)
       const latestRefs = pendingTiledPlanRef.current?.tileReferenceImages[nsIdx] ?? []
       const populatedRefs = latestRefs.filter((r) => r.dataUrl.length > 0)
 
@@ -997,7 +1009,7 @@ export default function Home() {
           const rawRePlan = await callApi(perTileMap, {
             phase: 'plan',
             populatedRefs,
-            effectivePrompt,
+            effectivePrompt: planningPrompt,
           })
 
           const normalizedRePlan = await normalizeImageToSize(rawRePlan, globalPlanWidth, globalPlanHeight)
@@ -1041,7 +1053,7 @@ export default function Home() {
         phase: 'refine',
         bakedPlanning: !!planningGuide,
         populatedRefs,
-        effectivePrompt,
+        effectivePrompt: refinePrompt,
       }))
 
       const unfilled = await isTileResultUnfilled(raw, tileSpec)
@@ -1052,7 +1064,7 @@ export default function Home() {
           phase: 'refine',
           bakedPlanning: !!planningGuide,
           populatedRefs,
-          effectivePrompt,
+          effectivePrompt: refinePrompt,
         }))
       }
 
@@ -1458,15 +1470,22 @@ export default function Home() {
     dims: { width: number; height: number },
   ) => {
     const isHorizontal = direction === 'left' || direction === 'right'
-    const plan = planExtensionTiles({
-      direction,
-      imageWidth: dims.width,
-      imageHeight: dims.height,
-      extensionPercent: EXTENSION_PERCENT,
-      maxDimension: MAX_AI_DIMENSION,
-      tileOverlapPx: TILE_OVERLAP_PX,
-      maxTiles: MAX_TILES_PER_EXTEND,
-    })
+
+    let plan: TiledExtensionPlan
+    try {
+      plan = planExtensionTiles({
+        direction,
+        imageWidth: dims.width,
+        imageHeight: dims.height,
+        extensionPercent: EXTENSION_PERCENT,
+        maxDimension: MAX_AI_DIMENSION,
+        tileOverlapPx: TILE_OVERLAP_PX,
+        maxTiles: MAX_TILES_PER_EXTEND,
+      })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to plan tiled extension')
+      return
+    }
 
     const extensionSize = plan.bandChunkInfo.extensionSize
     // Context is the overlap strip (overlapPercent), not "image size minus extension".

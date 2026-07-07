@@ -55,9 +55,12 @@ export const TILE_OVERLAP_PX = 384
 
 /**
  * Hard cap on the total number of API calls per tiled extension to guard
- * against accidental runaway cost on very large images.
+ * against accidental runaway cost on very large images. Each non-skipped
+ * tile costs up to two calls (Phase 2 re-plan + Phase 3 refine), so this
+ * is a coarse cost/time guard rather than a technical limit — raise it if
+ * you routinely extend very large images and are fine with the extra calls.
  */
-export const MAX_TILES_PER_EXTEND = 24
+export const MAX_TILES_PER_EXTEND = 36
 
 /**
  * Longest edge of the global/per-tile planning map sent to Phase 1/2.

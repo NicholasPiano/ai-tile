@@ -1268,16 +1268,25 @@ export function TileExtensionModal({
   // Build the assembled prompt the model will receive so the user can see
   // exactly what will be sent.
   const chunkInfo = buildTileChunkInfo(tileSpec, direction, nsIdx, nonSkippedCount)
-  const effectivePrompt = tilePrompt.trim() || globalPrompt.trim() || undefined
   const populatedRefs = tileReferenceImages.filter((r) => r.dataUrl.length > 0)
   const isKeyedLayer = !!layerRole && layerRole !== 'sky'
   const showTwoPhase = nonSkippedCount > 1 && !isKeyedLayer
+
+  const trimmedTilePrompt = tilePrompt.trim() || undefined
+  // Mirrors generateTile's split in app/page.tsx: Phase 1/2 (planning) still
+  // falls back to the global description, but Phase 3 (refine) only uses an
+  // explicit per-tile override once a plan exists — composition is already
+  // locked in by then, so the global description shouldn't reappear there.
+  const planningEffectivePrompt = trimmedTilePrompt || globalPrompt.trim() || undefined
+  const refineEffectivePrompt = showTwoPhase
+    ? trimmedTilePrompt
+    : (trimmedTilePrompt || globalPrompt.trim() || undefined)
 
   const assembledPrompt = buildExtendPrompt({
     direction,
     chunkInfo,
     useFullContext: false,
-    customPrompt: effectivePrompt ?? null,
+    customPrompt: refineEffectivePrompt ?? null,
     artStyle: artStyle !== 'none' ? artStyle : null,
     layerRole: layerRole ?? null,
     sceneBrief: sceneBrief ?? null,
@@ -1288,7 +1297,7 @@ export function TileExtensionModal({
   const planningPromptText = showTwoPhase
     ? buildGlobalPlanningPrompt({
         direction,
-        customPrompt: effectivePrompt ?? null,
+        customPrompt: planningEffectivePrompt ?? null,
         artStyle: artStyle !== 'none' ? artStyle : null,
         sceneBrief: sceneBrief ?? null,
         referenceImages: populatedRefs.map((r) => ({ description: r.description })),
@@ -1375,7 +1384,11 @@ export function TileExtensionModal({
                 value={tilePrompt}
                 onChange={(e) => onSetTilePrompt(e.target.value)}
                 placeholder={
-                  globalPrompt.trim()
+                  showTwoPhase
+                    ? globalPrompt.trim()
+                      ? 'Refinement ignores the global prompt — leave blank for a faithful high-res render, or type a specific instruction for this tile'
+                      : 'Leave blank — faithful high-res render of the plan'
+                    : globalPrompt.trim()
                     ? `Using global: "${globalPrompt.trim().slice(0, 60)}"`
                     : 'Leave blank — natural scene continuation'
                 }
