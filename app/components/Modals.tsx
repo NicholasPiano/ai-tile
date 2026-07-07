@@ -1140,6 +1140,8 @@ export interface TileExtensionModalProps {
   isNextPending: boolean
   /** True while the API call for this tile is in-flight. */
   isGenerating: boolean
+  /** True while the plan-slice-as-final-result path is being applied. */
+  isAcceptingPlan: boolean
   /** Band canvas needed to build the tile input image preview. */
   bandCanvas: HTMLCanvasElement | null
   /** All non-skipped tile specs — needed to restore accepted-neighbour overlaps. */
@@ -1155,6 +1157,11 @@ export interface TileExtensionModalProps {
   /** Trigger Phase 2: per-tile plan re-run. */
   onReplan: () => void
   onAccept: () => void
+  /**
+   * Accept the current planning slice directly as the tile's final result,
+   * skipping the Phase 3 high-res refinement call entirely.
+   */
+  onAcceptPlan: () => void
   onClose: () => void
   /** True when the in-flight generation for this tile is a Phase 2 re-plan. */
   isReplanInProgress: boolean
@@ -1175,6 +1182,7 @@ export function TileExtensionModal({
   planningSlice,
   isNextPending,
   isGenerating,
+  isAcceptingPlan,
   bandCanvas,
   allTileSpecs,
   tileAccepted,
@@ -1184,6 +1192,7 @@ export function TileExtensionModal({
   onGenerate,
   onReplan,
   onAccept,
+  onAcceptPlan,
   onClose,
   isReplanInProgress,
 }: TileExtensionModalProps) {
@@ -1244,15 +1253,15 @@ export function TileExtensionModal({
     img.src = preview
   }, [preview])
 
-  // Close on Escape when not generating.
+  // Close on Escape when not generating or accepting the plan directly.
   useEffect(() => {
     if (!open) return
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !isGenerating) onClose()
+      if (e.key === 'Escape' && !isGenerating && !isAcceptingPlan) onClose()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [open, isGenerating, onClose])
+  }, [open, isGenerating, isAcceptingPlan, onClose])
 
   if (!open) return null
 
@@ -1286,8 +1295,11 @@ export function TileExtensionModal({
       })
     : null
 
-  const canAct = isNextPending && !isGenerating
+  const canAct = isNextPending && !isGenerating && !isAcceptingPlan
   const hasPreview = preview !== null
+  // Combined busy flag for modal-chrome affordances (close, field editing)
+  // that should pause for either a real AI call or the local accept-plan step.
+  const isBusy = isGenerating || isAcceptingPlan
 
   const dirArrow: Record<string, string> = { up: '↑', down: '↓', left: '←', right: '→' }
 
@@ -1297,7 +1309,7 @@ export function TileExtensionModal({
       <div
         className="fixed inset-0 z-50 anim-fade"
         style={{ background: 'rgba(0,0,0,0.72)' }}
-        onClick={() => { if (!isGenerating) onClose() }}
+        onClick={() => { if (!isBusy) onClose() }}
       />
 
       {/* Panel */}
@@ -1340,7 +1352,7 @@ export function TileExtensionModal({
                 </span>
               )}
             </div>
-            {!isGenerating && (
+            {!isBusy && (
               <button onClick={onClose} className="icon-btn" aria-label="Close">
                 <Icons.X size={14} />
               </button>
@@ -1367,14 +1379,14 @@ export function TileExtensionModal({
                     ? `Using global: "${globalPrompt.trim().slice(0, 60)}"`
                     : 'Leave blank — natural scene continuation'
                 }
-                disabled={isGenerating}
+                disabled={isBusy}
                 className="w-full rounded-[var(--radius-sm)] px-3 py-2 text-[12px]"
                 style={{
                   background: 'var(--surface)',
                   border: '1px solid var(--border)',
                   color: 'var(--text)',
                   outline: 'none',
-                  opacity: isGenerating ? 0.6 : 1,
+                  opacity: isBusy ? 0.6 : 1,
                 }}
               />
             </div>
@@ -1427,14 +1439,14 @@ export function TileExtensionModal({
                             ? '1px solid var(--border-strong)'
                             : '1.5px dashed var(--border)',
                           background: 'var(--surface)',
-                          opacity: isGenerating ? 0.6 : 1,
+                          opacity: isBusy ? 0.6 : 1,
                         }}
                         onClick={() => {
-                          if (!isGenerating) refImageFileInputRefs.current[rowIdx]?.click()
+                          if (!isBusy) refImageFileInputRefs.current[rowIdx]?.click()
                         }}
                         onDragOver={(e) => e.preventDefault()}
                         onDrop={(e) => {
-                          if (isGenerating) return
+                          if (isBusy) return
                           e.preventDefault()
                           const file = e.dataTransfer.files[0]
                           if (!file || !file.type.startsWith('image/')) return
@@ -1473,14 +1485,14 @@ export function TileExtensionModal({
                         type="text"
                         value={ref.description}
                         placeholder="Describe this reference (optional)"
-                        disabled={isGenerating}
+                        disabled={isBusy}
                         className="flex-1 rounded-[var(--radius-sm)] px-3 py-2 text-[12px]"
                         style={{
                           background: 'var(--surface)',
                           border: '1px solid var(--border)',
                           color: 'var(--text)',
                           outline: 'none',
-                          opacity: isGenerating ? 0.6 : 1,
+                          opacity: isBusy ? 0.6 : 1,
                         }}
                         onChange={(e) => {
                           const next = tileReferenceImages.map((r, i) =>
@@ -1497,7 +1509,7 @@ export function TileExtensionModal({
                             tileReferenceImages.filter((_, i) => i !== rowIdx)
                           )
                         }}
-                        disabled={isGenerating}
+                        disabled={isBusy}
                         className="icon-btn shrink-0"
                         aria-label="Remove reference image"
                         title="Remove"
@@ -1517,9 +1529,9 @@ export function TileExtensionModal({
                     { dataUrl: '', description: '' },
                   ])
                 }}
-                disabled={isGenerating}
+                disabled={isBusy}
                 className="w-full btn btn-ghost text-[12px]"
-                style={{ opacity: isGenerating ? 0.6 : 1 }}
+                style={{ opacity: isBusy ? 0.6 : 1 }}
               >
                 + Add reference image
               </button>
@@ -1655,7 +1667,7 @@ export function TileExtensionModal({
                         background: 'var(--surface)',
                       }}
                     >
-                      {isPhase3Generating && (
+                      {(isPhase3Generating || isAcceptingPlan) && (
                         spinnerOverlay(16)
                       )}
                       {hasPreview && preview && (
@@ -1666,7 +1678,7 @@ export function TileExtensionModal({
                           draggable={false}
                         />
                       )}
-                      {!isGenerating && !hasPreview && (
+                      {!isGenerating && !isAcceptingPlan && !hasPreview && (
                         <div
                           className="absolute inset-0 flex items-center justify-center text-[11px]"
                           style={{ color: 'var(--text-muted)' }}
@@ -1683,6 +1695,8 @@ export function TileExtensionModal({
                         ? `${resultDimensions.width} × ${resultDimensions.height}`
                         : isPhase3Generating
                         ? 'Generating…'
+                        : isAcceptingPlan
+                        ? 'Applying plan…'
                         : hasPreview
                         ? '…'
                         : '—'}
@@ -1696,7 +1710,7 @@ export function TileExtensionModal({
             <div className="flex items-center justify-between">
               <button
                 onClick={onClose}
-                disabled={isGenerating}
+                disabled={isBusy}
                 className="btn btn-ghost"
               >
                 Close
@@ -1718,6 +1732,35 @@ export function TileExtensionModal({
                       </>
                     ) : (
                       <>↺ Re-plan tile</>
+                    )}
+                  </button>
+                )}
+
+                {/* Accept plan as-is — skip Phase 3 entirely and use the
+                    low-res planning slice (upscaled) as the final tile */}
+                {showTwoPhase && (
+                  <button
+                    onClick={onAcceptPlan}
+                    disabled={!canAct || !planningSlice}
+                    className="btn btn-ghost"
+                    title={
+                      !isNextPending
+                        ? 'Accept prior tiles first'
+                        : !planningSlice
+                        ? 'No plan available yet for this tile'
+                        : 'Skip refinement — use the plan slice as the final tile'
+                    }
+                  >
+                    {isAcceptingPlan ? (
+                      <>
+                        <Icons.Spinner size={13} />
+                        Applying…
+                      </>
+                    ) : (
+                      <>
+                        <Icons.Check size={13} />
+                        Accept plan as-is
+                      </>
                     )}
                   </button>
                 )}

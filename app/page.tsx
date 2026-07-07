@@ -105,6 +105,13 @@ export default function Home() {
     generatingTileIdx: number | null
     /** True when the in-flight generation is a plan-only per-tile re-run (Phase 2). */
     generatingPlanOnly: boolean
+    /**
+     * Non-skipped index of the tile whose plan slice is being accepted
+     * directly (skipping Phase 3), or null. Kept separate from
+     * generatingTileIdx/generatingPlanOnly so the Generate/Re-plan buttons
+     * don't show a misleading busy state during this local, non-AI step.
+     */
+    acceptingPlanTileIdx: number | null
     // ── Global plan (Phase 1) ────────────────────────────────────────────────
     /** Full-scene planning map image sent to Phase 1, or null if not yet run. */
     globalPlanningMap: string | null
@@ -895,7 +902,7 @@ export default function Home() {
     const nextPendingIdx = getNextPendingTileIdx(plan.tileAccepted)
     if (nsIdx > 0 && nsIdx !== nextPendingIdx) return
     if (nsIdx === 0 && plan.tileAccepted[0]) return  // already accepted, nothing to do
-    if (plan.generatingTileIdx !== null) return
+    if (plan.generatingTileIdx !== null || plan.acceptingPlanTileIdx !== null) return
 
     const tileSpec = plan.nonSkippedTileSpecs[nsIdx]
     if (!tileSpec) return
@@ -1153,6 +1160,59 @@ export default function Home() {
     }
   }, [debugMode, adoptCandidates])
 
+  /**
+   * Accept the current planning slice (Phase 1 global plan, or its Phase 2
+   * per-tile override) directly as this tile's final result, skipping the
+   * Phase 3 high-res refinement AI call entirely. Useful when the low-res
+   * composition guide already looks right and no further AI polish is
+   * needed — just upscales the slice to the tile's full resolution and
+   * accepts it exactly like a normal generated result.
+   */
+  const acceptTilePlan = useCallback(async (nsIdx: number) => {
+    const plan = pendingTiledPlanRef.current
+    if (!plan) return
+
+    const nextPendingIdx = getNextPendingTileIdx(plan.tileAccepted)
+    if (nsIdx > 0 && nsIdx !== nextPendingIdx) return
+    if (nsIdx === 0 && plan.tileAccepted[0]) return
+    if (plan.generatingTileIdx !== null || plan.acceptingPlanTileIdx !== null) return
+
+    const tileSpec = plan.nonSkippedTileSpecs[nsIdx]
+    if (!tileSpec) return
+
+    const planningSlice = plan.tilePlanningSlices[nsIdx] ?? plan.globalTilePlanSlices[nsIdx]
+    if (!planningSlice) return
+
+    setPendingTiledPlan((prev) =>
+      prev ? { ...prev, acceptingPlanTileIdx: nsIdx } : null
+    )
+
+    try {
+      const upscaled = await normalizeImageToSize(
+        planningSlice,
+        tileSpec.tileWidth,
+        tileSpec.tileHeight,
+        getChunkAlign(plan.direction),
+      )
+
+      setPendingTiledPlan((prev) => {
+        if (!prev) return null
+        const next = [...prev.tilePreviews]
+        next[nsIdx] = upscaled
+        const updated = { ...prev, tilePreviews: next, acceptingPlanTileIdx: null }
+        pendingTiledPlanRef.current = updated
+        return updated
+      })
+
+      await acceptTile(nsIdx)
+    } catch (err) {
+      setError((err as Error).message || 'Failed to accept tile plan')
+      setPendingTiledPlan((prev) =>
+        prev ? { ...prev, acceptingPlanTileIdx: null } : null
+      )
+    }
+  }, [acceptTile])
+
   /** Cancel the current tiled extension plan and reset all related state. */
   const cancelTiledPlan = useCallback(() => {
     autoGenerateTilesStopRef.current = true
@@ -1310,7 +1370,7 @@ export default function Home() {
   const generateAllTiles = useCallback(async () => {
     const plan = pendingTiledPlanRef.current
     if (!plan) return
-    if (isAutoGeneratingTiles || plan.generatingTileIdx !== null) return
+    if (isAutoGeneratingTiles || plan.generatingTileIdx !== null || plan.acceptingPlanTileIdx !== null) return
 
     autoGenerateTilesStopRef.current = false
     setIsAutoGeneratingTiles(true)
@@ -1474,6 +1534,7 @@ export default function Home() {
       tileReferenceImages: Array.from({ length: nonSkippedCount }, () => [] as ReferenceImage[]),
       generatingTileIdx: null,
       generatingPlanOnly: false,
+      acceptingPlanTileIdx: null,
       globalPlanningMap: null,
       globalPlanResult: null,
       globalPlanExtensionView: null,
@@ -4755,6 +4816,7 @@ export default function Home() {
             }
             isNextPending={getNextPendingTileIdx(plan.tileAccepted) === nsIdx}
             isGenerating={plan.generatingTileIdx === nsIdx}
+            isAcceptingPlan={plan.acceptingPlanTileIdx === nsIdx}
             bandCanvas={bandCanvasRef.current}
             allTileSpecs={plan.nonSkippedTileSpecs}
             tileAccepted={plan.tileAccepted}
@@ -4778,6 +4840,7 @@ export default function Home() {
             onGenerate={() => void generateTile(nsIdx)}
             onReplan={() => void generateTile(nsIdx, true)}
             onAccept={() => void acceptTile(nsIdx)}
+            onAcceptPlan={() => void acceptTilePlan(nsIdx)}
             onClose={() => setActiveTileModalIdx(null)}
             isReplanInProgress={plan.generatingTileIdx === nsIdx && plan.generatingPlanOnly}
           />
