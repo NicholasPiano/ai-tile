@@ -1903,31 +1903,24 @@ export function buildTileInput(
 }
 
 /**
- * Draw a softened planning guide into the tile blank region.
+ * Draw a planning guide into the tile blank region at full blank resolution.
  *
- * Low-res plan slices are heavily upscaled into the blank area; drawing them
- * sharp leaves visible blocks that the model copies as cartoon/8-bit output.
- * A blur proportional to the upscale factor keeps layout and colour hints
- * while removing pixel-grid structure the model should not replicate.
+ * Plan slices live at map scale (only downscaled to fit `MAX_AI_DIMENSION`).
+ * Upscale them into the blank with high-quality smoothing — no extra blur —
+ * so layout and colour from the plan are preserved for Phase 3 refine.
  */
 export function drawSoftenedPlanningGuide(
   ctx: CanvasRenderingContext2D,
   sliceImg: HTMLImageElement,
   blankRegion: { x: number; y: number; width: number; height: number },
 ): void {
-  const scale = Math.max(
-    blankRegion.width / Math.max(1, sliceImg.naturalWidth),
-    blankRegion.height / Math.max(1, sliceImg.naturalHeight),
-  )
-  const blurPx = scale > 1.25
-    ? Math.min(48, Math.max(8, Math.round(scale * 1.5)))
-    : 0
-
   const guide = document.createElement('canvas')
   guide.width = blankRegion.width
   guide.height = blankRegion.height
   const gctx = guide.getContext('2d')
   if (!gctx) {
+    ctx.imageSmoothingEnabled = true
+    ctx.imageSmoothingQuality = 'high'
     ctx.drawImage(
       sliceImg,
       0, 0, sliceImg.naturalWidth, sliceImg.naturalHeight,
@@ -1938,11 +1931,7 @@ export function drawSoftenedPlanningGuide(
 
   gctx.imageSmoothingEnabled = true
   gctx.imageSmoothingQuality = 'high'
-  if (blurPx > 0) {
-    gctx.filter = `blur(${blurPx}px)`
-  }
   gctx.drawImage(sliceImg, 0, 0, blankRegion.width, blankRegion.height)
-  gctx.filter = 'none'
 
   ctx.drawImage(guide, blankRegion.x, blankRegion.y)
 }
@@ -2002,8 +1991,10 @@ function restoreAcceptedNeighbourOverlaps(
 }
 
 /**
- * Composite a tile input image with a softened planning guide in the blank region.
- * Used by the tile modal preview; same treatment as the API composite.
+ * Composite a tile input image with a planning guide in the blank region.
+ *
+ * Used by the TileExtensionModal preview so the user sees the same plan
+ * placement that Phase 3 refine receives (high-quality upsample, no blur).
  *
  * Pass `allTileSpecs` + `tileAccepted` and a live `bandCanvas` so that
  * accepted-neighbour overlaps can be restored with high-res pixels after the
@@ -2043,7 +2034,8 @@ export function compositeTileInputWithPlanning(
  *
  * Layout:
  *   - High-res context strip from the band canvas (preserved exactly).
- *   - Softened low-res plan guide in the blank region (layout hint only).
+ *   - Low-res plan guide upscaled into the blank region (layout + colour;
+ *     only previously downscaled to fit the API dimension limit).
  *   - High-res pixels from accepted neighbour tiles restored on top of the
  *     plan guide wherever they overlap the current tile's blank region
  *     (e.g. the tile directly above in the same column).
@@ -2075,8 +2067,8 @@ export function buildTileSliceComposite(
 
     const sliceImg = new Image()
     sliceImg.onload = () => {
-      // Step 2: softened plan guide over the full blank region (overwrites
-      // any accepted-neighbour pixels that landed inside blankRegion).
+      // Step 2: plan guide over the full blank region (overwrites any
+      // accepted-neighbour pixels that landed inside blankRegion).
       drawSoftenedPlanningGuide(ctx, sliceImg, blankRegion)
 
       // Step 3: restore accepted-neighbour overlaps with high-res pixels so
@@ -3081,7 +3073,8 @@ export function cropPlanningResult(
         return
       }
       ctx.drawImage(img, x, y, width, height, 0, 0, width, height)
-      resolve(canvas.toDataURL('image/jpeg', 0.90))
+      // PNG: plan slices are composition guides — avoid JPEG round-trip loss.
+      resolve(canvas.toDataURL('image/png'))
     }
     img.onerror = () => reject(new Error('Failed to load planning result for crop'))
     img.crossOrigin = 'anonymous'

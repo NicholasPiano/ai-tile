@@ -246,27 +246,28 @@ CRITICAL: If you return ${workingImage} unchanged with the gray area still prese
       : 'right'
 
     if (hasBakedPlanning) {
-      // The extension area is pre-filled with a softened low-res composition plan.
-      // Frame the task as faithful high-resolution rendering of that plan.
-      prompt = `${multiImagePreamble}You are an expert image renderer. You have been given a ${isHorizDir ? 'vertical' : 'horizontal'} strip${hasExtras ? ' (IMAGE 1)' : ''} where the extension area contains a SOFTENED COMPOSITION PLAN — layout and colour guidance only, NOT the target look.
+      // The extension area is pre-filled with a low-res composition plan
+      // (downscaled only to fit the API dimension limit, then upscaled into
+      // the blank — no extra blur). Treat it as layout/colour guidance.
+      prompt = `${multiImagePreamble}You are an expert image renderer. You have been given a ${isHorizDir ? 'vertical' : 'horizontal'} strip${hasExtras ? ' (IMAGE 1)' : ''} where the extension area contains a LOW-RESOLUTION COMPOSITION PLAN — layout and colour guidance for what should appear there.
 
 PIXEL LAYOUT OF ${layoutLabel}:
 - ${contextSide.toUpperCase()} ${contextPx}px → HIGH-RESOLUTION existing scene content. This is your STYLE REFERENCE. Preserve these pixels EXACTLY — pixel-perfect, no changes whatsoever.
-- ${dirDesc.toUpperCase()} ${extPx}px → SOFTENED composition plan. It currently looks like you are viewing the true scene through FROSTED / FOGGED GLASS — hazy, indistinct, low detail. That frosted-glass look is a rendering artifact of the planning pass, NOT the target output. IGNORE its pixel structure. Your job is to completely remove the frosted-glass effect and reveal the sharp, fully-detailed, high-resolution continuation of the ${contextSide} strip that it is only vaguely hinting at.
+- ${dirDesc.toUpperCase()} ${extPx}px → LOW-RESOLUTION composition plan (may look soft or slightly blocky from upscaling). It defines WHERE things go and their colour masses — NOT the final pixel look. Your job is to render that composition at full native detail matching the ${contextSide} strip.
 
 YOUR TASK:
 1. Preserve EVERY pixel in the ${contextSide} ${contextPx}px high-resolution area exactly as-is — do not alter them in any way.
 2. Study the ${contextSide} high-resolution strip for rendering style: texture density, edge sharpness, colour depth, shading model, and level of realism. The extension MUST match this exactly.
-3. Render the ${dirDesc} ${extPx}px area using the plan ONLY for composition (where things go, general shapes, colour masses):
+3. Render the ${dirDesc} ${extPx}px area using the plan for composition (where things go, general shapes, colour masses):
    - Same subjects, spatial layout, and proportions as the plan.
    - Full native-resolution detail, texture, and anti-aliasing matching the ${contextSide} strip.
-   - Do NOT copy the plan's blur, blockiness, flat colours, or simplified rendering — clear away the frosted-glass haze entirely rather than sharpening it in place.
+   - Do NOT copy the plan's limited resolution, flat colours, or upscale artifacts — replace them with true high-resolution rendering.
 4. Make the boundary between the high-resolution and rendered areas completely invisible — no seam, colour shift, or brightness jump.
 
 STYLE AUTHORITY (critical):
 - The high-resolution ${contextSide} context strip is the SOLE authority for how the extension should look.
 - The plan defines WHAT to show, not HOW to render it.
-- Output must look like the same photograph, render, or artwork continued at full quality — as if captured at the same resolution as the context strip. There must be no remaining haze, softness, or frosted-glass quality anywhere in the output.
+- Output must look like the same photograph, render, or artwork continued at full quality — as if captured at the same resolution as the context strip.
 
 FORBIDDEN OUTPUTS (unless the context strip already uses that exact style):
 - Cartoon, anime, chibi, or illustration-simplified rendering
@@ -274,9 +275,8 @@ FORBIDDEN OUTPUTS (unless the context strip already uses that exact style):
 - Flat shading, posterization, banding, or limited colour palettes
 - Visible upscaled blocks, chunky pixels, or mosaic artifacts
 - Clip-art, vector-icon, or children's-book simplification
-- Any residual blur, haze, or frosted/fogged-glass softness
 
-A result that looks like an upscaled, cartoonified, blurry, or pixelated version of the plan is a FAILURE.`
+A result that looks like an upscaled, cartoonified, or pixelated version of the plan is a FAILURE.`
     } else {
       const movingDir =
         direction === 'down' ? 'downward (further below the current view)'

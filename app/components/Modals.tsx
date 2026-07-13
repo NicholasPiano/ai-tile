@@ -1261,8 +1261,9 @@ export function TileExtensionModal({
     }
   }, [open, bandCanvas, tileSpec])
 
-  // Build the tile-slice composite: INPUT with a softened planning guide in the
-  // blank region (same treatment as the API composite).
+  // Build the tile-slice composite: INPUT with a planning guide in the
+  // blank region (high-quality upsample of the map-scale plan, no blur;
+  // same treatment as the API composite).
   useEffect(() => {
     if (!inputImageUrl || !planningSlice) {
       setTileSliceUrl(null)
