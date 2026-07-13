@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { buildExtendPrompt, buildGlobalPlanningPrompt } from '@/app/lib/extendPrompt'
+import { buildExtendPrompt, buildGlobalPlanningPrompt, buildRegionalPlanningPrompt } from '@/app/lib/extendPrompt'
 import { ReferenceImage } from '@/app/lib/app'
 
 // Default model when the client doesn't specify one.
@@ -86,6 +86,10 @@ export async function POST(request: NextRequest) {
       // Three-phase fields
       phase,
       bakedPlanning,
+      // Regional-plan fields (hierarchical planning for very large scenes)
+      planScope,
+      regionIndex,
+      regionCount,
     } = await request.json() as {
       expandedCanvas: string
       direction: string
@@ -102,7 +106,7 @@ export async function POST(request: NextRequest) {
       sceneBrief?: string
       referenceImages?: ReferenceImage[]
       /**
-       * 'plan'   = global or per-tile planning pass (Phase 1 or 2).
+       * 'plan'   = global, regional, or per-tile planning pass (Phase 1 or 2).
        * 'refine' = high-res tile generation (Phase 3, default).
        */
       phase?: 'plan' | 'refine'
@@ -112,6 +116,15 @@ export async function POST(request: NextRequest) {
        * The refine prompt frames the task as high-res rendering of the preview.
        */
       bakedPlanning?: boolean
+      /**
+       * 'region' = this 'plan' call is one region of a regionally-planned
+       * extension (see groupTilesIntoPlanRegions); switches the prompt to
+       * buildRegionalPlanningPrompt. Undefined/other = existing whole-scene
+       * or per-tile re-plan behaviour via buildGlobalPlanningPrompt.
+       */
+      planScope?: 'region'
+      regionIndex?: number
+      regionCount?: number
     }
 
     if (!expandedCanvas || !direction || !extensionAmount) {
@@ -139,9 +152,21 @@ export async function POST(request: NextRequest) {
 
     // ── Build prompt ─────────────────────────────────────────────────────────
     let prompt: string
-    if (phase === 'plan') {
-      // Phase 1 (global plan) or Phase 2 (per-tile re-plan) — both use the
-      // global planning prompt which describes: fill grey, preserve everything else.
+    if (phase === 'plan' && planScope === 'region') {
+      // Regional plan — one slice of a regionally-planned very-large extension.
+      prompt = buildRegionalPlanningPrompt({
+        direction: direction as 'up' | 'down' | 'left' | 'right',
+        regionIndex: typeof regionIndex === 'number' ? regionIndex : 0,
+        regionCount: typeof regionCount === 'number' ? regionCount : 1,
+        customPrompt: customPrompt ?? null,
+        artStyle: artStyle ?? null,
+        sceneBrief: sceneBrief ?? null,
+        referenceImages: referenceImages?.map((r) => ({ description: r.description })),
+      })
+    } else if (phase === 'plan') {
+      // Phase 1 (whole-scene global plan) or Phase 2 (per-tile re-plan) —
+      // both use the global planning prompt which describes: fill grey,
+      // preserve everything else.
       prompt = buildGlobalPlanningPrompt({
         direction: direction as 'up' | 'down' | 'left' | 'right',
         customPrompt: customPrompt ?? null,

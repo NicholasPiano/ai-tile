@@ -1,5 +1,6 @@
 'use client'
 
+import { useState } from 'react'
 import { Icons } from '@/app/components/icons'
 import { StatusPill } from '@/app/components/TopBar'
 import { Direction } from '@/app/lib/app'
@@ -20,6 +21,21 @@ export interface TileCellDisplay {
   isSkipped: boolean
   /** -1 when isSkipped, otherwise index into tilePreviews. */
   nonSkippedIndex: number
+}
+
+/** Minimal per-cell data the inline region-layer overlay needs. */
+export interface RegionCellDisplay {
+  index: number
+  bandX: number
+  bandY: number
+  width: number
+  height: number
+  /** True once this region has a generated plan result. */
+  hasResult: boolean
+  /** True while this specific region's plan call is in flight. */
+  isGenerating: boolean
+  /** True if at least one of this region's owned tiles is now stale. */
+  hasStaleTiles: boolean
 }
 
 export interface TilingState {
@@ -49,6 +65,14 @@ export interface TilingState {
   globalPlanExtensionView?: string | null
   /** True while Phase 1 (global plan) is being generated. */
   isGlobalPlanGenerating?: boolean
+  /**
+   * Region-layer cells for a regionally-planned (very large) extension.
+   * Undefined/empty when the extension uses a single whole-scene plan —
+   * the region layer toggle only appears when this is non-empty.
+   */
+  regions?: RegionCellDisplay[]
+  /** Per-tile "stale" flags — owning region was regenerated after this tile had a result. */
+  staleTileIds?: Set<number>
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -77,9 +101,9 @@ function extensionViewport(state: TilingState): ExtensionViewport {
   }
 }
 
-/** Map a tile's intersection with the extension viewport to band-UI percentages. */
-function tileExtensionLayout(
-  cell: TileCellDisplay,
+/** Map a band-coordinate rect's intersection with the extension viewport to band-UI percentages. */
+function rectExtensionLayout(
+  rect: { bandX: number; bandY: number; width: number; height: number },
   viewport: ExtensionViewport,
 ): {
   leftPct: number
@@ -91,17 +115,17 @@ function tileExtensionLayout(
   imgHeightFrac: number
   imgWidthFrac: number
 } | null {
-  const tileLeft = cell.bandX
-  const tileTop = cell.bandY
-  const tileRight = cell.bandX + cell.tileWidth
-  const tileBottom = cell.bandY + cell.tileHeight
+  const rectLeft = rect.bandX
+  const rectTop = rect.bandY
+  const rectRight = rect.bandX + rect.width
+  const rectBottom = rect.bandY + rect.height
   const extRight = viewport.originX + viewport.width
   const extBottom = viewport.originY + viewport.height
 
-  const visLeft = Math.max(tileLeft, viewport.originX)
-  const visTop = Math.max(tileTop, viewport.originY)
-  const visRight = Math.min(tileRight, extRight)
-  const visBottom = Math.min(tileBottom, extBottom)
+  const visLeft = Math.max(rectLeft, viewport.originX)
+  const visTop = Math.max(rectTop, viewport.originY)
+  const visRight = Math.min(rectRight, extRight)
+  const visBottom = Math.min(rectBottom, extBottom)
   const visibleW = visRight - visLeft
   const visibleH = visBottom - visTop
 
@@ -109,8 +133,8 @@ function tileExtensionLayout(
     return null
   }
 
-  const clipLeft = visLeft - tileLeft
-  const clipTop = visTop - tileTop
+  const clipLeft = visLeft - rectLeft
+  const clipTop = visTop - rectTop
 
   return {
     leftPct: ((visLeft - viewport.originX) / viewport.width) * 100,
@@ -119,17 +143,33 @@ function tileExtensionLayout(
     heightPct: (visibleH / viewport.height) * 100,
     imgLeftFrac: -(clipLeft / visibleW),
     imgTopFrac: -(clipTop / visibleH),
-    imgWidthFrac: cell.tileWidth / visibleW,
-    imgHeightFrac: cell.tileHeight / visibleH,
+    imgWidthFrac: rect.width / visibleW,
+    imgHeightFrac: rect.height / visibleH,
   }
+}
+
+/** Map a tile's intersection with the extension viewport to band-UI percentages. */
+function tileExtensionLayout(
+  cell: TileCellDisplay,
+  viewport: ExtensionViewport,
+) {
+  return rectExtensionLayout(
+    { bandX: cell.bandX, bandY: cell.bandY, width: cell.tileWidth, height: cell.tileHeight },
+    viewport,
+  )
 }
 
 function TilingBand({
   state,
   onTileClick,
+  onRegionClick,
+  activeLayer,
 }: {
   state: TilingState
   onTileClick: (nsIdx: number) => void
+  onRegionClick?: (regionIdx: number) => void
+  /** Which grid is bold/interactive; the other renders faint/dashed. */
+  activeLayer: 'tiles' | 'regions'
 }) {
   const {
     direction,
@@ -140,10 +180,15 @@ function TilingBand({
     generatingTileIdx,
     nextPendingTileIdx,
     globalPlanExtensionView,
+    regions,
+    staleTileIds,
   } = state
 
   const isVertical = direction === 'down' || direction === 'up'
   const viewport = extensionViewport(state)
+  const hasRegions = !!regions && regions.length > 0
+  const tilesActive = !hasRegions || activeLayer === 'tiles'
+  const regionsActive = hasRegions && activeLayer === 'regions'
 
   // Round only the outer edges of the band (the shared edge with the image is flat)
   const bandRound =
@@ -203,6 +248,7 @@ function TilingBand({
           const isGenerating = ns === generatingTileIdx
           const isNext = ns === nextPendingTileIdx
           const hasPreview = preview !== null
+          const isStale = ns >= 0 && !!staleTileIds?.has(ns)
 
           const layout = tileExtensionLayout(cell, viewport)
           if (!layout) {
@@ -234,10 +280,10 @@ function TilingBand({
             <div
               key={`t${ns}`}
               role="button"
-              tabIndex={0}
-              onClick={() => onTileClick(ns)}
-              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onTileClick(ns) }}
-              className={!hasPreview && !isGenerating ? 'animate-pulse' : ''}
+              tabIndex={tilesActive ? 0 : -1}
+              onClick={() => { if (tilesActive) onTileClick(ns) }}
+              onKeyDown={(e) => { if (tilesActive && (e.key === 'Enter' || e.key === ' ')) onTileClick(ns) }}
+              className={!hasPreview && !isGenerating && tilesActive ? 'animate-pulse' : ''}
               style={{
                 position: 'absolute',
                 left: `${leftPct}%`,
@@ -245,14 +291,16 @@ function TilingBand({
                 width: `${widthPct}%`,
                 height: `${heightPct}%`,
                 boxSizing: 'border-box',
-                cursor: 'pointer',
+                cursor: tilesActive ? 'pointer' : 'default',
+                opacity: tilesActive ? 1 : 0.35,
+                pointerEvents: tilesActive ? 'auto' : 'none',
                 backgroundColor: isGenerating
                   ? 'rgba(80,80,130,0.45)'
                   : 'rgba(18,18,28,0.65)',
                 border: `1px ${hasPreview ? 'solid' : 'dashed'} ${borderColor}`,
-                boxShadow: isNext && !isAccepted ? '0 0 0 2px var(--accent)' : 'none',
+                boxShadow: tilesActive && isNext && !isAccepted ? '0 0 0 2px var(--accent)' : 'none',
                 overflow: 'hidden',
-                transition: 'box-shadow 0.2s, border-color 0.2s',
+                transition: 'box-shadow 0.2s, border-color 0.2s, opacity 0.2s',
               }}
             >
               {/* Preview image — offset so only the extension portion shows */}
@@ -287,6 +335,17 @@ function TilingBand({
                 </div>
               )}
 
+              {/* Stale badge — owning region was regenerated after this tile had a result */}
+              {isStale && (
+                <div
+                  className="absolute top-1 left-1 rounded-full px-1.5 py-0.5 text-[8px] font-semibold uppercase tracking-wide"
+                  style={{ background: 'rgba(230,160,20,0.9)', color: '#1a1404', pointerEvents: 'none' }}
+                  title="This tile's plan changed — regenerate to catch up"
+                >
+                  Stale
+                </div>
+              )}
+
               {/* Generating spinner */}
               {isGenerating && !hasPreview && (
                 <div className="absolute inset-0 flex items-center justify-center">
@@ -296,6 +355,57 @@ function TilingBand({
             </div>
           )
         })}
+
+      {/* Region layer overlay — faint/dashed context when tiles are active,
+          bold and clickable when the user has switched to the region layer. */}
+      {hasRegions && regions!.map((region) => {
+        const layout = rectExtensionLayout(
+          { bandX: region.bandX, bandY: region.bandY, width: region.width, height: region.height },
+          viewport,
+        )
+        if (!layout) return null
+        const { leftPct, topPct, widthPct, heightPct } = layout
+
+        const borderColor = region.isGenerating
+          ? 'rgba(120,120,255,0.8)'
+          : region.hasStaleTiles
+          ? 'rgba(230,160,20,0.9)'
+          : region.hasResult
+          ? 'var(--accent)'
+          : 'rgba(255,255,255,0.5)'
+
+        return (
+          <div
+            key={`r${region.index}`}
+            role="button"
+            tabIndex={regionsActive ? 0 : -1}
+            onClick={() => { if (regionsActive) onRegionClick?.(region.index) }}
+            onKeyDown={(e) => {
+              if (regionsActive && (e.key === 'Enter' || e.key === ' ')) onRegionClick?.(region.index)
+            }}
+            style={{
+              position: 'absolute',
+              left: `${leftPct}%`,
+              top: `${topPct}%`,
+              width: `${widthPct}%`,
+              height: `${heightPct}%`,
+              boxSizing: 'border-box',
+              cursor: regionsActive ? 'pointer' : 'default',
+              pointerEvents: regionsActive ? 'auto' : 'none',
+              border: `2px ${region.hasResult ? 'solid' : 'dashed'} ${borderColor}`,
+              opacity: regionsActive ? 1 : 0.4,
+              transition: 'opacity 0.2s, border-color 0.2s',
+            }}
+          >
+            <div
+              className="absolute top-1 left-1 flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[9px] font-semibold"
+              style={{ background: 'rgba(18,18,28,0.75)', color: 'var(--text-secondary)', pointerEvents: 'none' }}
+            >
+              {region.isGenerating ? <Icons.Spinner size={9} /> : `R${region.index + 1}`}
+            </div>
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -314,6 +424,10 @@ function TilingEdgeControl({
   isAutoGenerating,
   onStopAutoGenerate,
   canGenerateAll,
+  hasRegions,
+  activeLayer,
+  onLayerChange,
+  regionCount,
 }: {
   direction: Direction
   onCancel: () => void
@@ -327,6 +441,11 @@ function TilingEdgeControl({
   onStopAutoGenerate?: () => void
   /** Whether at least one tile is still left to generate. */
   canGenerateAll?: boolean
+  /** True for a regionally-planned (very large) extension — shows the layer toggle. */
+  hasRegions?: boolean
+  activeLayer?: 'tiles' | 'regions'
+  onLayerChange?: (layer: 'tiles' | 'regions') => void
+  regionCount?: number
 }) {
   const position: React.CSSProperties = (
     {
@@ -358,6 +477,30 @@ function TilingEdgeControl({
       className="absolute z-10 flex items-center gap-1.5 whitespace-nowrap"
       style={position}
     >
+      {/* Layer toggle — only shown for regionally-planned (very large) extensions,
+          so it's always visually unambiguous which grid a click will hit. */}
+      {hasRegions && onLayerChange && (
+        <div
+          className="flex items-center rounded-full p-0.5"
+          style={{ background: 'var(--bg-elev)', border: '1px solid var(--border-strong)', boxShadow: '0 2px 8px rgba(0,0,0,0.45)' }}
+        >
+          {(['regions', 'tiles'] as const).map((layer) => (
+            <button
+              key={layer}
+              onClick={() => onLayerChange(layer)}
+              title={layer === 'regions' ? `${regionCount ?? 0} region${regionCount === 1 ? '' : 's'}` : 'Tiles'}
+              className="rounded-full px-2.5 py-1 text-[11px] font-medium transition-colors"
+              style={{
+                background: activeLayer === layer ? 'var(--accent)' : 'transparent',
+                color: activeLayer === layer ? '#1a1404' : 'var(--text-secondary)',
+              }}
+            >
+              {layer === 'regions' ? `Regions${typeof regionCount === 'number' ? ` (${regionCount})` : ''}` : 'Tiles'}
+            </button>
+          ))}
+        </div>
+      )}
+
       {/* Re-run global plan — only shown when the callback is provided */}
       {onRerunGlobalPlan && (
         <button
@@ -500,6 +643,7 @@ export function Workspace({
   resultActions,
   tilingState,
   onTileClick,
+  onRegionClick,
   onTileCancel,
   onRerunGlobalPlan,
   onGenerateAllTiles,
@@ -525,6 +669,8 @@ export function Workspace({
   tilingState?: TilingState | null
   /** Called when the user clicks a non-skipped tile cell in the band. */
   onTileClick?: (nsIdx: number) => void
+  /** Called when the user clicks a region cell in the region layer. */
+  onRegionClick?: (regionIdx: number) => void
   onTileCancel?: () => void
   /** Re-run Phase 1 (global plan) for the entire extension. */
   onRerunGlobalPlan?: () => void
@@ -536,6 +682,11 @@ export function Workspace({
   onStopAutoGenerateTiles?: () => void
 }) {
   const isTiling = !!tilingState
+  const hasRegions = !!tilingState?.regions && tilingState.regions.length > 0
+  /** Which grid is bold/interactive. Defaults to tiles — the region layer is
+   * an opt-in view; tiles auto-trigger their owning region's plan on demand
+   * either way, so a user who never opens the region layer sees no difference. */
+  const [activeLayer, setActiveLayer] = useState<'tiles' | 'regions'>('tiles')
 
   // ── Layout helpers when tiling ──────────────────────────────────────────────
   const flexDir: React.CSSProperties['flexDirection'] =
@@ -654,6 +805,8 @@ export function Workspace({
             onTileClick={
               isAutoGeneratingTiles ? () => undefined : onTileClick ?? (() => undefined)
             }
+            onRegionClick={onRegionClick}
+            activeLayer={hasRegions ? activeLayer : 'tiles'}
           />
         )}
 
@@ -670,6 +823,10 @@ export function Workspace({
               isAutoGenerating={isAutoGeneratingTiles}
               onStopAutoGenerate={onStopAutoGenerateTiles}
               canGenerateAll={tilingState.nextPendingTileIdx !== null}
+              hasRegions={hasRegions}
+              activeLayer={activeLayer}
+              onLayerChange={setActiveLayer}
+              regionCount={tilingState.regions?.length}
             />
           )
           : !isResult && (

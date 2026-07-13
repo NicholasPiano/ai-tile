@@ -63,10 +63,56 @@ export const TILE_OVERLAP_PX = 384
 export const MAX_TILES_PER_EXTEND = 36
 
 /**
- * Longest edge of the global/per-tile planning map sent to Phase 1/2.
- * Higher values preserve more detail in the plan but cost more tokens.
+ * Longest edge of every plan-level image (global plan, regional plans,
+ * per-tile re-plans). Reuses the same ceiling the AI API accepts for a
+ * single call (`MAX_AI_DIMENSION`) — there is no cost or API reason to send
+ * a smaller image than the model can accept, so plans get the full budget.
+ * (A separate, smaller `PLANNING_MAP_MAX_DIM` constant used to cap this at
+ * 1024px; it has been retired in favour of `MAX_AI_DIMENSION`.)
  */
-export const PLANNING_MAP_MAX_DIM = 1024
+
+/**
+ * Multiplier applied to `MAX_AI_DIMENSION` to decide when a single whole-scene
+ * plan is too compressed to be useful and the extension should instead be
+ * planned as multiple overlapping regional plans (see `groupTilesIntoPlanRegions`
+ * in imageProcessor.ts). E.g. with a multiplier of 2, a scene whose longest
+ * edge exceeds 3072px (2 × 1536) switches to regional planning.
+ */
+export const REGIONAL_PLAN_TRIGGER_MULTIPLIER = 2
+
+/**
+ * Target maximum scene-space span (in source-image pixels, before scaling)
+ * that a single regional plan should cover per axis. Regions are grouped from
+ * the tile grid so each region's bounding rect stays under this before being
+ * scaled to `MAX_AI_DIMENSION` — smaller regions of a huge scene render with
+ * far less compression than a single whole-scene plan would.
+ *
+ * Deliberately biased toward fewer, larger (more downscaled/blurry) regions
+ * rather than more, sharper ones: a regional plan's whole job is coherence —
+ * getting the broad composition right so Phase 3 tile refine has something
+ * sensible to sharpen — not fine detail, so it's fine for it to be blurry.
+ * Fewer regions means fewer plan-to-plan seams to keep consistent.
+ */
+export const PLAN_REGION_MAX_SCENE_DIM = 8192
+
+/**
+ * Number of tiles shared between two adjacent regions. The shared tiles'
+ * content is decided once (by the earlier region) and carried forward as
+ * real, already-decided pixels into the later region's input — the same
+ * overlap/continuity trick tiles already use with `TILE_OVERLAP_PX`, applied
+ * one level up between regions. A larger overlap gives the model more real
+ * (already-decided) pixels to anchor each region's continuation against,
+ * trading a bit more per-region compression for much better plan-to-plan
+ * coherence.
+ */
+export const PLAN_REGION_OVERLAP_TILES = 3
+
+/**
+ * Hard cap on the number of regional plan calls per extension, guarding
+ * against runaway cost on pathological image sizes — mirrors
+ * `MAX_TILES_PER_EXTEND` above.
+ */
+export const MAX_PLAN_REGIONS = 24
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OpenRouter integration — BYOK (bring your own key) for open-source friendliness

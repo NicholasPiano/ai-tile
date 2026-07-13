@@ -3,10 +3,20 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { Icons } from '@/app/components/icons'
 import { ART_STYLE_GROUPS } from '@/app/lib/artStyles'
-import { buildExtendPrompt, buildGlobalPlanningPrompt } from '@/app/lib/extendPrompt'
-import { buildTileChunkInfo, buildTileInput, compositeTileInputWithPlanning, ExtensionTileSpec } from '@/app/utils/imageProcessor'
+import { buildExtendPrompt, buildGlobalPlanningPrompt, buildRegionalPlanningPrompt } from '@/app/lib/extendPrompt'
+import {
+  buildRegionalPlanningMap,
+  buildTileChunkInfo,
+  buildTileInput,
+  compositeTileInputWithPlanning,
+  computeRegionMapLayout,
+  ExtensionTileSpec,
+  PlanRegionGrouping,
+  PlanRegionSpec,
+  PriorRegionResult,
+} from '@/app/utils/imageProcessor'
 import { MODELS, maskKey } from '@/app/lib/models'
-import { Direction, ReferenceImage } from '@/app/lib/app'
+import { Direction, MAX_AI_DIMENSION, ReferenceImage } from '@/app/lib/app'
 
 export function SettingsDrawer({
   open,
@@ -216,6 +226,26 @@ export function SettingsDrawer({
               into full-resolution overlapping tiles generated sequentially, so
               each tile sees its already-painted neighbours as context. Tiled
               extensions produce a single result (no 3-variant selection).
+            </p>
+            <p
+              className="mt-3 text-[12px] leading-relaxed"
+              style={{ color: 'var(--text-secondary)' }}
+            >
+              <strong>Region layer</strong> appears for very large tiled
+              extensions (band or scene span more than 2× the API's 1 536 px
+              limit). The tile grid is grouped into a handful of regions,
+              each planned independently at full 1 536 px resolution — far
+              sharper than one whole-scene plan could be. Use the
+              Regions / Tiles toggle above the extension band to switch
+              layers; each region has its own prompt override, reference
+              images, and independent Regenerate action, just like tiles.
+              Regenerating a region does not auto-regenerate its tiles — any
+              tile already generated from an old region plan is flagged
+              &ldquo;Plan changed — stale&rdquo; until you regenerate it. Each
+              region's input is roughly half real, deeply-cropped original
+              image (however blurry once downscaled) and half new area to
+              fill, so the model always has substantial real content to
+              anchor the extension against.
             </p>
             <p
               className="mt-3 text-[11px]"
@@ -1165,6 +1195,12 @@ export interface TileExtensionModalProps {
   onClose: () => void
   /** True when the in-flight generation for this tile is a Phase 2 re-plan. */
   isReplanInProgress: boolean
+  /** Set only in regional-plan mode: this tile's owning region, for the breadcrumb + jump link. */
+  owningRegion?: { index: number; count: number } | null
+  /** Opens the owning region's RegionPlanModal (closes this modal). Only used when owningRegion is set. */
+  onJumpToRegion?: () => void
+  /** True if this tile's owning region was regenerated after this tile got a result — stale badge. */
+  isStale?: boolean
 }
 
 export function TileExtensionModal({
@@ -1195,6 +1231,9 @@ export function TileExtensionModal({
   onAcceptPlan,
   onClose,
   isReplanInProgress,
+  owningRegion,
+  onJumpToRegion,
+  isStale,
 }: TileExtensionModalProps) {
   const [inputImageUrl, setInputImageUrl] = useState<string | null>(null)
   const [resultDimensions, setResultDimensions] = useState<{ width: number; height: number } | null>(null)
@@ -1359,6 +1398,30 @@ export function TileExtensionModal({
                 >
                   Awaiting prior tile
                 </span>
+              )}
+              {isStale && (
+                <span
+                  className="rounded-full px-2 py-0.5 text-[11px] font-medium"
+                  style={{
+                    background: 'rgba(230,160,50,0.18)',
+                    color: 'var(--warning, #e6a032)',
+                    border: '1px solid rgba(230,160,50,0.4)',
+                  }}
+                  title="This tile's owning region was regenerated since — regenerate this tile to catch up"
+                >
+                  Plan changed — stale
+                </span>
+              )}
+              {owningRegion && (
+                <button
+                  onClick={onJumpToRegion}
+                  disabled={isBusy}
+                  className="text-[11px] underline"
+                  style={{ color: 'var(--text-muted)' }}
+                  title="Open this tile's owning region plan"
+                >
+                  Region {owningRegion.index + 1} of {owningRegion.count} ↗
+                </button>
               )}
             </div>
             {!isBusy && (
@@ -1810,6 +1873,596 @@ export function TileExtensionModal({
                   → Accept
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RegionPlanModal — per-region prompt / reference images / result view.
+// Sibling of TileExtensionModal for the coarser "region" layer that sits
+// between the macro thumbnail and the tile grid in very large extensions.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Summary of one tile owned by a region, for the "owned tiles" list. */
+export interface RegionOwnedTileInfo {
+  nsIdx: number
+  row: number
+  col: number
+  isStale: boolean
+  hasResult: boolean
+  isAccepted: boolean
+}
+
+export interface RegionPlanModalProps {
+  open: boolean
+  regionIdx: number
+  regionCount: number
+  region: PlanRegionSpec
+  direction: Direction
+  /** Per-region prompt override (may be empty = use global). */
+  regionPrompt: string
+  globalPrompt: string
+  artStyle: string
+  sceneBrief?: string
+  /**
+   * Last plan input map actually SENT to the API for this region (grey area +
+   * carried-forward context), from the most recent successful generation.
+   * Used as an immediate fallback while the live preview (below) rebuilds,
+   * and as the only source before this region has ever been generated —
+   * hence the live preview is what makes the original-image overlap show up
+   * even on a region that's never been sent to the API yet.
+   */
+  planningMap: string | null
+  /** Band canvas (source context strip + extension) — needed to live-preview this region's input, including its overlap with the real original image. */
+  bandCanvas: HTMLCanvasElement | null
+  /** Original, full-resolution source image — needed to pull the deep "half real image" context block into the live preview. */
+  sourceImage: string
+  imageWidth: number
+  imageHeight: number
+  contextSize: number
+  extensionSize: number
+  regionGrouping: PlanRegionGrouping
+  nonSkippedTileSpecs: ExtensionTileSpec[]
+  tileAccepted: boolean[]
+  /** Other regions' latest results, needed to carry forward shared-overlap-tile continuity into this region's live preview. */
+  regionResults: (string | null)[]
+  regionScales: number[]
+  /** Latest filled-in plan result for this region, or null if not yet generated. */
+  result: string | null
+  isGenerating: boolean
+  regionReferenceImages: ReferenceImage[]
+  /** Tiles owned by this region, in scan order. */
+  ownedTiles: RegionOwnedTileInfo[]
+  onSetRegionPrompt: (v: string) => void
+  onSetRegionReferenceImages: (v: ReferenceImage[]) => void
+  onRegenerate: () => void
+  onClose: () => void
+  /** Open the given tile's TileExtensionModal (closes this modal). */
+  onJumpToTile: (nsIdx: number) => void
+}
+
+export function RegionPlanModal({
+  open,
+  regionIdx,
+  regionCount,
+  region,
+  direction,
+  regionPrompt,
+  globalPrompt,
+  artStyle,
+  sceneBrief,
+  planningMap,
+  bandCanvas,
+  sourceImage,
+  imageWidth,
+  imageHeight,
+  contextSize,
+  extensionSize,
+  regionGrouping,
+  nonSkippedTileSpecs,
+  tileAccepted,
+  regionResults,
+  regionScales,
+  result,
+  isGenerating,
+  regionReferenceImages,
+  ownedTiles,
+  onSetRegionPrompt,
+  onSetRegionReferenceImages,
+  onRegenerate,
+  onClose,
+  onJumpToTile,
+}: RegionPlanModalProps) {
+  const [resultDimensions, setResultDimensions] = useState<{ width: number; height: number } | null>(null)
+  const refImageFileInputRefs = useRef<(HTMLInputElement | null)[]>([])
+  /**
+   * Live client-side preview of this region's plan input — built the same
+   * way generateRegionPlan() builds the real one, but computed eagerly on
+   * open/change instead of only after a successful API round-trip. Without
+   * this, a region that has never been generated yet shows no overlap with
+   * the original image at all (planningMap stays null until first success).
+   */
+  const [liveInputUrl, setLiveInputUrl] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!open || !bandCanvas) {
+      setLiveInputUrl(null)
+      return
+    }
+    let cancelled = false
+    const priorRegionResults: Array<PriorRegionResult | null> = regionGrouping.regions.map((r, i) =>
+      regionResults[i]
+        ? { resultUrl: regionResults[i] as string, scale: regionScales[i], bandRect: r.bandRect }
+        : null
+    )
+    buildRegionalPlanningMap(
+      bandCanvas,
+      nonSkippedTileSpecs,
+      tileAccepted,
+      regionGrouping,
+      region,
+      priorRegionResults,
+      MAX_AI_DIMENSION,
+      { sourceImageDataUrl: sourceImage, direction, imageWidth, imageHeight, contextSize, extensionSize },
+    )
+      .then(({ mapDataUrl }) => { if (!cancelled) setLiveInputUrl(mapDataUrl) })
+      .catch(() => { if (!cancelled) setLiveInputUrl(null) })
+    return () => { cancelled = true }
+  }, [open, bandCanvas, sourceImage, direction, imageWidth, imageHeight, contextSize, extensionSize, regionGrouping, region, nonSkippedTileSpecs, tileAccepted, regionResults, regionScales])
+
+  useEffect(() => {
+    if (!result) {
+      setResultDimensions(null)
+      return
+    }
+    const img = new Image()
+    img.onload = () => setResultDimensions({ width: img.naturalWidth, height: img.naturalHeight })
+    img.onerror = () => setResultDimensions(null)
+    img.src = result
+  }, [result])
+
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !isGenerating) onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, isGenerating, onClose])
+
+  if (!open) return null
+
+  // Prefer the live-rebuilt preview (always reflects the current band canvas
+  // and any newly-carried-forward neighbour context); fall back to the last
+  // map actually sent to the API while the live one is still (re)computing.
+  const regionInputSrc = liveInputUrl ?? planningMap
+
+  const populatedRefs = regionReferenceImages.filter((r) => r.dataUrl.length > 0)
+  const effectivePrompt = regionPrompt.trim() || globalPrompt.trim() || undefined
+  const assembledPrompt = buildRegionalPlanningPrompt({
+    direction,
+    regionIndex: regionIdx,
+    regionCount,
+    customPrompt: effectivePrompt ?? null,
+    artStyle: artStyle !== 'none' ? artStyle : null,
+    sceneBrief: sceneBrief ?? null,
+    referenceImages: populatedRefs.map((r) => ({ description: r.description })),
+  })
+
+  const hasResult = result !== null
+  const staleCount = ownedTiles.filter((t) => t.isStale).length
+  const dirArrow: Record<string, string> = { up: '↑', down: '↓', left: '←', right: '→' }
+  // The map's actual pixel dimensions include the deep original-image
+  // context block (see RegionMapLayout in imageProcessor.ts), which is NOT
+  // the same aspect ratio as region.bandRect alone — using bandRect here
+  // would letterbox the preview with blank space on either side.
+  const regionLayout = computeRegionMapLayout(
+    { direction, imageWidth, imageHeight, contextSize, extensionSize },
+    region.bandRect,
+    MAX_AI_DIMENSION,
+  )
+  const regionAR = `${regionLayout.mapWidth} / ${regionLayout.mapHeight}`
+
+  return (
+    <>
+      {/* Backdrop */}
+      <div
+        className="fixed inset-0 z-50 anim-fade"
+        style={{ background: 'rgba(0,0,0,0.72)' }}
+        onClick={() => { if (!isGenerating) onClose() }}
+      />
+
+      {/* Panel */}
+      <div className="fixed inset-0 z-50 flex items-center justify-center p-4 pointer-events-none">
+        <div
+          className="pointer-events-auto flex w-full max-w-[700px] flex-col anim-slide-up rounded-[var(--radius)]"
+          style={{
+            background: 'var(--bg-elev)',
+            border: '1px solid var(--border-strong)',
+            maxHeight: '90vh',
+            overflowY: 'auto',
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* ── Header ──────────────────────────────────────────────── */}
+          <div
+            className="flex h-12 shrink-0 items-center justify-between border-b px-5"
+            style={{ borderColor: 'var(--border)' }}
+          >
+            <div className="flex items-center gap-2">
+              <span className="text-[13px] font-semibold">
+                Region {regionIdx + 1} / {regionCount}
+              </span>
+              <span className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
+                {dirArrow[direction]} {direction}
+                {' · '}
+                {region.bandRect.width}×{region.bandRect.height}
+                {' · '}
+                {ownedTiles.length} tile{ownedTiles.length === 1 ? '' : 's'}
+              </span>
+              {staleCount > 0 && (
+                <span
+                  className="rounded-full px-2 py-0.5 text-[11px] font-medium"
+                  style={{
+                    background: 'rgba(230,160,50,0.18)',
+                    color: 'var(--warning, #e6a032)',
+                    border: '1px solid rgba(230,160,50,0.4)',
+                  }}
+                >
+                  {staleCount} tile{staleCount === 1 ? '' : 's'} stale
+                </span>
+              )}
+            </div>
+            {!isGenerating && (
+              <button onClick={onClose} className="icon-btn" aria-label="Close">
+                <Icons.X size={14} />
+              </button>
+            )}
+          </div>
+
+          {/* ── Body ────────────────────────────────────────────────── */}
+          <div className="flex flex-col gap-5 px-5 pt-5 pb-6">
+
+            {/* Prompt override */}
+            <div>
+              <p
+                className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                Prompt override
+              </p>
+              <input
+                type="text"
+                value={regionPrompt}
+                onChange={(e) => onSetRegionPrompt(e.target.value)}
+                placeholder={
+                  globalPrompt.trim()
+                    ? `Using global: "${globalPrompt.trim().slice(0, 60)}"`
+                    : 'Leave blank — natural scene continuation'
+                }
+                disabled={isGenerating}
+                className="w-full rounded-[var(--radius-sm)] px-3 py-2 text-[12px]"
+                style={{
+                  background: 'var(--surface)',
+                  border: '1px solid var(--border)',
+                  color: 'var(--text)',
+                  outline: 'none',
+                  opacity: isGenerating ? 0.6 : 1,
+                }}
+              />
+            </div>
+
+            {/* Reference images */}
+            <div>
+              <p
+                className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                Reference Images
+              </p>
+
+              {regionReferenceImages.length > 0 && (
+                <div className="flex flex-col gap-2 mb-2">
+                  {regionReferenceImages.map((ref, rowIdx) => (
+                    <div key={rowIdx} className="flex items-center gap-2">
+                      <input
+                        ref={(el) => { refImageFileInputRefs.current[rowIdx] = el }}
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0]
+                          if (!file) return
+                          const reader = new FileReader()
+                          reader.onload = (ev) => {
+                            const dataUrl = ev.target?.result
+                            if (typeof dataUrl !== 'string') return
+                            const next = regionReferenceImages.map((r, i) =>
+                              i === rowIdx ? { ...r, dataUrl } : r
+                            )
+                            onSetRegionReferenceImages(next)
+                          }
+                          reader.readAsDataURL(file)
+                          e.target.value = ''
+                        }}
+                      />
+
+                      <div
+                        className="shrink-0 relative overflow-hidden rounded-[var(--radius-sm)] cursor-pointer"
+                        style={{
+                          width: 64,
+                          height: 64,
+                          border: ref.dataUrl
+                            ? '1px solid var(--border-strong)'
+                            : '1.5px dashed var(--border)',
+                          background: 'var(--surface)',
+                          opacity: isGenerating ? 0.6 : 1,
+                        }}
+                        onClick={() => {
+                          if (!isGenerating) refImageFileInputRefs.current[rowIdx]?.click()
+                        }}
+                        onDragOver={(e) => e.preventDefault()}
+                        onDrop={(e) => {
+                          if (isGenerating) return
+                          e.preventDefault()
+                          const file = e.dataTransfer.files[0]
+                          if (!file || !file.type.startsWith('image/')) return
+                          const reader = new FileReader()
+                          reader.onload = (ev) => {
+                            const dataUrl = ev.target?.result
+                            if (typeof dataUrl !== 'string') return
+                            const next = regionReferenceImages.map((r, i) =>
+                              i === rowIdx ? { ...r, dataUrl } : r
+                            )
+                            onSetRegionReferenceImages(next)
+                          }
+                          reader.readAsDataURL(file)
+                        }}
+                        title={ref.dataUrl ? 'Click to replace image' : 'Click or drop an image'}
+                      >
+                        {ref.dataUrl ? (
+                          <img
+                            src={ref.dataUrl}
+                            alt={`Reference ${rowIdx + 1}`}
+                            className="w-full h-full object-cover block"
+                            draggable={false}
+                          />
+                        ) : (
+                          <div
+                            className="absolute inset-0 flex items-center justify-center"
+                            style={{ color: 'var(--text-muted)' }}
+                          >
+                            <Icons.Image size={20} />
+                          </div>
+                        )}
+                      </div>
+
+                      <input
+                        type="text"
+                        value={ref.description}
+                        placeholder="Describe this reference (optional)"
+                        disabled={isGenerating}
+                        className="flex-1 rounded-[var(--radius-sm)] px-3 py-2 text-[12px]"
+                        style={{
+                          background: 'var(--surface)',
+                          border: '1px solid var(--border)',
+                          color: 'var(--text)',
+                          outline: 'none',
+                          opacity: isGenerating ? 0.6 : 1,
+                        }}
+                        onChange={(e) => {
+                          const next = regionReferenceImages.map((r, i) =>
+                            i === rowIdx ? { ...r, description: e.target.value } : r
+                          )
+                          onSetRegionReferenceImages(next)
+                        }}
+                      />
+
+                      <button
+                        onClick={() => {
+                          onSetRegionReferenceImages(
+                            regionReferenceImages.filter((_, i) => i !== rowIdx)
+                          )
+                        }}
+                        disabled={isGenerating}
+                        className="icon-btn shrink-0"
+                        aria-label="Remove reference image"
+                        title="Remove"
+                      >
+                        <Icons.X size={13} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <button
+                onClick={() => {
+                  onSetRegionReferenceImages([
+                    ...regionReferenceImages,
+                    { dataUrl: '', description: '' },
+                  ])
+                }}
+                disabled={isGenerating}
+                className="w-full btn btn-ghost text-[12px]"
+                style={{ opacity: isGenerating ? 0.6 : 1 }}
+              >
+                + Add reference image
+              </button>
+            </div>
+
+            {/* Assembled prompt — collapsible */}
+            <details>
+              <summary
+                className="cursor-pointer select-none text-[11px] uppercase tracking-wider font-medium"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                Full assembled prompt ▸
+              </summary>
+              <pre
+                className="mt-2 overflow-auto rounded-[var(--radius-sm)] p-3 text-[10px] leading-relaxed whitespace-pre-wrap"
+                style={{
+                  background: 'var(--surface)',
+                  border: '1px solid var(--border)',
+                  color: 'var(--text-secondary)',
+                  maxHeight: 180,
+                }}
+              >
+                {assembledPrompt}
+              </pre>
+            </details>
+
+            {/* ── Image pipeline ───────────────────────────────────── */}
+            <div className="flex gap-4">
+              {/* Cell 1 — Region plan input (map sent to the model) */}
+              <div className="flex-1 min-w-0">
+                <p
+                  className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
+                  style={{ color: 'var(--text-muted)' }}
+                >
+                  Region input
+                </p>
+                <div
+                  className="checker relative overflow-hidden rounded-[var(--radius-sm)]"
+                  style={{
+                    border: '1px solid var(--border)',
+                    aspectRatio: regionAR,
+                    background: 'var(--surface)',
+                  }}
+                >
+                  {regionInputSrc ? (
+                    <img
+                      src={regionInputSrc}
+                      alt="Region plan input"
+                      className="w-full h-full object-contain block"
+                      draggable={false}
+                    />
+                  ) : (
+                    <div className="absolute inset-0 flex items-center justify-center">
+                      <Icons.Spinner size={14} />
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Cell 2 — Region plan result */}
+              <div className="flex-1 min-w-0">
+                <p
+                  className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
+                  style={{ color: 'var(--text-muted)' }}
+                >
+                  Region plan result
+                </p>
+                <div
+                  className="checker relative overflow-hidden rounded-[var(--radius-sm)]"
+                  style={{
+                    border: `1px solid ${hasResult ? 'var(--border-strong)' : 'var(--border)'}`,
+                    aspectRatio: regionAR,
+                    background: 'var(--surface)',
+                  }}
+                >
+                  {isGenerating && (
+                    <>
+                      <div className="absolute inset-0 flex items-center justify-center">
+                        <Icons.Spinner size={16} />
+                      </div>
+                      <div
+                        className="absolute inset-0 animate-pulse"
+                        style={{ background: 'rgba(80,80,130,0.3)' }}
+                      />
+                    </>
+                  )}
+                  {hasResult && result && (
+                    <img
+                      src={result}
+                      alt="Region plan result"
+                      className="w-full h-full object-contain block"
+                      draggable={false}
+                    />
+                  )}
+                  {!isGenerating && !hasResult && (
+                    <div
+                      className="absolute inset-0 flex items-center justify-center text-[11px]"
+                      style={{ color: 'var(--text-muted)' }}
+                    >
+                      Not generated yet
+                    </div>
+                  )}
+                </div>
+                <p
+                  className="mt-1.5 font-mono text-[11px] text-center"
+                  style={{ color: 'var(--text-muted)' }}
+                >
+                  {resultDimensions
+                    ? `${resultDimensions.width} × ${resultDimensions.height}`
+                    : isGenerating
+                    ? 'Generating…'
+                    : '—'}
+                </p>
+              </div>
+            </div>
+
+            {/* Owned tiles list */}
+            {ownedTiles.length > 0 && (
+              <div>
+                <p
+                  className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
+                  style={{ color: 'var(--text-muted)' }}
+                >
+                  Owned tiles
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {ownedTiles.map((t) => (
+                    <button
+                      key={t.nsIdx}
+                      onClick={() => onJumpToTile(t.nsIdx)}
+                      className="rounded-[var(--radius-sm)] px-2 py-1 text-[11px] flex items-center gap-1"
+                      style={{
+                        background: 'var(--surface)',
+                        border: `1px solid ${t.isStale ? 'rgba(230,160,50,0.5)' : 'var(--border)'}`,
+                        color: t.isAccepted ? 'var(--text)' : 'var(--text-muted)',
+                      }}
+                      title={`Open tile ${t.nsIdx + 1} (r${t.row}×c${t.col})`}
+                    >
+                      r{t.row}×c{t.col}
+                      {t.isAccepted && <Icons.Check size={10} />}
+                      {t.isStale && (
+                        <span style={{ color: 'var(--warning, #e6a032)' }}>·stale</span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Actions */}
+            <div className="flex items-center justify-between">
+              <button
+                onClick={onClose}
+                disabled={isGenerating}
+                className="btn btn-ghost"
+              >
+                Close
+              </button>
+
+              <button
+                onClick={onRegenerate}
+                disabled={isGenerating}
+                className="btn btn-primary"
+              >
+                {isGenerating ? (
+                  <>
+                    <Icons.Spinner size={13} />
+                    Generating…
+                  </>
+                ) : (
+                  <>↺ {hasResult ? 'Regenerate region' : 'Generate region'}</>
+                )}
+              </button>
             </div>
           </div>
         </div>

@@ -2270,6 +2270,584 @@ export function buildPerTilePlanningMap(
   })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Regional plans — for extensions whose scene is far larger than a single
+// whole-scene plan can usefully represent. Instead of one plan covering the
+// entire extension at a heavy downscale, the tile grid is grouped into a
+// handful of regions, each planned independently at the full MAX_AI_DIMENSION
+// budget. See groupTilesIntoPlanRegions() and buildRegionalPlanningMap().
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Position + size of one axis slot (tile column or row) in band pixels. */
+interface AxisExtent {
+  pos: number
+  size: number
+}
+
+/**
+ * Greedily group consecutive axis slots (tile columns or rows) so each
+ * group's span stays within `maxSpan`, with `overlapCount` slots shared
+ * between consecutive groups for seam continuity. Mirrors planTilingAxis's
+ * "as many as fit" logic, but groups whole tiles instead of raw pixels.
+ *
+ * Every group contains at least one slot beyond its start, even if that
+ * single slot alone already exceeds maxSpan — a group can never be empty.
+ */
+function greedyAxisGroups(extents: AxisExtent[], maxSpan: number, overlapCount: number): number[][] {
+  const n = extents.length
+  if (n === 0) return []
+  const groups: number[][] = []
+  let start = 0
+  while (start < n) {
+    let end = start
+    while (end + 1 < n) {
+      const candidateEnd = end + 1
+      const span = (extents[candidateEnd].pos + extents[candidateEnd].size) - extents[start].pos
+      if (span <= maxSpan || end === start) {
+        end = candidateEnd
+      } else {
+        break
+      }
+    }
+    const group: number[] = []
+    for (let i = start; i <= end; i++) group.push(i)
+    groups.push(group)
+    if (end >= n - 1) break
+    start = overlapCount > 0 ? Math.max(start + 1, end - overlapCount + 1) : end + 1
+  }
+  return groups
+}
+
+/** One region of a regionally-planned extension. */
+export interface PlanRegionSpec {
+  /** Sequential generation order — also this region's index into the flattened regions array. */
+  index: number
+  /** Tile row indices (into the full grid) this region covers. */
+  rowGroup: number[]
+  /** Tile column indices (into the full grid) this region covers. */
+  colGroup: number[]
+  /** Bounding rect of this region in band-canvas coordinates. */
+  bandRect: { x: number; y: number; width: number; height: number }
+}
+
+export interface PlanRegionGrouping {
+  /** Regions in generation order. */
+  regions: PlanRegionSpec[]
+  /**
+   * Index of the region that OWNS tile (row, col) — the first region
+   * (generation order) whose row/col group covers it. Later regions that
+   * share an overlap tile with an earlier one never re-decide it; they only
+   * read it as already-decided context. Returns -1 if the tile isn't part
+   * of any region (shouldn't happen for tiles actually present in the grid).
+   */
+  regionOf: (row: number, col: number) => number
+}
+
+/**
+ * Group a tile grid into planning regions so each region's scene-space span
+ * stays within `maxSceneDim` per axis, instead of one whole-scene plan that
+ * gets more compressed the larger the source image is.
+ *
+ * Grouping happens independently on both axes (rows and columns) and regions
+ * are the cross product — in the common case one axis fits in a single group
+ * so this reduces to grouping along the other axis only, but it generalises
+ * to extensions where both axes are large.
+ *
+ * Throws if the resulting region count exceeds `maxRegions` (cost guard,
+ * mirrors planExtensionTiles' maxTiles check).
+ */
+export function groupTilesIntoPlanRegions(
+  nonSkippedTileSpecs: ExtensionTileSpec[],
+  maxSceneDim: number,
+  overlapTiles: number,
+  maxRegions: number,
+): PlanRegionGrouping {
+  if (nonSkippedTileSpecs.length === 0) {
+    return { regions: [], regionOf: () => -1 }
+  }
+
+  const totalRows = nonSkippedTileSpecs[0].totalRows
+  const totalCols = nonSkippedTileSpecs[0].totalCols
+
+  const colExtents: AxisExtent[] = new Array(totalCols).fill(null).map(() => ({ pos: 0, size: 0 }))
+  const rowExtents: AxisExtent[] = new Array(totalRows).fill(null).map(() => ({ pos: 0, size: 0 }))
+  const colSeen = new Array<boolean>(totalCols).fill(false)
+  const rowSeen = new Array<boolean>(totalRows).fill(false)
+  for (const t of nonSkippedTileSpecs) {
+    if (!colSeen[t.col]) { colExtents[t.col] = { pos: t.bandX, size: t.tileWidth }; colSeen[t.col] = true }
+    if (!rowSeen[t.row]) { rowExtents[t.row] = { pos: t.bandY, size: t.tileHeight }; rowSeen[t.row] = true }
+  }
+
+  const colGroups = greedyAxisGroups(colExtents, maxSceneDim, overlapTiles)
+  const rowGroups = greedyAxisGroups(rowExtents, maxSceneDim, overlapTiles)
+
+  if (rowGroups.length * colGroups.length > maxRegions) {
+    throw new Error(
+      `Regional planning requires ${rowGroups.length * colGroups.length} regions ` +
+      `(${rowGroups.length} row-group(s) × ${colGroups.length} col-group(s)), exceeding the limit of ${maxRegions}.`
+    )
+  }
+
+  // Earliest group index containing each row/col — a shared boundary slot
+  // belongs to two groups; the earlier one owns it.
+  const rowGroupOfRow = new Array<number>(totalRows).fill(-1)
+  rowGroups.forEach((g, gi) => { for (const r of g) if (rowGroupOfRow[r] === -1) rowGroupOfRow[r] = gi })
+  const colGroupOfCol = new Array<number>(totalCols).fill(-1)
+  colGroups.forEach((g, gi) => { for (const c of g) if (colGroupOfCol[c] === -1) colGroupOfCol[c] = gi })
+
+  const regionIndexByGroup: number[][] = rowGroups.map(() => new Array<number>(colGroups.length).fill(-1))
+  const regions: PlanRegionSpec[] = []
+  for (let rg = 0; rg < rowGroups.length; rg++) {
+    for (let cg = 0; cg < colGroups.length; cg++) {
+      const rows = rowGroups[rg]
+      const cols = colGroups[cg]
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+      for (const t of nonSkippedTileSpecs) {
+        if (!rows.includes(t.row) || !cols.includes(t.col)) continue
+        minX = Math.min(minX, t.bandX)
+        minY = Math.min(minY, t.bandY)
+        maxX = Math.max(maxX, t.bandX + t.tileWidth)
+        maxY = Math.max(maxY, t.bandY + t.tileHeight)
+      }
+      // No surviving (non-skipped) tile lands in this row/col combination —
+      // skip creating an empty region for it.
+      if (!Number.isFinite(minX)) continue
+      regionIndexByGroup[rg][cg] = regions.length
+      regions.push({
+        index: regions.length,
+        rowGroup: rows,
+        colGroup: cols,
+        bandRect: { x: minX, y: minY, width: maxX - minX, height: maxY - minY },
+      })
+    }
+  }
+
+  const regionOf = (row: number, col: number): number => {
+    const rg = rowGroupOfRow[row]
+    const cg = colGroupOfCol[col]
+    if (rg === -1 || cg === -1) return -1
+    return regionIndexByGroup[rg][cg]
+  }
+
+  return { regions, regionOf }
+}
+
+/** A previously-generated region's plan result, needed to carry overlap-tile continuity forward. */
+export interface PriorRegionResult {
+  resultUrl: string
+  /** Scale factor from band-canvas pixels to that region's map pixels. */
+  scale: number
+  bandRect: { x: number; y: number; width: number; height: number }
+}
+
+export interface RegionalPlanningMapResult {
+  mapDataUrl: string
+  mapWidth: number
+  mapHeight: number
+  /** Scale factor from band-canvas pixels to this region's map pixels. */
+  scale: number
+  /**
+   * Map-scale blank-region rect for each tile NEWLY owned by this region
+   * (i.e. this is the region that must fill it), keyed by index into
+   * `nonSkippedTileSpecs`. Tiles owned by an earlier region are absent —
+   * this region only reads them as context, it never re-decides them.
+   */
+  tileRegionsInMap: Map<number, PlanTileRegion>
+}
+
+/** Axis parameters shared by every region of one extension, needed to derive
+ * the extension-axis layout (Block A / Block B split) without depending on
+ * a source image — used anywhere only the geometry (not the pixels) matters. */
+export interface RegionAxisContext {
+  direction: 'up' | 'down' | 'left' | 'right'
+  imageWidth: number
+  imageHeight: number
+  /** The small, tile-oriented context strip size already baked into bandCanvas. */
+  contextSize: number
+  extensionSize: number
+}
+
+/** Scene-level parameters shared by every region of one extension — needed to
+ * pull a much deeper "real image" context block straight from the original
+ * source, independent of the small tile-oriented context strip already
+ * baked into the band canvas. */
+export interface RegionSceneContext extends RegionAxisContext {
+  sourceImageDataUrl: string
+}
+
+/**
+ * Layout of one region's plan map: it's composed of two blocks stacked along
+ * the extension axis —
+ *   Block A ("real image"): a deep crop straight from the ORIGINAL source
+ *     image, sized to roughly match the extension depth (half real / half
+ *     new), independent of the much thinner context strip tiles use.
+ *   Block B ("new region tile"): this region's own extension-only slice of
+ *     the band canvas (grey for undecided tiles, real pixels for any
+ *     already-accepted ones, plus carried-forward overlap from earlier
+ *     regions) — what the pre-existing implementation cropped alone.
+ * For context-at-start directions (down/right) Block A precedes Block B;
+ * for context-at-end directions (up/left) Block B precedes Block A.
+ * Exported so every consumer (map builder, extension-view compositor,
+ * Phase-2 per-tile re-plan, and the RegionPlanModal live preview) derives
+ * the exact same pixel mapping from the same inputs — no separate state to
+ * keep in sync.
+ */
+export interface RegionMapLayout {
+  mapWidth: number
+  mapHeight: number
+  /** Scale factor from band-canvas px to map px (uniform on both axes). */
+  scale: number
+  /** Band coordinate (along the extension axis) where Block B's content starts. */
+  blockBExtStart: number
+  /** Band-scale size of Block B's content along the extension axis. */
+  blockBExtSize: number
+  /** Map-scale pixels of Block A preceding Block B (0 when Block A trails instead). */
+  contextLeadPx: number
+  /** Band-scale depth of Block A's original-image crop along the extension axis. */
+  contextDepth: number
+}
+
+export function computeRegionMapLayout(
+  scene: RegionAxisContext,
+  bandRect: { x: number; y: number; width: number; height: number },
+  maxDim: number,
+): RegionMapLayout {
+  const { direction, imageWidth, imageHeight, contextSize, extensionSize } = scene
+  const isVertical = direction === 'down' || direction === 'up'
+  const contextAtStart = direction === 'down' || direction === 'right'
+  const bandDim = contextSize + extensionSize
+
+  // Aim for roughly equal parts real image / new region tile, capped by how
+  // much of the original image actually exists to draw from.
+  const availableSourceDepth = isVertical ? imageHeight : imageWidth
+  const desiredContextDepth = Math.min(extensionSize, availableSourceDepth)
+
+  const crossSize = isVertical ? bandRect.width : bandRect.height
+  const rectExtStart = isVertical ? bandRect.y : bandRect.x
+  const rectExtSize = isVertical ? bandRect.height : bandRect.width
+  const extRangeStart = contextAtStart ? contextSize : 0
+  const extRangeEnd = contextAtStart ? bandDim : extensionSize
+  const blockBExtStart = Math.max(rectExtStart, extRangeStart)
+  const blockBExtEnd = Math.min(rectExtStart + rectExtSize, extRangeEnd)
+  const blockBExtSize = Math.max(0, blockBExtEnd - blockBExtStart)
+
+  const unscaledDepth = desiredContextDepth + blockBExtSize
+  const scale = Math.min(1, maxDim / Math.max(crossSize, unscaledDepth))
+
+  const outCross = Math.max(1, Math.round(crossSize * scale))
+  const contextLeadPx = contextAtStart ? Math.round(desiredContextDepth * scale) : 0
+  const blockBSizePx = Math.max(1, Math.round(blockBExtSize * scale))
+  const outDepth = contextAtStart
+    ? contextLeadPx + blockBSizePx
+    : blockBSizePx + Math.round(desiredContextDepth * scale)
+
+  return {
+    mapWidth: isVertical ? outCross : outDepth,
+    mapHeight: isVertical ? outDepth : outCross,
+    scale,
+    blockBExtStart,
+    blockBExtSize,
+    contextLeadPx,
+    contextDepth: desiredContextDepth,
+  }
+}
+
+/**
+ * Map a tile's band-canvas-relative blank rect into a region's map-pixel
+ * coordinate space, per the Block A / Block B layout in RegionMapLayout.
+ * Shared by buildRegionalPlanningMap's own tileRegionsInMap and by the
+ * Phase-2 per-tile re-plan path in page.tsx, so both always agree on
+ * exactly where a tile's slice lives within a region's plan result image.
+ */
+export function mapTileRectIntoRegionLayout(
+  scene: RegionAxisContext,
+  bandRect: { x: number; y: number; width: number; height: number },
+  layout: RegionMapLayout,
+  tileBandX: number,
+  tileBandY: number,
+  tileWidth: number,
+  tileHeight: number,
+): PlanTileRegion {
+  const isVertical = scene.direction === 'down' || scene.direction === 'up'
+  const contextAtStart = scene.direction === 'down' || scene.direction === 'right'
+  const tileExtCoord = isVertical ? tileBandY : tileBandX
+  const tileCrossCoord = isVertical ? tileBandX : tileBandY
+  const crossOrigin = isVertical ? bandRect.x : bandRect.y
+  const extLocalPx = Math.round((tileExtCoord - layout.blockBExtStart) * layout.scale) + (contextAtStart ? layout.contextLeadPx : 0)
+  const crossLocalPx = Math.round((tileCrossCoord - crossOrigin) * layout.scale)
+  return {
+    x: Math.round(isVertical ? crossLocalPx : extLocalPx),
+    y: Math.round(isVertical ? extLocalPx : crossLocalPx),
+    width: Math.max(1, Math.round(tileWidth * layout.scale)),
+    height: Math.max(1, Math.round(tileHeight * layout.scale)),
+  }
+}
+
+/**
+ * Build the planning map for ONE region of a regionally-planned extension
+ * (see groupTilesIntoPlanRegions).
+ *
+ * Composes two blocks along the extension axis (see RegionMapLayout):
+ *   Block A — a deep crop straight from the ORIGINAL source image, sized to
+ *     roughly match the extension depth, so the model has substantial real
+ *     content to anchor its continuation against — not just tiles' thin
+ *     context strip. It's fine (expected, even) for this to end up heavily
+ *     downscaled/blurry: a region plan's job is broad coherence, not detail.
+ *   Block B — this region's own extension-only slice of the band canvas
+ *     (grey for undecided tiles, real pixels for already-accepted ones).
+ *
+ * The overlap tile(s) shared with an earlier region are not yet real pixels
+ * in the band canvas (Phase 3 refine hasn't necessarily run for them).
+ * Wherever such a tile isn't already accepted, this draws the earlier
+ * region's plan result over the grey so the model sees continuity instead of
+ * a hard grey seam — the plan-level equivalent of the tile overlap trick.
+ */
+export async function buildRegionalPlanningMap(
+  bandCanvas: HTMLCanvasElement,
+  nonSkippedTileSpecs: ExtensionTileSpec[],
+  tileAccepted: boolean[],
+  grouping: PlanRegionGrouping,
+  region: PlanRegionSpec,
+  priorRegionResults: Array<PriorRegionResult | null>,
+  maxDim: number,
+  scene: RegionSceneContext,
+): Promise<RegionalPlanningMapResult> {
+  const { bandRect } = region
+  const isVertical = scene.direction === 'down' || scene.direction === 'up'
+  const contextAtStart = scene.direction === 'down' || scene.direction === 'right'
+  const layout = computeRegionMapLayout(scene, bandRect, maxDim)
+  const { mapWidth: outW, mapHeight: outH, scale, blockBExtStart, blockBExtSize, contextLeadPx, contextDepth } = layout
+
+  const map = document.createElement('canvas')
+  map.width = outW
+  map.height = outH
+  const ctx = map.getContext('2d')
+  if (!ctx) {
+    return { mapDataUrl: bandCanvas.toDataURL('image/jpeg', 0.85), mapWidth: outW, mapHeight: outH, scale, tileRegionsInMap: new Map() }
+  }
+
+  const crossStart = isVertical ? bandRect.x : bandRect.y
+  const crossSizeUnscaled = isVertical ? bandRect.width : bandRect.height
+  const bSizePx = Math.max(1, Math.round(blockBExtSize * scale))
+  const bLeadPx = contextAtStart ? contextLeadPx : 0
+  const aLeadPx = contextAtStart ? 0 : bSizePx
+  const aSizePx = Math.max(0, (isVertical ? outH : outW) - bSizePx)
+
+  // ── Block A: deep, real context straight from the ORIGINAL image ───────
+  // Deliberately much bigger than tiles' thin context strip — roughly half
+  // the map, capped by how much of the source actually exists — so the
+  // model has substantial real pixels to anchor against. Fine if blurry.
+  try {
+    if (contextDepth > 0 && aSizePx > 0) {
+      const srcImg = await loadImageElement(scene.sourceImageDataUrl)
+      if (isVertical) {
+        const srcY = scene.direction === 'down' ? scene.imageHeight - contextDepth : 0
+        ctx.drawImage(
+          srcImg,
+          crossStart, srcY, crossSizeUnscaled, contextDepth,
+          0, aLeadPx, outW, aSizePx,
+        )
+      } else {
+        const srcX = scene.direction === 'right' ? scene.imageWidth - contextDepth : 0
+        ctx.drawImage(
+          srcImg,
+          srcX, crossStart, contextDepth, crossSizeUnscaled,
+          aLeadPx, 0, aSizePx, outH,
+        )
+      }
+    }
+  } catch {
+    // Original image failed to load — fall back to whatever Block B below
+    // provides; not fatal, just less deep context this one time.
+  }
+
+  // ── Block B: this region's extension-only slice of the band canvas ─────
+  if (blockBExtSize > 0) {
+    if (isVertical) {
+      ctx.drawImage(
+        bandCanvas,
+        bandRect.x, blockBExtStart, bandRect.width, blockBExtSize,
+        0, bLeadPx, outW, bSizePx,
+      )
+    } else {
+      ctx.drawImage(
+        bandCanvas,
+        blockBExtStart, bandRect.y, blockBExtSize, bandRect.height,
+        bLeadPx, 0, bSizePx, outH,
+      )
+    }
+  }
+
+  const tileRegionsInMap = new Map<number, PlanTileRegion>()
+  type OverlapDraw = { url: string; sx: number; sy: number; sw: number; sh: number; dx: number; dy: number; dw: number; dh: number }
+  const draws: OverlapDraw[] = []
+
+  for (let i = 0; i < nonSkippedTileSpecs.length; i++) {
+    const t = nonSkippedTileSpecs[i]
+    const ownerIdx = grouping.regionOf(t.row, t.col)
+    const br = t.blankRegion
+    if (br.width === 0 || br.height === 0) continue
+
+    if (ownerIdx === region.index) {
+      // Newly owned by this region — record its map-scale blank rect so the
+      // caller can crop this tile's slice out of the plan result. Tiles only
+      // ever live in Block B (the extension), so the ext-axis coordinate is
+      // relative to blockBExtStart + the Block-A lead, not bandRect's origin.
+      tileRegionsInMap.set(i, mapTileRectIntoRegionLayout(
+        scene, bandRect, layout, t.bandX + br.x, t.bandY + br.y, br.width, br.height,
+      ))
+      continue
+    }
+
+    if (ownerIdx === -1 || tileAccepted[i]) continue
+    const prior = priorRegionResults[ownerIdx]
+    if (!prior) continue
+    const priorLayout = computeRegionMapLayout(scene, grouping.regions[ownerIdx].bandRect, maxDim)
+
+    const tileBandX = t.bandX + br.x
+    const tileBandY = t.bandY + br.y
+    const ix = Math.max(tileBandX, bandRect.x)
+    const iy = Math.max(tileBandY, bandRect.y)
+    const ir = Math.min(tileBandX + br.width, bandRect.x + bandRect.width)
+    const ib = Math.min(tileBandY + br.height, bandRect.y + bandRect.height)
+    if (ir <= ix || ib <= iy) continue
+
+    const priorExtStart = isVertical ? iy : ix
+    const priorExtEnd = isVertical ? ib : ir
+    const priorCrossStart = isVertical ? ix : iy
+    const priorCrossEnd = isVertical ? ir : ib
+
+    const sExt = (priorExtStart - priorLayout.blockBExtStart) * prior.scale + priorLayout.contextLeadPx
+    const sCross = (priorCrossStart - (isVertical ? prior.bandRect.x : prior.bandRect.y)) * prior.scale
+    const sExtSize = (priorExtEnd - priorExtStart) * prior.scale
+    const sCrossSize = (priorCrossEnd - priorCrossStart) * prior.scale
+
+    const dExt = (priorExtStart - blockBExtStart) * scale + (contextAtStart ? contextLeadPx : 0)
+    const dCross = (priorCrossStart - (isVertical ? bandRect.x : bandRect.y)) * scale
+    const dExtSize = (priorExtEnd - priorExtStart) * scale
+    const dCrossSize = (priorCrossEnd - priorCrossStart) * scale
+
+    draws.push({
+      url: prior.resultUrl,
+      sx: isVertical ? sCross : sExt,
+      sy: isVertical ? sExt : sCross,
+      sw: isVertical ? sCrossSize : sExtSize,
+      sh: isVertical ? sExtSize : sCrossSize,
+      dx: isVertical ? dCross : dExt,
+      dy: isVertical ? dExt : dCross,
+      dw: isVertical ? dCrossSize : dExtSize,
+      dh: isVertical ? dExtSize : dCrossSize,
+    })
+  }
+
+  if (draws.length > 0) {
+    try {
+      const uniqueUrls = Array.from(new Set(draws.map((d) => d.url)))
+      const images = await Promise.all(uniqueUrls.map((url) => loadImageElement(url)))
+      const imageByUrl = new Map(uniqueUrls.map((url, i) => [url, images[i]] as const))
+      for (const d of draws) {
+        const img = imageByUrl.get(d.url)
+        if (!img) continue
+        ctx.drawImage(img, d.sx, d.sy, d.sw, d.sh, d.dx, d.dy, d.dw, d.dh)
+      }
+    } catch {
+      // A prior region's image failed to load — fall back to whatever's
+      // already drawn. Not fatal; the model just sees a plainer seam this
+      // one time.
+    }
+  }
+
+  return {
+    mapDataUrl: map.toDataURL('image/jpeg', 0.90),
+    mapWidth: outW,
+    mapHeight: outH,
+    scale,
+    tileRegionsInMap,
+  }
+}
+
+/**
+ * Composite every generated region's result into a single extension-only
+ * background image for the tiling band UI — the regional-plan counterpart
+ * of cropGlobalPlanExtensionView(). Regions without a result yet simply
+ * leave their portion of the composite blank (transparent), which the
+ * band UI already handles gracefully for a partially-planned extension.
+ */
+export async function buildRegionalExtensionView(
+  regionResults: Array<PriorRegionResult | null>,
+  viewport: { x: number; y: number; width: number; height: number },
+  maxDim: number,
+  scene: RegionAxisContext,
+): Promise<string> {
+  const isVertical = scene.direction === 'down' || scene.direction === 'up'
+  const outScale = Math.min(1, maxDim / Math.max(viewport.width, viewport.height))
+  const outW = Math.max(1, Math.round(viewport.width * outScale))
+  const outH = Math.max(1, Math.round(viewport.height * outScale))
+
+  const canvas = document.createElement('canvas')
+  canvas.width = outW
+  canvas.height = outH
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return ''
+
+  type Draw = { url: string; sx: number; sy: number; sw: number; sh: number; dx: number; dy: number; dw: number; dh: number }
+  const draws: Draw[] = []
+  for (const region of regionResults) {
+    if (!region) continue
+    const { bandRect } = region
+    const ix = Math.max(bandRect.x, viewport.x)
+    const iy = Math.max(bandRect.y, viewport.y)
+    const ir = Math.min(bandRect.x + bandRect.width, viewport.x + viewport.width)
+    const ib = Math.min(bandRect.y + bandRect.height, viewport.y + viewport.height)
+    if (ir <= ix || ib <= iy) continue
+
+    // The viewport is extension-only, so this intersection always lands
+    // inside the region's Block B (never Block A's deep source context) —
+    // but Block B may itself be offset within resultUrl by Block A's lead,
+    // so the source sample must go through the same layout math used to
+    // build resultUrl in the first place, not a naive bandRect-relative crop.
+    const layout = computeRegionMapLayout(scene, bandRect, maxDim)
+    const extStart = isVertical ? iy : ix
+    const extEnd = isVertical ? ib : ir
+    const crossStart = isVertical ? ix : iy
+    const crossEnd = isVertical ? ir : ib
+    const crossOrigin = isVertical ? bandRect.x : bandRect.y
+    const contextAtStart = scene.direction === 'down' || scene.direction === 'right'
+
+    const sExt = (extStart - layout.blockBExtStart) * region.scale + (contextAtStart ? layout.contextLeadPx : 0)
+    const sCross = (crossStart - crossOrigin) * region.scale
+    const sExtSize = (extEnd - extStart) * region.scale
+    const sCrossSize = (crossEnd - crossStart) * region.scale
+
+    draws.push({
+      url: region.resultUrl,
+      sx: isVertical ? sCross : sExt,
+      sy: isVertical ? sExt : sCross,
+      sw: isVertical ? sCrossSize : sExtSize,
+      sh: isVertical ? sExtSize : sCrossSize,
+      dx: (ix - viewport.x) * outScale,
+      dy: (iy - viewport.y) * outScale,
+      dw: (ir - ix) * outScale,
+      dh: (ib - iy) * outScale,
+    })
+  }
+  if (draws.length === 0) return ''
+
+  try {
+    const uniqueUrls = Array.from(new Set(draws.map((d) => d.url)))
+    const images = await Promise.all(uniqueUrls.map((url) => loadImageElement(url)))
+    const imageByUrl = new Map(uniqueUrls.map((url, i) => [url, images[i]] as const))
+    for (const d of draws) {
+      const img = imageByUrl.get(d.url)
+      if (!img) continue
+      ctx.drawImage(img, d.sx, d.sy, d.sw, d.sh, d.dx, d.dy, d.dw, d.dh)
+    }
+  } catch {
+    return ''
+  }
+  return canvas.toDataURL('image/jpeg', 0.90)
+}
+
 /**
  * Build a scaled-down planning map of the full scene for phase 1.
  *

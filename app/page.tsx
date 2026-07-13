@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { CommandBar } from '@/app/components/CommandBar'
 import { EditStudio } from '@/app/components/EditStudio'
 import { EmptyState } from '@/app/components/EmptyState'
-import { ApiKeyModal, ErrorToast, GenerateModal, SettingsDrawer, TileExtensionModal, Toggle } from '@/app/components/Modals'
+import { ApiKeyModal, ErrorToast, GenerateModal, RegionPlanModal, SettingsDrawer, TileExtensionModal, Toggle } from '@/app/components/Modals'
 import { ParallaxStudio } from '@/app/components/ParallaxStudio'
 import { PropStudio } from '@/app/components/PropStudio'
 import { SpriteStudio } from '@/app/components/SpriteStudio'
@@ -12,7 +12,7 @@ import { TileStudio } from '@/app/components/TileStudio'
 import { TopBar } from '@/app/components/TopBar'
 import { ResultActions, VariantSelector } from '@/app/components/VariantSelector'
 import { Workspace, TilingState, TileCellDisplay } from '@/app/components/Workspace'
-import { Candidate, Direction, EXTENSION_PERCENT, MAX_AI_DIMENSION, MAX_TILES_PER_EXTEND, Mode, PLANNING_MAP_MAX_DIM, ReferenceImage, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, TILE_OVERLAP_PX } from '@/app/lib/app'
+import { Candidate, Direction, EXTENSION_PERCENT, MAX_AI_DIMENSION, MAX_PLAN_REGIONS, MAX_TILES_PER_EXTEND, Mode, PLAN_REGION_MAX_SCENE_DIM, PLAN_REGION_OVERLAP_TILES, REGIONAL_PLAN_TRIGGER_MULTIPLIER, ReferenceImage, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, TILE_OVERLAP_PX } from '@/app/lib/app'
 import { findStyleLabel } from '@/app/lib/artStyles'
 import { DEFAULT_MODEL, MODELS, getModelConfig, skipsArtDirectorReview } from '@/app/lib/models'
 import { LAYER_ORDER, LAYER_ROLES, LayerRole, PARALLAX_MAX_AUTO_STEPS, ParallaxLayer, WORKFLOW_ORDER, createDefaultLayers, getRecommendedLayerIndex, getWorkflowPrerequisite } from '@/app/lib/parallax'
@@ -20,7 +20,7 @@ import { PROP_BATCH, PROP_BATCH_COLS, PROP_BATCH_H, PROP_BATCH_ROWS, PROP_BATCH_
 import { SPRITE_ANIMATIONS, SPRITE_FRAME_COUNT, SPRITE_FRAME_SIZE, SPRITE_GRID_COLS, SPRITE_GRID_ROWS, SPRITE_SHEET_H, SPRITE_SHEET_W, SPRITE_STRIP_H, SPRITE_STRIP_W, SpriteAnimType, SpriteFrame, SpriteSheet, createEmptySpriteSheet } from '@/app/lib/sprite'
 import { BODY_PLANS, BodyPlan, isAirborneAnim } from '@/app/lib/bodyPlans'
 import { CORNER_GRAFTS, ENABLE_CORNER_RECONCILE, TILESET_ATLAS_EXTRUDE_PX, TILESET_BY_ROLE, TILESET_COLS, TILESET_PADDED_SHEET_H, TILESET_PADDED_SHEET_W, TILESET_PADDED_STRIDE, TILESET_ROWS, TILESET_SHEET_H, TILESET_SHEET_W, TILESET_SLOTS, TILESET_TILE_SIZE, TILE_TEMPLATE_CELL, TILE_TEMPLATE_COLS, TILE_TEMPLATE_H, TILE_TEMPLATE_MASK, TILE_TEMPLATE_ROWS, TILE_TEMPLATE_SAMPLES, TILE_TEMPLATE_W, TileSetRole, TileSetSlot, alignAiOutputToTemplate, applyFeatheredRoleMask, buildTileSheetGuideDataUrl, createEmptyTileSet, rebuildCornerTile, reconcileAllCorners, templateRoleForCell } from '@/app/lib/tileset'
-import { alignSpriteFramesToBaseline, applyFullContextResult, buildGlobalPlanningMap, buildPerTilePlanningMap, buildTileChunkInfo, buildTileInput, buildTileSliceComposite, buildTilePlanningMap, centerSpriteFramesHorizontally, ChunkInfo, chromaKeyToAlpha, compositeTileResult, createChunkedExtension, createFullContextExtension, cropGlobalPlanExtensionView, cropPlanningResult, ExtensionTileSpec, getChunkAlign, getImageDimensions, harmonizeHorizontalSeams, initBandCanvas, isolatePrimarySpriteComponent, isAiExtensionUnfilled, isTileResultUnfilled, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, measureSeamResidual, normalizeImageToSize, normalizeSpriteFrameScale, PlanTileRegion, planExtensionTiles, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk, TiledExtensionPlan } from '@/app/utils/imageProcessor'
+import { alignSpriteFramesToBaseline, applyFullContextResult, buildGlobalPlanningMap, buildPerTilePlanningMap, buildRegionalExtensionView, buildRegionalPlanningMap, buildTileChunkInfo, buildTileInput, buildTileSliceComposite, buildTilePlanningMap, centerSpriteFramesHorizontally, ChunkInfo, chromaKeyToAlpha, compositeTileResult, computeRegionMapLayout, createChunkedExtension, createFullContextExtension, cropGlobalPlanExtensionView, cropPlanningResult, ExtensionTileSpec, getChunkAlign, getImageDimensions, groupTilesIntoPlanRegions, harmonizeHorizontalSeams, initBandCanvas, isolatePrimarySpriteComponent, isAiExtensionUnfilled, isTileResultUnfilled, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, mapTileRectIntoRegionLayout, measureSeamResidual, normalizeImageToSize, normalizeSpriteFrameScale, PlanRegionGrouping, PlanTileRegion, planExtensionTiles, PriorRegionResult, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk, TiledExtensionPlan } from '@/app/utils/imageProcessor'
 import { SubjectBounds, drawPoseGuideSheet, measureSubjectBounds } from '@/app/utils/poseRig'
 import JSZip from 'jszip'
 
@@ -136,6 +136,36 @@ export default function Home() {
     globalPlanHeight: number
     /** True while Phase 1 (global plan) is in flight. */
     isGlobalPlanGenerating: boolean
+    // ── Regional plan (hierarchical planning for very large extensions) ─────
+    /**
+     * True when the extension band is large enough that a single whole-scene
+     * plan would be too compressed to be useful; switches to the region-layer
+     * path (independent per-region plans) instead of one global plan.
+     */
+    isRegionalPlan: boolean
+    /** Tile grid grouped into regions, or null in single-plan mode. */
+    regionGrouping: PlanRegionGrouping | null
+    /** Owning region index for each non-skipped tile (-1 = none / single-plan mode). */
+    tileRegionOwner: number[]
+    /** Per-region planning input map sent to the API, aligned to regionGrouping.regions. */
+    regionPlanningMaps: (string | null)[]
+    /** Per-region filled plan result, aligned to regionGrouping.regions. */
+    regionResults: (string | null)[]
+    /** Per-region scale factor (band px → region map px), aligned to regionGrouping.regions. */
+    regionScales: number[]
+    /** Per-region prompt override (empty = use global), aligned to regionGrouping.regions. */
+    regionPrompts: string[]
+    /** Per-region user-supplied reference images, aligned to regionGrouping.regions. */
+    regionReferenceImages: ReferenceImage[][]
+    /** Region index currently being generated, or null. */
+    generatingRegionIdx: number | null
+    /**
+     * Non-skipped tile indices whose owning region was regenerated after the
+     * tile already had a result and/or was accepted — shown as a "stale"
+     * badge until the tile itself is regenerated. Regenerating a region never
+     * auto-clears or re-triggers its owned tiles (decoupled by design).
+     */
+    staleTileIds: Set<number>
   }
 
   const [pendingTiledPlan, setPendingTiledPlan] = useState<PendingTiledPlan | null>(null)
@@ -160,8 +190,19 @@ export default function Home() {
    */
   const generateGlobalPlanRef = useRef<((direction: Direction) => Promise<void>) | null>(null)
 
+  /**
+   * Ref to `generateRegionPlan` so `generateTile` (defined earlier in this
+   * component, before generateRegionPlan) can auto-trigger a tile's owning
+   * region plan on demand without a forward-reference / temporal-dead-zone
+   * issue, mirroring the generateGlobalPlanRef pattern above.
+   */
+  const generateRegionPlanRef = useRef<((regionIdx: number) => Promise<void>) | null>(null)
+
   /** Non-skipped index of the tile whose modal is currently open, or null. */
   const [activeTileModalIdx, setActiveTileModalIdx] = useState<number | null>(null)
+
+  /** Index of the region whose modal is currently open, or null. */
+  const [activeRegionModalIdx, setActiveRegionModalIdx] = useState<number | null>(null)
 
   /** True while "Generate all" is auto-looping through the remaining tiles. */
   const [isAutoGeneratingTiles, setIsAutoGeneratingTiles] = useState(false)
@@ -987,24 +1028,55 @@ export default function Home() {
       if (useTwoPhase) {
         if (planOnly) {
           // ── Phase 2: per-tile plan re-run (user clicked "Re-plan tile") ────────
-          // Build a per-tile planning map from the global plan result by greying
-          // out just this tile's region, then call the API, and store the slice.
+          // Build a per-tile planning map by greying out just this tile's
+          // region on its planning background, then call the API and store
+          // the slice. The background is either the single whole-scene plan
+          // result, or — in regional mode — this tile's OWNING region's
+          // result, scaled/cropped to that region's own map coordinates.
           const currentPlan = pendingTiledPlanRef.current
-          const globalPlanResult = currentPlan?.globalPlanResult ?? null
-          const globalTileRegions = currentPlan?.globalTileRegions ?? []
-          const globalPlanWidth   = currentPlan?.globalPlanWidth ?? 0
-          const globalPlanHeight  = currentPlan?.globalPlanHeight ?? 0
-          const tileRegion = globalTileRegions[nsIdx]
+          let backgroundResult: string | null = null
+          let tileRegion: PlanTileRegion | null = null
+          let backgroundWidth = 0
+          let backgroundHeight = 0
 
-          if (!globalPlanResult || !tileRegion || tileRegion.width === 0) {
-            // No global plan yet — cannot do per-tile re-plan; release lock.
+          if (currentPlan?.isRegionalPlan && currentPlan.regionGrouping) {
+            const ownerIdx = currentPlan.tileRegionOwner[nsIdx]
+            const region = ownerIdx >= 0 ? currentPlan.regionGrouping.regions[ownerIdx] : undefined
+            const ownerResult = ownerIdx >= 0 ? currentPlan.regionResults[ownerIdx] : null
+            if (region && ownerResult) {
+              const br = tileSpec.blankRegion
+              backgroundResult = ownerResult
+              const regionAxis = {
+                direction: currentPlan.direction,
+                imageWidth: currentPlan.imageWidth,
+                imageHeight: currentPlan.imageHeight,
+                contextSize: currentPlan.contextSize,
+                extensionSize: currentPlan.extensionSize,
+              }
+              const layout = computeRegionMapLayout(regionAxis, region.bandRect, MAX_AI_DIMENSION)
+              tileRegion = mapTileRectIntoRegionLayout(
+                regionAxis, region.bandRect, layout, tileSpec.bandX + br.x, tileSpec.bandY + br.y, br.width, br.height,
+              )
+              backgroundWidth = layout.mapWidth
+              backgroundHeight = layout.mapHeight
+            }
+          } else {
+            backgroundResult = currentPlan?.globalPlanResult ?? null
+            tileRegion = currentPlan?.globalTileRegions[nsIdx] ?? null
+            backgroundWidth = currentPlan?.globalPlanWidth ?? 0
+            backgroundHeight = currentPlan?.globalPlanHeight ?? 0
+          }
+
+          if (!backgroundResult || !tileRegion || tileRegion.width === 0) {
+            // No plan yet for this tile's background — cannot do a per-tile
+            // re-plan; release the lock.
             setPendingTiledPlan((prev) =>
               prev ? { ...prev, generatingTileIdx: null, generatingPlanOnly: false } : null
             )
             return
           }
 
-          const perTileMap = await buildPerTilePlanningMap(globalPlanResult, tileRegion)
+          const perTileMap = await buildPerTilePlanningMap(backgroundResult, tileRegion)
 
           const rawRePlan = await callApi(perTileMap, {
             phase: 'plan',
@@ -1012,22 +1084,37 @@ export default function Home() {
             effectivePrompt: planningPrompt,
           })
 
-          const normalizedRePlan = await normalizeImageToSize(rawRePlan, globalPlanWidth, globalPlanHeight)
+          const normalizedRePlan = await normalizeImageToSize(rawRePlan, backgroundWidth, backgroundHeight)
           const tileSlice = await cropPlanningResult(normalizedRePlan, tileRegion)
 
           setPendingTiledPlan((prev) => {
             if (!prev) return null
             const slices = [...prev.tilePlanningSlices]
             slices[nsIdx] = tileSlice
-            return { ...prev, tilePlanningSlices: slices, generatingTileIdx: null, generatingPlanOnly: false }
+            const staleTileIds = new Set(prev.staleTileIds)
+            staleTileIds.delete(nsIdx)
+            return { ...prev, tilePlanningSlices: slices, staleTileIds, generatingTileIdx: null, generatingPlanOnly: false }
           })
           return
         }
 
         // ── Phase 3: high-res tile generation ───────────────────────────────────
+        // In regional mode, auto-trigger this tile's owning region's plan on
+        // demand if it hasn't run yet — mirrors how a fresh plan auto-kicks
+        // off the (single) global plan today. Decoupled: this only ensures a
+        // plan slice EXISTS; it never regenerates an already-planned region.
+        const planCheck = pendingTiledPlanRef.current
+        if (planCheck?.isRegionalPlan && planCheck.regionGrouping) {
+          const ownerIdx = planCheck.tileRegionOwner[nsIdx]
+          if (ownerIdx >= 0 && !planCheck.regionResults[ownerIdx] && planCheck.generatingRegionIdx === null) {
+            await generateRegionPlanRef.current?.(ownerIdx)
+          }
+        }
+
         // Derive the effective planning slice for this tile:
         //   1. Per-tile override (tilePlanningSlices[nsIdx]) if the user re-planned.
-        //   2. Pre-cropped global plan slice (globalTilePlanSlices[nsIdx]).
+        //   2. Pre-cropped plan slice (globalTilePlanSlices[nsIdx]) — sourced
+        //      from either the whole-scene plan or this tile's owning region.
         //   3. null = no planning guide available yet.
         const currentPlan = pendingTiledPlanRef.current
         const perTileSlice  = currentPlan?.tilePlanningSlices[nsIdx] ?? null
@@ -1072,7 +1159,9 @@ export default function Home() {
         if (!prev) return null
         const next = [...prev.tilePreviews]
         next[nsIdx] = raw
-        const updated = { ...prev, tilePreviews: next, generatingTileIdx: null, generatingPlanOnly: false }
+        const staleTileIds = new Set(prev.staleTileIds)
+        staleTileIds.delete(nsIdx)
+        const updated = { ...prev, tilePreviews: next, staleTileIds, generatingTileIdx: null, generatingPlanOnly: false }
         // Sync the ref immediately (not just on next render) so callers that
         // chain straight into acceptTile — e.g. the "Generate all" loop —
         // read the freshly-generated preview instead of a stale null.
@@ -1211,7 +1300,9 @@ export default function Home() {
         if (!prev) return null
         const next = [...prev.tilePreviews]
         next[nsIdx] = upscaled
-        const updated = { ...prev, tilePreviews: next, acceptingPlanTileIdx: null }
+        const staleTileIds = new Set(prev.staleTileIds)
+        staleTileIds.delete(nsIdx)
+        const updated = { ...prev, tilePreviews: next, staleTileIds, acceptingPlanTileIdx: null }
         pendingTiledPlanRef.current = updated
         return updated
       })
@@ -1245,6 +1336,10 @@ export default function Home() {
    *
    * Re-runnable at any time via "Re-run Global Plan". Resets per-tile overrides
    * so they stay consistent with the new plan.
+   *
+   * In regional mode there is no single whole-scene plan — each region is
+   * planned and re-planned independently via generateRegionPlan — so this
+   * is a no-op there.
    */
   const generateGlobalPlan = useCallback(async (direction: Direction) => {
     const plan = pendingTiledPlanRef.current
@@ -1256,6 +1351,7 @@ export default function Home() {
     // Global plan only applies to multi-tile non-keyed extensions.
     const isKeyedLayer = !!plan.layerRole && plan.layerRole !== 'sky'
     if (plan.nonSkippedCount <= 1 || isKeyedLayer) return
+    if (plan.isRegionalPlan) return
 
     setPendingTiledPlan((prev) =>
       prev ? { ...prev, isGlobalPlanGenerating: true } : null
@@ -1272,7 +1368,7 @@ export default function Home() {
         plan.imageHeight,
         plan.contextSize,
         plan.extensionSize,
-        PLANNING_MAP_MAX_DIM,
+        MAX_AI_DIMENSION,
       )
 
       const effectivePrompt = customPrompt.trim() || undefined
@@ -1352,10 +1448,173 @@ export default function Home() {
     }
   }, [apiKey, selectedModel, mode, sceneBrief, customPrompt, artStyle])
 
+  /**
+   * Generate (or regenerate) ONE region's plan in a regionally-planned
+   * extension. Independent of tile refine: this only updates the region's
+   * slice of `globalTilePlanSlices` (and flags any of its owned tiles that
+   * already had a result/acceptance as "stale") — it never auto-triggers
+   * Phase 3 for the region's tiles. That stays a separate, per-tile action,
+   * exactly like today's Phase‑2 per-tile re-plan pattern.
+   */
+  const generateRegionPlan = useCallback(async (regionIdx: number) => {
+    const plan = pendingTiledPlanRef.current
+    if (!plan || !plan.isRegionalPlan || !plan.regionGrouping) return
+    const region = plan.regionGrouping.regions[regionIdx]
+    if (!region) return
+    const canvas = bandCanvasRef.current
+    if (!canvas) return
+    if (plan.generatingRegionIdx !== null) return
+
+    setPendingTiledPlan((prev) =>
+      prev ? { ...prev, generatingRegionIdx: regionIdx } : null
+    )
+
+    try {
+      const priorRegionResults: Array<PriorRegionResult | null> = plan.regionGrouping.regions.map((r, i) =>
+        plan.regionResults[i]
+          ? { resultUrl: plan.regionResults[i] as string, scale: plan.regionScales[i], bandRect: r.bandRect }
+          : null
+      )
+
+      const { mapDataUrl, mapWidth, mapHeight, scale, tileRegionsInMap } = await buildRegionalPlanningMap(
+        canvas,
+        plan.nonSkippedTileSpecs,
+        plan.tileAccepted,
+        plan.regionGrouping,
+        region,
+        priorRegionResults,
+        MAX_AI_DIMENSION,
+        {
+          sourceImageDataUrl: plan.sourceImage,
+          direction: plan.direction,
+          imageWidth: plan.imageWidth,
+          imageHeight: plan.imageHeight,
+          contextSize: plan.contextSize,
+          extensionSize: plan.extensionSize,
+        },
+      )
+
+      const populatedRefs = (plan.regionReferenceImages[regionIdx] ?? []).filter((r) => r.dataUrl.length > 0)
+      const effectivePrompt = (plan.regionPrompts[regionIdx] || '').trim() || customPrompt.trim() || undefined
+
+      const response = await fetch('/api/extend', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          expandedCanvas: mapDataUrl,
+          direction: plan.direction,
+          extensionAmount: EXTENSION_PERCENT,
+          customPrompt: effectivePrompt,
+          artStyle: artStyle !== 'none' ? artStyle : undefined,
+          apiKey: apiKey || undefined,
+          model: selectedModel,
+          layerRole: plan.layerRole,
+          sceneBrief: mode === 'parallax' && sceneBrief.trim() ? sceneBrief.trim() : undefined,
+          referenceImages: populatedRefs.length > 0 ? populatedRefs : undefined,
+          phase: 'plan',
+          planScope: 'region',
+          regionIndex: regionIdx,
+          regionCount: plan.regionGrouping.regions.length,
+        }),
+      })
+      const data = await response.json() as { imageUrl?: string; error?: string }
+      if (!response.ok) {
+        const err = new Error(data.error || 'Region plan API call failed') as Error & { status?: number }
+        err.status = response.status
+        throw err
+      }
+
+      const rawResult = data.imageUrl as string
+      const normalizedResult = await normalizeImageToSize(rawResult, mapWidth, mapHeight)
+
+      const current = pendingTiledPlanRef.current
+      if (!current || !current.regionGrouping) return
+
+      // Crop each newly-owned tile's slice out of this region's plan result
+      // into the same flattened globalTilePlanSlices array Phase 3 reads from
+      // — identical contract to the single whole-scene plan path.
+      const nextGlobalTilePlanSlices = [...current.globalTilePlanSlices]
+      const nextStale = new Set(current.staleTileIds)
+      for (const [nsIdx, mapRect] of Array.from(tileRegionsInMap.entries())) {
+        if (mapRect.width === 0 || mapRect.height === 0) continue
+        nextGlobalTilePlanSlices[nsIdx] = await cropPlanningResult(normalizedResult, mapRect)
+        if (current.tilePreviews[nsIdx] || current.tileAccepted[nsIdx]) {
+          nextStale.add(nsIdx)
+        } else {
+          nextStale.delete(nsIdx)
+        }
+      }
+
+      const nextRegionResults = [...current.regionResults]
+      nextRegionResults[regionIdx] = normalizedResult
+      const nextRegionScales = [...current.regionScales]
+      nextRegionScales[regionIdx] = scale
+      const nextRegionPlanningMaps = [...current.regionPlanningMaps]
+      nextRegionPlanningMaps[regionIdx] = mapDataUrl
+
+      // Refresh the extension-view background composite now that a new
+      // region result is available.
+      const viewport = current.direction === 'down'
+        ? { x: 0, y: current.contextSize, width: current.bandWidth, height: current.extensionSize }
+        : current.direction === 'up'
+        ? { x: 0, y: 0, width: current.bandWidth, height: current.extensionSize }
+        : current.direction === 'right'
+        ? { x: current.contextSize, y: 0, width: current.extensionSize, height: current.bandHeight }
+        : { x: 0, y: 0, width: current.extensionSize, height: current.bandHeight }
+      const priorForView: Array<PriorRegionResult | null> = current.regionGrouping.regions.map((r, i) =>
+        (i === regionIdx ? normalizedResult : nextRegionResults[i])
+          ? { resultUrl: (i === regionIdx ? normalizedResult : nextRegionResults[i]) as string, scale: nextRegionScales[i], bandRect: r.bandRect }
+          : null
+      )
+      const extensionView = await buildRegionalExtensionView(priorForView, viewport, MAX_AI_DIMENSION, {
+        direction: current.direction,
+        imageWidth: current.imageWidth,
+        imageHeight: current.imageHeight,
+        contextSize: current.contextSize,
+        extensionSize: current.extensionSize,
+      })
+
+      setPendingTiledPlan((prev) => {
+        if (!prev) return null
+        return {
+          ...prev,
+          regionResults: nextRegionResults,
+          regionScales: nextRegionScales,
+          regionPlanningMaps: nextRegionPlanningMaps,
+          globalTilePlanSlices: nextGlobalTilePlanSlices,
+          globalPlanExtensionView: extensionView || prev.globalPlanExtensionView,
+          staleTileIds: nextStale,
+          generatingRegionIdx: null,
+          // Reset this region's owned tiles' Phase-2 per-tile overrides so
+          // they match the new region plan baseline (mirrors the whole-scene
+          // plan's reset of tilePlanningSlices).
+          tilePlanningSlices: prev.tilePlanningSlices.map((slice, nsIdx) =>
+            prev.tileRegionOwner[nsIdx] === regionIdx ? null : slice
+          ),
+        }
+      })
+    } catch (err) {
+      const e = err as Error & { status?: number }
+      setError(e.message || 'Region plan generation failed')
+      if (e.status === 401) {
+        setApiKeyRequired(true)
+        setShowApiKeyModal(true)
+      }
+      setPendingTiledPlan((prev) =>
+        prev ? { ...prev, generatingRegionIdx: null } : null
+      )
+    }
+  }, [apiKey, selectedModel, mode, sceneBrief, customPrompt, artStyle])
+
   // Keep the ref in sync so startTiledPlan (zero-dep useCallback) can call it.
   useEffect(() => {
     generateGlobalPlanRef.current = generateGlobalPlan
   }, [generateGlobalPlan])
+
+  // Keep the ref in sync so generateTile can call the latest version.
+  useEffect(() => {
+    generateRegionPlanRef.current = generateRegionPlan
+  }, [generateRegionPlan])
 
   /**
    * Poll for an in-flight Phase-1 global plan to finish. We poll the ref
@@ -1366,6 +1625,17 @@ export default function Home() {
   const waitForGlobalPlan = async () => {
     while (
       pendingTiledPlanRef.current?.isGlobalPlanGenerating &&
+      !autoGenerateTilesStopRef.current
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 150))
+    }
+  }
+
+  /** Poll for an in-flight regional plan call (any region) to finish. */
+  const waitForRegionPlan = async () => {
+    while (
+      pendingTiledPlanRef.current?.generatingRegionIdx !== null &&
+      pendingTiledPlanRef.current?.generatingRegionIdx !== undefined &&
       !autoGenerateTilesStopRef.current
     ) {
       await new Promise((resolve) => setTimeout(resolve, 150))
@@ -1390,12 +1660,13 @@ export default function Home() {
     setActiveTileModalIdx(null)
 
     try {
-      // Multi-tile, non-keyed extensions rely on the Phase 1 global plan for
-      // composition guidance — wait for one already in flight, or kick one
-      // off if it hasn't run yet, before generating any tile.
+      // Multi-tile, non-keyed extensions rely on a Phase 1 plan for
+      // composition guidance. Single whole-scene mode needs it once, up
+      // front; regional mode needs each tile's OWNING region planned before
+      // that specific tile, which is checked lazily inside the loop below.
       const isKeyedLayer = !!plan.layerRole && plan.layerRole !== 'sky'
-      const needsGlobalPlan = plan.nonSkippedCount > 1 && !isKeyedLayer
-      if (needsGlobalPlan) {
+      const needsPlan = plan.nonSkippedCount > 1 && !isKeyedLayer
+      if (needsPlan && !plan.isRegionalPlan) {
         if (pendingTiledPlanRef.current?.isGlobalPlanGenerating) {
           await waitForGlobalPlan()
         }
@@ -1412,6 +1683,23 @@ export default function Home() {
         if (!current) break
         const nsIdx = getNextPendingTileIdx(current.tileAccepted)
         if (nsIdx === null) break
+
+        if (needsPlan && current.isRegionalPlan && current.regionGrouping) {
+          const ownerIdx = current.tileRegionOwner[nsIdx]
+          if (ownerIdx >= 0 && !current.regionResults[ownerIdx]) {
+            if (current.generatingRegionIdx !== null) {
+              await waitForRegionPlan()
+            }
+            if (
+              !autoGenerateTilesStopRef.current &&
+              !pendingTiledPlanRef.current?.regionResults[ownerIdx]
+            ) {
+              setProgressMsg(`Planning region ${ownerIdx + 1}/${current.regionGrouping.regions.length}…`)
+              await generateRegionPlan(ownerIdx)
+            }
+            if (autoGenerateTilesStopRef.current) break
+          }
+        }
 
         setProgressMsg(`Generating tile ${nsIdx + 1}/${current.nonSkippedCount}…`)
         await generateTile(nsIdx)
@@ -1430,7 +1718,7 @@ export default function Home() {
       autoGenerateTilesStopRef.current = false
       setProgressMsg(null)
     }
-  }, [isAutoGeneratingTiles, generateTile, acceptTile, generateGlobalPlan])
+  }, [isAutoGeneratingTiles, generateTile, acceptTile, generateGlobalPlan, generateRegionPlan])
 
   /** Stop the auto-generate-all loop — the current in-flight tile still finishes. */
   const stopAutoGenerateTiles = useCallback(() => {
@@ -1532,6 +1820,39 @@ export default function Home() {
     )
     bandCanvasRef.current = canvas
 
+    // Very large extensions (band longest edge far beyond a single plan
+    // call's resolution budget) switch to the region-layer path: the tile
+    // grid is grouped into regions, each planned independently at full
+    // MAX_AI_DIMENSION resolution instead of one heavily-downscaled
+    // whole-scene plan. See groupTilesIntoPlanRegions() for the mechanics.
+    const isKeyedLayerForRegions = !!layerRole && layerRole !== 'sky'
+    const maxBandDim = Math.max(plan.bandWidth, plan.bandHeight)
+    const wantsRegionalPlan =
+      nonSkippedCount > 1 &&
+      !isKeyedLayerForRegions &&
+      maxBandDim > MAX_AI_DIMENSION * REGIONAL_PLAN_TRIGGER_MULTIPLIER
+
+    let regionGrouping: PlanRegionGrouping | null = null
+    if (wantsRegionalPlan) {
+      try {
+        regionGrouping = groupTilesIntoPlanRegions(
+          nonSkippedTileSpecs,
+          PLAN_REGION_MAX_SCENE_DIM,
+          PLAN_REGION_OVERLAP_TILES,
+          MAX_PLAN_REGIONS,
+        )
+      } catch (err) {
+        // Region grouping exceeded the cost guard — fall back to the single
+        // whole-scene plan path rather than blocking the extension entirely.
+        setError(err instanceof Error ? err.message : 'Failed to plan regions; using a single global plan instead')
+        regionGrouping = null
+      }
+    }
+    const tileRegionOwner = regionGrouping
+      ? nonSkippedTileSpecs.map((t) => regionGrouping!.regionOf(t.row, t.col))
+      : new Array<number>(nonSkippedCount).fill(-1)
+    const regionCount = regionGrouping?.regions.length ?? 0
+
     const newPlan: PendingTiledPlan = {
       plan,
       direction,
@@ -1562,15 +1883,27 @@ export default function Home() {
       globalPlanWidth: 0,
       globalPlanHeight: 0,
       isGlobalPlanGenerating: false,
+      isRegionalPlan: !!regionGrouping,
+      regionGrouping,
+      tileRegionOwner,
+      regionPlanningMaps: new Array<string | null>(regionCount).fill(null),
+      regionResults: new Array<string | null>(regionCount).fill(null),
+      regionScales: new Array<number>(regionCount).fill(1),
+      regionPrompts: new Array<string>(regionCount).fill(''),
+      regionReferenceImages: Array.from({ length: regionCount }, () => [] as ReferenceImage[]),
+      generatingRegionIdx: null,
+      staleTileIds: new Set<number>(),
     }
 
     pendingTiledPlanRef.current = newPlan
     setPendingTiledPlan(newPlan)
 
-    // Kick off Phase 1 (global plan) immediately for multi-tile, non-keyed extensions.
+    // Kick off Phase 1 (global plan) immediately for multi-tile, non-keyed,
+    // non-regional extensions. Regional plans have no whole-scene plan step —
+    // each region is generated independently, on demand, via generateRegionPlan.
     // Uses a ref to avoid stale closures in this zero-dep useCallback.
     const isKeyedLayerCheck = !!layerRole && layerRole !== 'sky'
-    if (nonSkippedCount > 1 && !isKeyedLayerCheck) {
+    if (nonSkippedCount > 1 && !isKeyedLayerCheck && !regionGrouping) {
       void generateGlobalPlanRef.current?.(direction)
     }
   }, [])
@@ -4750,13 +5083,27 @@ export default function Home() {
                   globalPlanResult: pendingTiledPlan.globalPlanResult,
                   globalPlanExtensionView: pendingTiledPlan.globalPlanExtensionView,
                   isGlobalPlanGenerating: pendingTiledPlan.isGlobalPlanGenerating,
+                  regions: pendingTiledPlan.regionGrouping?.regions.map((r) => ({
+                    index: r.index,
+                    bandX: r.bandRect.x,
+                    bandY: r.bandRect.y,
+                    width: r.bandRect.width,
+                    height: r.bandRect.height,
+                    hasResult: pendingTiledPlan.regionResults[r.index] !== null,
+                    isGenerating: pendingTiledPlan.generatingRegionIdx === r.index,
+                    hasStaleTiles: pendingTiledPlan.tileRegionOwner.some(
+                      (ownerIdx, nsIdx) => ownerIdx === r.index && pendingTiledPlan.staleTileIds.has(nsIdx)
+                    ),
+                  })),
+                  staleTileIds: pendingTiledPlan.staleTileIds,
                 } satisfies TilingState)
               : null
           }
           onTileClick={(nsIdx) => setActiveTileModalIdx(nsIdx)}
+          onRegionClick={(regionIdx) => setActiveRegionModalIdx(regionIdx)}
           onTileCancel={cancelTiledPlan}
           onRerunGlobalPlan={
-            pendingTiledPlan
+            pendingTiledPlan && !pendingTiledPlan.isRegionalPlan
               ? () => void generateGlobalPlan(pendingTiledPlan.direction)
               : undefined
           }
@@ -4862,6 +5209,87 @@ export default function Home() {
             onAcceptPlan={() => void acceptTilePlan(nsIdx)}
             onClose={() => setActiveTileModalIdx(null)}
             isReplanInProgress={plan.generatingTileIdx === nsIdx && plan.generatingPlanOnly}
+            owningRegion={
+              plan.isRegionalPlan && plan.regionGrouping && plan.tileRegionOwner[nsIdx] >= 0
+                ? { index: plan.tileRegionOwner[nsIdx], count: plan.regionGrouping.regions.length }
+                : null
+            }
+            onJumpToRegion={() => {
+              const ownerIdx = plan.tileRegionOwner[nsIdx]
+              if (ownerIdx < 0) return
+              setActiveTileModalIdx(null)
+              setActiveRegionModalIdx(ownerIdx)
+            }}
+            isStale={plan.staleTileIds.has(nsIdx)}
+          />
+        )
+      })()}
+
+      {pendingTiledPlan?.isRegionalPlan && pendingTiledPlan.regionGrouping && activeRegionModalIdx !== null && (() => {
+        const plan = pendingTiledPlan
+        const regionIdx = activeRegionModalIdx
+        const region = plan.regionGrouping?.regions[regionIdx]
+        if (!region || !plan.regionGrouping) return null
+        const ownedTiles = plan.nonSkippedTileSpecs
+          .map((t, nsIdx) => ({ t, nsIdx }))
+          .filter(({ nsIdx }) => plan.tileRegionOwner[nsIdx] === regionIdx)
+          .map(({ t, nsIdx }) => ({
+            nsIdx,
+            row: t.row,
+            col: t.col,
+            isStale: plan.staleTileIds.has(nsIdx),
+            hasResult: !!plan.tilePreviews[nsIdx],
+            isAccepted: plan.tileAccepted[nsIdx],
+          }))
+        return (
+          <RegionPlanModal
+            open
+            regionIdx={regionIdx}
+            regionCount={plan.regionGrouping.regions.length}
+            region={region}
+            direction={plan.direction}
+            regionPrompt={plan.regionPrompts[regionIdx] ?? ''}
+            globalPrompt={customPrompt}
+            artStyle={artStyle}
+            sceneBrief={mode === 'parallax' ? sceneBrief : undefined}
+            planningMap={plan.regionPlanningMaps[regionIdx] ?? null}
+            bandCanvas={bandCanvasRef.current}
+            sourceImage={plan.sourceImage}
+            imageWidth={plan.imageWidth}
+            imageHeight={plan.imageHeight}
+            contextSize={plan.contextSize}
+            extensionSize={plan.extensionSize}
+            regionGrouping={plan.regionGrouping}
+            nonSkippedTileSpecs={plan.nonSkippedTileSpecs}
+            tileAccepted={plan.tileAccepted}
+            regionResults={plan.regionResults}
+            regionScales={plan.regionScales}
+            result={plan.regionResults[regionIdx] ?? null}
+            isGenerating={plan.generatingRegionIdx === regionIdx}
+            regionReferenceImages={plan.regionReferenceImages[regionIdx] ?? []}
+            ownedTiles={ownedTiles}
+            onSetRegionPrompt={(v) =>
+              setPendingTiledPlan((prev) => {
+                if (!prev) return null
+                const next = [...prev.regionPrompts]
+                next[regionIdx] = v
+                return { ...prev, regionPrompts: next }
+              })
+            }
+            onSetRegionReferenceImages={(v) =>
+              setPendingTiledPlan((prev) => {
+                if (!prev) return null
+                const next = [...prev.regionReferenceImages]
+                next[regionIdx] = v
+                return { ...prev, regionReferenceImages: next }
+              })
+            }
+            onRegenerate={() => void generateRegionPlan(regionIdx)}
+            onClose={() => setActiveRegionModalIdx(null)}
+            onJumpToTile={(nsIdx) => {
+              setActiveRegionModalIdx(null)
+              setActiveTileModalIdx(nsIdx)
+            }}
           />
         )
       })()}

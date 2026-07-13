@@ -73,6 +73,17 @@ export interface BuildGlobalPlanningPromptParams {
   referenceImages?: { description: string }[]
 }
 
+export interface BuildRegionalPlanningPromptParams {
+  direction: 'up' | 'down' | 'left' | 'right'
+  /** 0-based index of this region among all regions of the extension. */
+  regionIndex: number
+  regionCount: number
+  customPrompt?: string | null
+  artStyle?: string | null
+  sceneBrief?: string | null
+  referenceImages?: { description: string }[]
+}
+
 // ── Art style labels ─────────────────────────────────────────────────────────
 
 export const ART_STYLE_DESCRIPTIONS: Record<string, string> = {
@@ -566,6 +577,100 @@ STYLE RULES (critical):
 - Return the complete image at the SAME dimensions as the input.
 - Every grey (#B0B0B0) pixel must be replaced with scene content.
 - No seam, colour shift, or brightness jump at the grey↔real boundary.`
+
+  return prompt
+}
+
+// ── Regional extension planning prompt ────────────────────────────────────────
+
+/**
+ * Build the prompt for a single REGION of a regionally-planned extension.
+ *
+ * Very large extensions (far beyond a single MAX_AI_DIMENSION plan call's
+ * resolution budget) are split into several regions, each covering a slice
+ * of the tile grid and planned independently at the full MAX_AI_DIMENSION
+ * budget — see groupTilesIntoPlanRegions() in imageProcessor.ts. This prompt
+ * is the region-scoped counterpart to buildGlobalPlanningPrompt():
+ *   - The WORKING CANVAS is only a slice of the full scene, not the whole
+ *     source image, so the model needs to know it's one part of something
+ *     larger and is free to invent locally-plausible detail rather than
+ *     forcing a single tight global composition.
+ *   - Any non-grey pixel in the extension area may be either an already-
+ *     accepted tile OR the carried-forward edge of the neighbouring region —
+ *     both must be preserved exactly, same as buildGlobalPlanningPrompt's
+ *     already-accepted-tile handling.
+ */
+export function buildRegionalPlanningPrompt(params: BuildRegionalPlanningPromptParams): string {
+  const {
+    direction, regionIndex, regionCount, customPrompt, artStyle, sceneBrief,
+    referenceImages,
+  } = params
+  const hasRefs = !!(referenceImages && referenceImages.length > 0)
+
+  const dirLabel = direction === 'up' ? 'top'
+    : direction === 'down' ? 'bottom'
+    : direction === 'left' ? 'left'
+    : 'right'
+
+  const preamble = hasRefs
+    ? `MULTI-IMAGE REQUEST — IMAGE ROLES:
+- IMAGE 1: your WORKING CANVAS — the regional planning map described below.
+- IMAGE 2, 3, …: REFERENCE ONLY — style or content guides. Do NOT return them.
+
+`
+    : ''
+
+  let prompt = `${preamble}EXTENSION PLAN — REGIONAL COMPOSITION PASS (region ${regionIndex + 1} of ${regionCount}).
+
+The WORKING CANVAS shows ONE REGION of a much larger extension — a slice of the source image and extension area on the ${dirLabel}, NOT the full scene. Any non-grey pixel in the extension area is already-decided content: either an already-accepted high-resolution tile, or the carried-forward edge shared with a neighbouring region. Preserve all such pixels EXACTLY.
+
+THIS IS A LOW-RESOLUTION COMPOSITION PASS, NOT A DETAIL PASS: a later high-resolution step sharpens the result, so a blurry but well-continued extension is far more useful than a sharp but disconnected one. Prioritize COHERENCE with the real pixels you can see over inventing new detail: treat every visible non-grey pixel — the source context strip and any carried-forward overlap — as ground truth, and build your fill outward from it, rather than composing something new that merely resembles it.
+
+COLOUR REGIONS:
+- GREY (#B0B0B0): FILL THIS AREA — replace every grey pixel with plausible scene content.
+- All other pixels: already-decided content — preserve these EXACTLY unchanged.
+
+YOUR TASK:
+1. Fill EVERY grey pixel with a direct, literal continuation of the scene visible in this region — extend what's actually there, don't reinterpret or restart it.
+2. Preserve all non-grey pixels exactly as they appear — do NOT modify them, including any shared edge carried over from a neighbouring region.
+3. Return the image at the SAME pixel dimensions as the input.
+
+COMPOSITION RULES:
+- Match the EXACT visual style of the visible pixels: same realism level, colour rendering, shading, and art medium.
+- Continue the scene naturally across the shared edges you can see: same horizon line, lighting direction, atmosphere, and scale. The visible edge is your anchor — the fill should look like an obvious, uninterrupted continuation of it, not a new composition that happens to sit next to it.
+- This is ONE REGION of a large, busy scene extending far beyond what this canvas shows. You do NOT need to mirror a single exact global layout — treat this region as its own patch of the same environment, free to place independent local detail (background elements, terrain variation, points of interest not visible elsewhere). This freedom applies to what's FAR from any visible edge — right at a visible edge, continuity always wins over novelty.
+- Do not leave any grey (#B0B0B0) pixels unchanged — a fully grey output is a FAILURE.
+
+STYLE RULES (critical):
+- Do NOT simplify into cartoon, anime, pixel art, 8-bit, flat-shaded, or clip-art aesthetics unless the visible pixels already use that exact style.
+- Preserve continuous tones, natural textures, and the same colour depth as the visible pixels — even at this lower resolution.
+- Focus on correct layout and tonal composition; avoid hard outlines, posterized colour bands, and blocky simplified forms.`
+
+  if (artStyle && ART_STYLE_DESCRIPTIONS[artStyle]) {
+    prompt += `\n\nARTISTIC STYLE: ${ART_STYLE_DESCRIPTIONS[artStyle]}.`
+  }
+
+  if (customPrompt) {
+    prompt += `\n\nUSER DIRECTION for the grey area of this region: "${customPrompt}"`
+  }
+
+  if (typeof sceneBrief === 'string' && sceneBrief.trim()) {
+    prompt += `\n\nSHARED SCENE DIRECTION:\n${sceneBrief.trim()}`
+  }
+
+  if (hasRefs && referenceImages) {
+    const refLines = referenceImages.map((ref, i) => {
+      const label = `IMAGE ${i + 2}`
+      const note = ref.description.trim() ? ref.description.trim() : 'general style or scene reference'
+      return `- ${label}: ${note}`
+    })
+    prompt += `\n\nREFERENCE IMAGES:\n${refLines.join('\n')}\nUse these for style and content guidance when filling the grey area.`
+  }
+
+  prompt += `\n\nCRITICAL OUTPUT RULES:
+- Return the complete image at the SAME dimensions as the input.
+- Every grey (#B0B0B0) pixel must be replaced with scene content.
+- No seam, colour shift, or brightness jump at any grey↔real boundary.`
 
   return prompt
 }
