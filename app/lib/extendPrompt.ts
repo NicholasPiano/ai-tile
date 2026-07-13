@@ -84,6 +84,28 @@ export interface BuildRegionalPlanningPromptParams {
   referenceImages?: { description: string }[]
 }
 
+/**
+ * Merge the CommandBar global prompt with a tile/region-specific override.
+ * Global comes first; specific appends when both are set. Either alone is fine.
+ */
+export function combineExtendPrompts(
+  globalPrompt: string | null | undefined,
+  specificPrompt: string | null | undefined,
+): string | undefined {
+  const global = typeof globalPrompt === 'string' ? globalPrompt.trim() : ''
+  const specific = typeof specificPrompt === 'string' ? specificPrompt.trim() : ''
+  if (global.length > 0 && specific.length > 0) {
+    return `${global}\n\n${specific}`
+  }
+  if (specific.length > 0) {
+    return specific
+  }
+  if (global.length > 0) {
+    return global
+  }
+  return undefined
+}
+
 // ── Art style labels ─────────────────────────────────────────────────────────
 
 export const ART_STYLE_DESCRIPTIONS: Record<string, string> = {

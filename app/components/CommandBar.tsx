@@ -13,6 +13,8 @@ export function CommandBar({
   sceneBrief,
   setSceneBrief,
   sceneBriefLoading,
+  onDownload,
+  canDownload,
 }: {
   prompt: string
   setPrompt: (v: string) => void
@@ -23,6 +25,10 @@ export function CommandBar({
   sceneBrief?: string
   setSceneBrief?: (v: string) => void
   sceneBriefLoading?: boolean
+  /** Download the completed extension as PNG (Edit-style Save). */
+  onDownload?: () => void
+  /** True once an extension has been accepted and no tiled session is open. */
+  canDownload?: boolean
 }) {
   return (
     <div className="relative z-10 flex flex-col items-center gap-2 px-4 pb-6 pt-2">
@@ -71,19 +77,20 @@ export function CommandBar({
           boxShadow: '0 12px 32px -12px rgba(0,0,0,0.6)',
         }}
       >
-        <input
+        <textarea
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
           disabled={loading}
+          rows={3}
           placeholder={
             hint ?? 'Optional: describe what should appear in the new area…'
           }
-          className="flex-1 bg-transparent px-3 py-2.5 text-[14px] focus:outline-none"
+          className="field min-h-[4.5rem] flex-1 resize-y bg-transparent px-3 py-2.5 text-[14px] leading-relaxed focus:outline-none"
           style={{ color: 'var(--text)' }}
         />
 
         <div
-          className="hidden items-center sm:flex"
+          className="hidden items-center self-start sm:flex"
           style={{ borderLeft: '1px solid var(--border)' }}
         >
           <select
@@ -111,6 +118,24 @@ export function CommandBar({
             )}
           </select>
         </div>
+
+        {onDownload && (
+          <button
+            type="button"
+            onClick={onDownload}
+            disabled={loading || !canDownload}
+            className="btn btn-ghost shrink-0 self-center text-[12px]"
+            style={{ padding: '2px 10px', height: 28 }}
+            title={
+              canDownload
+                ? 'Download completed extension as PNG'
+                : 'Available after you accept a completed extension'
+            }
+          >
+            <Icons.Download size={12} />
+            Save
+          </button>
+        )}
       </div>
     </div>
   )

@@ -86,13 +86,11 @@ export function ResultActions({
   onAccept,
   onRegenerate,
   onDiscard,
-  onDownload,
   loading,
 }: {
   onAccept: () => void
   onRegenerate: () => void
   onDiscard: () => void
-  onDownload: () => void
   loading: boolean
 }) {
   return (
@@ -121,15 +119,6 @@ export function ResultActions({
       >
         {loading ? <Icons.Spinner size={14} /> : <Icons.Refresh size={14} />}
         Regenerate
-      </button>
-      <button
-        onClick={onDownload}
-        disabled={loading}
-        className="btn btn-ghost"
-        title="Download as PNG"
-      >
-        <Icons.Download size={14} />
-        Download
       </button>
       <div
         className="mx-1 h-5 w-px"

@@ -12,13 +12,14 @@ import { TileStudio } from '@/app/components/TileStudio'
 import { TopBar } from '@/app/components/TopBar'
 import { ResultActions, VariantSelector } from '@/app/components/VariantSelector'
 import { Workspace, TilingState, TileCellDisplay } from '@/app/components/Workspace'
-import { Candidate, Direction, EXTENSION_PERCENT, MAX_AI_DIMENSION, MAX_PLAN_REGIONS, MAX_TILES_PER_EXTEND, Mode, PLAN_REGION_MAX_SCENE_DIM, PLAN_REGION_OVERLAP_TILES, REGIONAL_PLAN_TRIGGER_MULTIPLIER, ReferenceImage, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, TILE_OVERLAP_PX } from '@/app/lib/app'
+import { Candidate, Direction, EXTENSION_PERCENT, MAX_AI_DIMENSION, MAX_PLAN_REGIONS, MAX_TILES_PER_EXTEND, Mode, PLAN_REGION_MAX_SCENE_DIM, PLAN_REGION_OVERLAP_TILES, REGIONAL_PLAN_TRIGGER_MULTIPLIER, ReferenceImage, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, TILE_OVERLAP_PX, timestampForFilename } from '@/app/lib/app'
 import { findStyleLabel } from '@/app/lib/artStyles'
 import { DEFAULT_MODEL, MODELS, getModelConfig, skipsArtDirectorReview } from '@/app/lib/models'
 import { LAYER_ORDER, LAYER_ROLES, LayerRole, PARALLAX_MAX_AUTO_STEPS, ParallaxLayer, WORKFLOW_ORDER, createDefaultLayers, getRecommendedLayerIndex, getWorkflowPrerequisite } from '@/app/lib/parallax'
 import { PROP_BATCH, PROP_BATCH_COLS, PROP_BATCH_H, PROP_BATCH_ROWS, PROP_BATCH_W, PROP_TILE_SIZE, PropItem, nextPropId, propAtlasLayout, resolvePropNames } from '@/app/lib/props'
 import { SPRITE_ANIMATIONS, SPRITE_FRAME_COUNT, SPRITE_FRAME_SIZE, SPRITE_GRID_COLS, SPRITE_GRID_ROWS, SPRITE_SHEET_H, SPRITE_SHEET_W, SPRITE_STRIP_H, SPRITE_STRIP_W, SpriteAnimType, SpriteFrame, SpriteSheet, createEmptySpriteSheet } from '@/app/lib/sprite'
 import { BODY_PLANS, BodyPlan, isAirborneAnim } from '@/app/lib/bodyPlans'
+import { combineExtendPrompts } from '@/app/lib/extendPrompt'
 import { CORNER_GRAFTS, ENABLE_CORNER_RECONCILE, TILESET_ATLAS_EXTRUDE_PX, TILESET_BY_ROLE, TILESET_COLS, TILESET_PADDED_SHEET_H, TILESET_PADDED_SHEET_W, TILESET_PADDED_STRIDE, TILESET_ROWS, TILESET_SHEET_H, TILESET_SHEET_W, TILESET_SLOTS, TILESET_TILE_SIZE, TILE_TEMPLATE_CELL, TILE_TEMPLATE_COLS, TILE_TEMPLATE_H, TILE_TEMPLATE_MASK, TILE_TEMPLATE_ROWS, TILE_TEMPLATE_SAMPLES, TILE_TEMPLATE_W, TileSetRole, TileSetSlot, alignAiOutputToTemplate, applyFeatheredRoleMask, buildTileSheetGuideDataUrl, createEmptyTileSet, rebuildCornerTile, reconcileAllCorners, templateRoleForCell } from '@/app/lib/tileset'
 import { alignSpriteFramesToBaseline, applyFullContextResult, buildGlobalPlanningMap, buildPerTilePlanningMap, buildRegionalExtensionView, buildRegionalPlanningMap, buildTileChunkInfo, buildTileInput, buildTileSliceComposite, buildTilePlanningMap, centerSpriteFramesHorizontally, ChunkInfo, chromaKeyToAlpha, compositeTileResult, computeRegionMapLayout, createChunkedExtension, createFullContextExtension, cropGlobalPlanExtensionView, cropPlanningResult, ExtensionTileSpec, getChunkAlign, getImageDimensions, groupTilesIntoPlanRegions, harmonizeHorizontalSeams, initBandCanvas, isolatePrimarySpriteComponent, isAiExtensionUnfilled, isTileResultUnfilled, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, mapTileRectIntoRegionLayout, measureSeamResidual, normalizeImageToSize, normalizeSpriteFrameScale, PlanRegionGrouping, PlanTileRegion, planExtensionTiles, PriorRegionResult, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk, TiledExtensionPlan } from '@/app/utils/imageProcessor'
 import { SubjectBounds, drawPoseGuideSheet, measureSubjectBounds } from '@/app/utils/poseRig'
@@ -46,6 +47,12 @@ export default function Home() {
     height: number
   } | null>(null)
   const [imageBeforeExtension, setImageBeforeExtension] = useState<string | null>(null)
+  /**
+   * True after the user accepts a finished extension into the base image.
+   * Gates the CommandBar Save button — download is only offered once an
+   * extension is complete (not mid-tiled session, not pre-extend upload).
+   */
+  const [hasCompletedExtension, setHasCompletedExtension] = useState(false)
   const [lastExtensionParams, setLastExtensionParams] = useState<{
     direction: Direction
     customPrompt: string
@@ -583,6 +590,7 @@ export default function Home() {
       setSelectedCandidateIdx(0)
       setError(null)
       setOriginalFileName(filename)
+      setHasCompletedExtension(false)
       const img = new Image()
       img.onload = () => {
         setCurrentImageDimensions({ width: img.width, height: img.height })
@@ -1004,18 +1012,14 @@ export default function Home() {
     try {
       const latestPrompt = pendingTiledPlanRef.current?.tilePrompts[nsIdx] ?? ''
       const trimmedTilePrompt = latestPrompt.trim() || undefined
-      // Phase 1/2 (planning) decide composition, so falling back to the
-      // global description there is reasonable. By Phase 3 (refine) the plan
-      // has already locked in composition — re-applying the global
-      // description risks introducing new content instead of a faithful
-      // high-res render, so only an explicit per-tile override should reach
-      // that call. Single-phase extensions (no plan at all — single tile or
-      // a keyed parallax layer) have no separate composition step, so they
-      // keep the global fallback for the one call they make.
-      const planningPrompt = trimmedTilePrompt || customPrompt.trim() || undefined
+      // Global first, then per-tile override when both are set. Phase 3
+      // (refine) in two-phase mode only sends direction when an explicit
+      // tile override exists — otherwise it stays a faithful high-res
+      // render of the plan. Single-phase extensions always combine.
+      const planningPrompt = combineExtendPrompts(customPrompt, latestPrompt)
       const refinePrompt = useTwoPhase
-        ? trimmedTilePrompt
-        : (trimmedTilePrompt || customPrompt.trim() || undefined)
+        ? (trimmedTilePrompt ? combineExtendPrompts(customPrompt, latestPrompt) : undefined)
+        : combineExtendPrompts(customPrompt, latestPrompt)
       const latestRefs = pendingTiledPlanRef.current?.tileReferenceImages[nsIdx] ?? []
       const populatedRefs = latestRefs.filter((r) => r.dataUrl.length > 0)
 
@@ -1495,7 +1499,10 @@ export default function Home() {
       )
 
       const populatedRefs = (plan.regionReferenceImages[regionIdx] ?? []).filter((r) => r.dataUrl.length > 0)
-      const effectivePrompt = (plan.regionPrompts[regionIdx] || '').trim() || customPrompt.trim() || undefined
+      const effectivePrompt = combineExtendPrompts(
+        customPrompt,
+        plan.regionPrompts[regionIdx] ?? '',
+      )
 
       const response = await fetch('/api/extend', {
         method: 'POST',
@@ -1968,6 +1975,7 @@ export default function Home() {
       })
     } else {
       setSelectedImage(accepted)
+      setHasCompletedExtension(true)
       const img = new Image()
       img.onload = () => {
         setCurrentImageDimensions({ width: img.width, height: img.height })
@@ -1991,18 +1999,15 @@ export default function Home() {
     setActiveDirection(null)
   }
 
+  /**
+   * Download the completed extension as PNG. Filename mirrors Edit Save:
+   * `extended_YYYY-MM-DD_HH-MM-SS.png`.
+   */
   const handleDownload = () => {
-    const target = activeCandidate?.imageUrl ?? selectedImage
-    if (!target) return
+    if (!selectedImage) return
     const link = document.createElement('a')
-    link.href = target
-    const baseName = originalFileName.replace(/\.[^/.]+$/, '') || 'extended'
-    // Tag the filename with the variant index when there are multiple, so
-    // batch-downloading different cycles doesn't overwrite the same file.
-    const variantTag = extendedCandidates.length > 1
-      ? `_v${selectedCandidateIdx + 1}`
-      : ''
-    link.download = `${baseName}_extended${variantTag}.png`
+    link.href = selectedImage
+    link.download = `extended_${timestampForFilename()}.png`
     document.body.appendChild(link)
     link.click()
     document.body.removeChild(link)
@@ -2015,6 +2020,7 @@ export default function Home() {
     setSelectedCandidateIdx(0)
     setCurrentImageDimensions(null)
     setImageBeforeExtension(null)
+    setHasCompletedExtension(false)
     setLastExtensionParams(null)
     setActiveDirection(null)
     setError(null)
@@ -4865,7 +4871,6 @@ export default function Home() {
       onAccept={handleAccept}
       onRegenerate={handleRegenerate}
       onDiscard={handleDiscard}
-      onDownload={handleDownload}
       loading={loading}
     />
   ) : undefined
@@ -5145,6 +5150,13 @@ export default function Home() {
             sceneBrief={showSceneDirection ? sceneBrief : undefined}
             setSceneBrief={showSceneDirection ? setSceneBrief : undefined}
             sceneBriefLoading={sceneBriefLoading}
+            onDownload={!isParallax ? handleDownload : undefined}
+            canDownload={
+              !isParallax &&
+              hasCompletedExtension &&
+              !pendingTiledPlan &&
+              !!selectedImage
+            }
           />
         )}
 

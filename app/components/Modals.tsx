@@ -3,7 +3,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { Icons } from '@/app/components/icons'
 import { ART_STYLE_GROUPS } from '@/app/lib/artStyles'
-import { buildExtendPrompt, buildGlobalPlanningPrompt, buildRegionalPlanningPrompt } from '@/app/lib/extendPrompt'
+import { buildExtendPrompt, buildGlobalPlanningPrompt, buildRegionalPlanningPrompt, combineExtendPrompts } from '@/app/lib/extendPrompt'
 import {
   buildRegionalPlanningMap,
   buildTileChunkInfo,
@@ -1012,17 +1012,18 @@ export function TiledPlanModal({
                     >
                       r{cell.row}×c{cell.col}
                     </span>
-                    <input
-                      type="text"
+                    <textarea
                       value={tilePrompts[idx] ?? ''}
                       onChange={(e) => onSetTilePrompt(idx, e.target.value)}
-                      placeholder="Leave blank to use global prompt"
-                      className="min-w-0 flex-1 rounded-[var(--radius-sm)] px-2.5 py-1 text-[12px]"
+                      rows={2}
+                      placeholder="Leave blank to use global prompt only"
+                      className="field min-w-0 flex-1 resize-y rounded-[var(--radius-sm)] px-2.5 py-1 text-[12px] leading-relaxed"
                       style={{
                         background: 'var(--surface)',
                         border: '1px solid var(--border)',
                         color: 'var(--text)',
                         outline: 'none',
+                        minHeight: '2.5rem',
                       }}
                     />
                   </div>
@@ -1048,17 +1049,18 @@ export function TiledPlanModal({
                 </span>
               </div>
 
-              <input
-                type="text"
+              <textarea
                 value={tilePrompts[currentTileIdx] ?? ''}
                 onChange={(e) => onSetTilePrompt(currentTileIdx, e.target.value)}
-                placeholder="Override prompt for regeneration…"
-                className="mb-3 w-full rounded-[var(--radius-sm)] px-3 py-2 text-[12px]"
+                rows={3}
+                placeholder="Optional tile note — appended after the global prompt…"
+                className="field mb-3 w-full resize-y rounded-[var(--radius-sm)] px-3 py-2 text-[12px] leading-relaxed"
                 style={{
                   background: 'var(--surface)',
                   border: '1px solid var(--border)',
                   color: 'var(--text)',
                   outline: 'none',
+                  minHeight: '4.5rem',
                 }}
               />
 
@@ -1312,14 +1314,13 @@ export function TileExtensionModal({
   const showTwoPhase = nonSkippedCount > 1 && !isKeyedLayer
 
   const trimmedTilePrompt = tilePrompt.trim() || undefined
-  // Mirrors generateTile's split in app/page.tsx: Phase 1/2 (planning) still
-  // falls back to the global description, but Phase 3 (refine) only uses an
-  // explicit per-tile override once a plan exists — composition is already
-  // locked in by then, so the global description shouldn't reappear there.
-  const planningEffectivePrompt = trimmedTilePrompt || globalPrompt.trim() || undefined
+  // Global first, then per-tile override when both are set. Phase 3 (refine)
+  // in two-phase mode only includes direction when an explicit tile override
+  // exists — otherwise it stays a faithful high-res render of the plan.
+  const planningEffectivePrompt = combineExtendPrompts(globalPrompt, tilePrompt)
   const refineEffectivePrompt = showTwoPhase
-    ? trimmedTilePrompt
-    : (trimmedTilePrompt || globalPrompt.trim() || undefined)
+    ? (trimmedTilePrompt ? combineExtendPrompts(globalPrompt, tilePrompt) : undefined)
+    : combineExtendPrompts(globalPrompt, tilePrompt)
 
   const assembledPrompt = buildExtendPrompt({
     direction,
@@ -1442,27 +1443,28 @@ export function TileExtensionModal({
               >
                 Prompt override
               </p>
-              <input
-                type="text"
+              <textarea
                 value={tilePrompt}
                 onChange={(e) => onSetTilePrompt(e.target.value)}
+                rows={3}
                 placeholder={
                   showTwoPhase
                     ? globalPrompt.trim()
-                      ? 'Refinement ignores the global prompt — leave blank for a faithful high-res render, or type a specific instruction for this tile'
-                      : 'Leave blank — faithful high-res render of the plan'
+                      ? 'Optional tile note — appended after the global prompt for planning; refine uses both when set'
+                      : 'Optional tile-specific direction (appended after the global prompt when set)'
                     : globalPrompt.trim()
-                    ? `Using global: "${globalPrompt.trim().slice(0, 60)}"`
+                    ? 'Optional tile note — appended after the global prompt'
                     : 'Leave blank — natural scene continuation'
                 }
                 disabled={isBusy}
-                className="w-full rounded-[var(--radius-sm)] px-3 py-2 text-[12px]"
+                className="field w-full resize-y rounded-[var(--radius-sm)] px-3 py-2 text-[12px] leading-relaxed"
                 style={{
                   background: 'var(--surface)',
                   border: '1px solid var(--border)',
                   color: 'var(--text)',
                   outline: 'none',
                   opacity: isBusy ? 0.6 : 1,
+                  minHeight: '4.5rem',
                 }}
               />
             </div>
@@ -2042,7 +2044,7 @@ export function RegionPlanModal({
   const regionInputSrc = liveInputUrl ?? planningMap
 
   const populatedRefs = regionReferenceImages.filter((r) => r.dataUrl.length > 0)
-  const effectivePrompt = regionPrompt.trim() || globalPrompt.trim() || undefined
+  const effectivePrompt = combineExtendPrompts(globalPrompt, regionPrompt)
   const assembledPrompt = buildRegionalPlanningPrompt({
     direction,
     regionIndex: regionIdx,
@@ -2135,23 +2137,24 @@ export function RegionPlanModal({
               >
                 Prompt override
               </p>
-              <input
-                type="text"
+              <textarea
                 value={regionPrompt}
                 onChange={(e) => onSetRegionPrompt(e.target.value)}
+                rows={3}
                 placeholder={
                   globalPrompt.trim()
-                    ? `Using global: "${globalPrompt.trim().slice(0, 60)}"`
+                    ? 'Optional region note — appended after the global prompt'
                     : 'Leave blank — natural scene continuation'
                 }
                 disabled={isGenerating}
-                className="w-full rounded-[var(--radius-sm)] px-3 py-2 text-[12px]"
+                className="field w-full resize-y rounded-[var(--radius-sm)] px-3 py-2 text-[12px] leading-relaxed"
                 style={{
                   background: 'var(--surface)',
                   border: '1px solid var(--border)',
                   color: 'var(--text)',
                   outline: 'none',
                   opacity: isGenerating ? 0.6 : 1,
+                  minHeight: '4.5rem',
                 }}
               />
             </div>

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   EDIT_STRIP_PX,
   MAX_AI_DIMENSION,
+  timestampForFilename,
   type InpaintState,
   type InpaintRegion,
   type InpaintTilePlan,
@@ -183,17 +184,6 @@ function committedDragFromSelection(
     current: { x: sel.x + sel.w, y: sel.y + sel.h },
     committed: true,
   }
-}
-
-/** Build a filesystem-safe timestamp for download filenames. */
-function timestampForFilename(date: Date = new Date()): string {
-  const yyyy = date.getFullYear()
-  const mm = String(date.getMonth() + 1).padStart(2, '0')
-  const dd = String(date.getDate()).padStart(2, '0')
-  const hh = String(date.getHours()).padStart(2, '0')
-  const min = String(date.getMinutes()).padStart(2, '0')
-  const ss = String(date.getSeconds()).padStart(2, '0')
-  return `${yyyy}-${mm}-${dd}_${hh}-${min}-${ss}`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
