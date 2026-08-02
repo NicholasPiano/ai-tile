@@ -10,6 +10,7 @@ import {
   buildTileInput,
   compositeTileInputWithPlanning,
   computeRegionMapLayout,
+  defaultTileSeamMix,
   ExtensionTileSpec,
   PlanRegionGrouping,
   PlanRegionSpec,
@@ -1191,11 +1192,11 @@ export interface TileExtensionModalProps {
   /** Trigger Phase 2: per-tile plan re-run. */
   onReplan: () => void
   /**
-   * Accept this tile's generated result. `offset` is the manual "shimmy"
-   * nudge (see the Shimmy control below) applied to the tile's blank/
-   * extension content only — the preserved context strip never moves.
+   * Accept this tile's generated result.
+   * - `offset`: manual "shimmy" nudge of blank/extension content only
+   * - `seamMix`: hard-cut mix (0 = fully original, 1 = fully new)
    */
-  onAccept: (offset: TileShimmyOffset) => void
+  onAccept: (offset: TileShimmyOffset, seamMix: number) => void
   /**
    * Accept the current planning slice directly as the tile's final result,
    * skipping the Phase 3 high-res refinement call entirely.
@@ -1260,11 +1261,20 @@ export function TileExtensionModal({
    * whenever a different tile is shown or a fresh result is generated.
    */
   const [shimmyOffset, setShimmyOffset] = useState<TileShimmyOffset>({ x: 0, y: 0 })
-  /** Live seam-focused preview of the merge at the current shimmy offset. */
+  /**
+   * Hard-cut seam mix: 0 = fully original band, 1 = fully new AI tile.
+   * Defaults to the natural context/blank boundary.
+   */
+  const [seamMix, setSeamMix] = useState(() => defaultTileSeamMix(tileSpec, direction))
+  /** Live seam-focused preview of the merge at the current shimmy + seam mix. */
   const [mergePreviewUrl, setMergePreviewUrl] = useState<string | null>(null)
 
   useEffect(() => {
     setShimmyOffset({ x: 0, y: 0 })
+    setSeamMix(defaultTileSeamMix(tileSpec, direction))
+    // Reset only when the tile identity or generated result changes — not on
+    // every parent re-render that allocates a new tileSpec reference.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nsIdx, preview])
 
   // Recompute the tile input image whenever the modal opens or the band canvas
@@ -1314,7 +1324,7 @@ export function TileExtensionModal({
     img.src = preview
   }, [preview])
 
-  // Live seam-focused merge preview at the current shimmy offset — mirrors
+  // Live seam-focused merge preview at the current shimmy + seam mix — mirrors
   // exactly what compositeTileResult will do on Accept, without touching the
   // live band canvas.
   useEffect(() => {
@@ -1323,11 +1333,11 @@ export function TileExtensionModal({
       return
     }
     let cancelled = false
-    previewCompositeTileResult(bandCanvas, preview, tileSpec, direction, shimmyOffset)
+    previewCompositeTileResult(bandCanvas, preview, tileSpec, direction, shimmyOffset, seamMix)
       .then((url) => { if (!cancelled) setMergePreviewUrl(url) })
       .catch(() => { if (!cancelled) setMergePreviewUrl(null) })
     return () => { cancelled = true }
-  }, [preview, bandCanvas, tileSpec, direction, shimmyOffset])
+  }, [preview, bandCanvas, tileSpec, direction, shimmyOffset, seamMix])
 
   // Close on Escape when not generating or accepting the plan directly.
   useEffect(() => {
@@ -1879,7 +1889,7 @@ export function TileExtensionModal({
                         className="mt-1.5 font-mono text-[11px] text-center"
                         style={{ color: 'var(--text-muted)' }}
                       >
-                        Seam × {shimmyOffset.x}, {shimmyOffset.y}
+                        {`Shimmy ${shimmyOffset.x},${shimmyOffset.y} · Seam ${Math.round(seamMix * 100)}%`}
                       </p>
                     </div>
                   )}
@@ -1956,6 +1966,68 @@ export function TileExtensionModal({
                     </button>
                     <div />
                   </div>
+                </div>
+              </div>
+            )}
+
+            {/* Seam — hard cut between original band content and the new AI
+                tile along the extension axis (no soft feather). */}
+            {hasPreview && canAct && (
+              <div
+                className="flex items-center justify-between gap-4 rounded-[var(--radius-sm)] px-3 py-2.5"
+                style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
+              >
+                <div className="shrink-0">
+                  <p
+                    className="text-[11px] uppercase tracking-wider font-medium"
+                    style={{ color: 'var(--text-muted)' }}
+                  >
+                    Seam
+                  </p>
+                  <p className="mt-0.5 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                    Hard cut — original ↔ new
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2 flex-1 min-w-0 max-w-sm">
+                  <span
+                    className="text-[11px] shrink-0"
+                    style={{ color: 'var(--text-muted)' }}
+                  >
+                    Original
+                  </span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={Math.round(seamMix * 100)}
+                    onChange={(e) => {
+                      const next = Number(e.target.value)
+                      if (!Number.isFinite(next)) {
+                        return
+                      }
+                      setSeamMix(next / 100)
+                    }}
+                    className="parallax-slider flex-1 min-w-0"
+                    aria-label="Seam hard-cut mix"
+                    title={`${Math.round(seamMix * 100)}% new`}
+                    style={{ width: 'auto' }}
+                  />
+                  <span
+                    className="text-[11px] shrink-0"
+                    style={{ color: 'var(--text-muted)' }}
+                  >
+                    New
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setSeamMix(defaultTileSeamMix(tileSpec, direction))}
+                    className="btn btn-ghost shrink-0 px-1.5 py-0.5 font-mono text-[11px]"
+                    title="Reset to natural context/blank boundary"
+                  >
+                    {`${Math.round(seamMix * 100)}%`}
+                  </button>
                 </div>
               </div>
             )}
@@ -2037,7 +2109,7 @@ export function TileExtensionModal({
                 </button>
 
                 <button
-                  onClick={() => onAccept(shimmyOffset)}
+                  onClick={() => onAccept(shimmyOffset, seamMix)}
                   disabled={!canAct || !hasPreview}
                   className="btn btn-primary"
                   title={

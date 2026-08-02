@@ -3157,6 +3157,119 @@ export interface TileShimmyOffset {
 }
 
 /**
+ * Clamp a seam-mix amount to [0, 1].
+ * 0 = fully original band content; 1 = fully new AI tile.
+ */
+export function clampTileSeamMix(amount: number): number {
+  if (!Number.isFinite(amount)) {
+    return 1
+  }
+  return Math.max(0, Math.min(1, amount))
+}
+
+/**
+ * Default seam mix: hard cut exactly at the natural context/blank boundary
+ * so original context is preserved and only the extension region takes AI
+ * pixels. Auto-accept and Accept-plan use this value.
+ */
+export function defaultTileSeamMix(
+  tileSpec: ExtensionTileSpec,
+  direction: 'up' | 'down' | 'left' | 'right',
+): number {
+  const { tileWidth, tileHeight, blankRegion } = tileSpec
+  switch (direction) {
+    case 'right': {
+      if (tileWidth <= 0) {
+        return 1
+      }
+      // cutX = blankRegion.x = (1 - amount) * tileWidth
+      return clampTileSeamMix(1 - blankRegion.x / tileWidth)
+    }
+    case 'left': {
+      if (tileWidth <= 0) {
+        return 1
+      }
+      // cutX = blank end = amount * tileWidth
+      return clampTileSeamMix((blankRegion.x + blankRegion.width) / tileWidth)
+    }
+    case 'down': {
+      if (tileHeight <= 0) {
+        return 1
+      }
+      // cutY = blankRegion.y = (1 - amount) * tileHeight
+      return clampTileSeamMix(1 - blankRegion.y / tileHeight)
+    }
+    case 'up': {
+      if (tileHeight <= 0) {
+        return 1
+      }
+      // cutY = blank end = amount * tileHeight
+      return clampTileSeamMix((blankRegion.y + blankRegion.height) / tileHeight)
+    }
+  }
+}
+
+/**
+ * Build a hard-cut alpha mask along the extension axis.
+ *
+ * AI pixels grow from the extension edge toward the context edge as
+ * `seamMix` increases:
+ * - 0 → fully original (mask fully transparent; band shows through)
+ * - 1 → fully new (mask fully opaque)
+ * Soft feathering is intentionally not applied — hard cuts are easier to repair.
+ */
+function buildTileSeamHardMask(
+  tileWidth: number,
+  tileHeight: number,
+  direction: 'up' | 'down' | 'left' | 'right',
+  seamMix: number,
+): HTMLCanvasElement {
+  const w = Math.max(1, Math.round(tileWidth))
+  const h = Math.max(1, Math.round(tileHeight))
+  const amount = clampTileSeamMix(seamMix)
+
+  const canvas = document.createElement('canvas')
+  canvas.width = w
+  canvas.height = h
+  const ctx = canvas.getContext('2d')
+  if (!ctx) {
+    return canvas
+  }
+
+  const imageData = ctx.createImageData(w, h)
+  const d = imageData.data
+
+  const cutXRight = Math.round((1 - amount) * w)
+  const cutXLeft = Math.round(amount * w)
+  const cutYDown = Math.round((1 - amount) * h)
+  const cutYUp = Math.round(amount * h)
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let useAi = false
+      if (direction === 'right') {
+        useAi = x >= cutXRight
+      } else if (direction === 'left') {
+        useAi = x < cutXLeft
+      } else if (direction === 'down') {
+        useAi = y >= cutYDown
+      } else {
+        useAi = y < cutYUp
+      }
+
+      const idx = (y * w + x) * 4
+      d[idx] = 255
+      d[idx + 1] = 255
+      d[idx + 2] = 255
+      d[idx + 3] = useAi ? 255 : 0
+    }
+  }
+
+  ctx.putImageData(imageData, 0, 0)
+  return canvas
+}
+
+/**
  * Build a tile-sized canvas from `tileImg` with its blank/extension content
  * nudged by `offset`, while the preserved context pixels stay exactly where
  * they were.
@@ -3167,7 +3280,7 @@ export interface TileShimmyOffset {
  * `offset` pixels away — sliding the model's fill within its fixed box. Any
  * area the shift uncovers is left transparent so whatever is already in the
  * band (prior neighbour pixels, or nothing) shows through once this tile is
- * composited — same as the feather step already relies on.
+ * composited — same as the seam hard-cut step already relies on.
  */
 function drawTileWithShimmy(
   tileImg: HTMLImageElement,
@@ -3207,9 +3320,8 @@ function drawTileWithShimmy(
 
 /**
  * Draw a (possibly shimmied) tile canvas onto `destCtx` at `(destX, destY)`,
- * applying the 2D separable feather mask so it blends with any already-
- * processed neighbors along shared overlap edges. Tiles with no processed
- * neighbors are drawn opaquely (first tile, no-op blending).
+ * masked by a hard cut along the extension axis (`seamMix`). Transparent
+ * mask regions leave the existing band content untouched — no soft feather.
  */
 function compositeShimmiedTileOnto(
   destCtx: CanvasRenderingContext2D,
@@ -3218,43 +3330,49 @@ function compositeShimmiedTileOnto(
   shimmiedTile: HTMLCanvasElement,
   tileWidth: number,
   tileHeight: number,
-  featherOverlap: TileFeatherOverlap,
+  direction: 'up' | 'down' | 'left' | 'right',
+  seamMix: number,
 ): void {
-  const hasFeather =
-    featherOverlap.top > 0 || featherOverlap.bottom > 0 ||
-    featherOverlap.left > 0 || featherOverlap.right > 0
+  const amount = clampTileSeamMix(seamMix)
 
-  if (!hasFeather) {
-    destCtx.drawImage(shimmiedTile, destX, destY)
+  // Fully original — leave the band untouched.
+  if (amount <= 0) {
     return
   }
 
-  const mask      = buildTileFeatherMask(tileWidth, tileHeight, featherOverlap)
   const offscreen = document.createElement('canvas')
-  offscreen.width  = tileWidth
+  offscreen.width = tileWidth
   offscreen.height = tileHeight
-  const offCtx    = offscreen.getContext('2d')
-  if (!offCtx) throw new Error('Failed to get offscreen tile canvas context')
+  const offCtx = offscreen.getContext('2d')
+  if (!offCtx) {
+    throw new Error('Failed to get offscreen tile canvas context')
+  }
 
   offCtx.drawImage(shimmiedTile, 0, 0)
-  offCtx.globalCompositeOperation = 'destination-in'
-  offCtx.drawImage(mask, 0, 0)
 
-  // source-over: masked tile fades to transparent at feathered edges so the
-  // already-composited band content shows through the overlap region
+  // Fully new — paint the whole tile opaquely (still no soft feather).
+  if (amount < 1) {
+    const mask = buildTileSeamHardMask(tileWidth, tileHeight, direction, amount)
+    offCtx.globalCompositeOperation = 'destination-in'
+    offCtx.drawImage(mask, 0, 0)
+  }
+
   destCtx.drawImage(offscreen, destX, destY)
 }
 
 /**
  * Composite one AI tile result into the running band canvas.
  *
- * Applies the 2D separable feather mask so the tile blends with any
- * already-processed neighbors along shared overlap edges.  Tiles with no
- * processed neighbors are drawn opaquely (first tile, no-op blending).
+ * Applies a hard cut along the extension axis (`seamMix`) so the user can
+ * choose how much original vs new content to keep — soft neighbor feathering
+ * is intentionally disabled (hard cuts are easier to repair).
  *
  * `shimmyOffset` nudges only the tile's blank/extension content (see
  * `drawTileWithShimmy`) — the preserved context strip never moves. Defaults
- * to `{ x: 0, y: 0 }`, matching prior behaviour exactly.
+ * to `{ x: 0, y: 0 }`.
+ *
+ * `seamMix` defaults to the natural context/blank boundary
+ * (`defaultTileSeamMix`) when omitted.
  */
 export async function compositeTileResult(
   bandCanvas: HTMLCanvasElement,
@@ -3262,8 +3380,10 @@ export async function compositeTileResult(
   tileSpec: ExtensionTileSpec,
   direction: 'up' | 'down' | 'left' | 'right',
   shimmyOffset: TileShimmyOffset = { x: 0, y: 0 },
+  seamMix?: number,
 ): Promise<void> {
-  const { bandX, bandY, tileWidth, tileHeight, blankRegion, featherOverlap } = tileSpec
+  const { bandX, bandY, tileWidth, tileHeight, blankRegion } = tileSpec
+  const mix = seamMix === undefined ? defaultTileSeamMix(tileSpec, direction) : clampTileSeamMix(seamMix)
 
   // Normalise AI output to exact tile dimensions (model may return slightly off).
   // Anchor to the context edge so the preserved strip stays pixel-aligned.
@@ -3276,22 +3396,24 @@ export async function compositeTileResult(
   const tileImg = await loadImageElement(normalized)
 
   const bandCtx = bandCanvas.getContext('2d')
-  if (!bandCtx) throw new Error('Failed to get band canvas context for composite')
+  if (!bandCtx) {
+    throw new Error('Failed to get band canvas context for composite')
+  }
 
   const shimmied = drawTileWithShimmy(tileImg, tileWidth, tileHeight, blankRegion, shimmyOffset)
-  compositeShimmiedTileOnto(bandCtx, bandX, bandY, shimmied, tileWidth, tileHeight, featherOverlap)
+  compositeShimmiedTileOnto(bandCtx, bandX, bandY, shimmied, tileWidth, tileHeight, direction, mix)
 }
 
 /**
- * Preview what `compositeTileResult` would produce at a given shimmy offset,
- * WITHOUT mutating the live band canvas.
+ * Preview what `compositeTileResult` would produce at a given shimmy offset
+ * and seam mix, WITHOUT mutating the live band canvas.
  *
  * Clones just this tile's footprint from the live band (so the preview
- * reflects real neighbour context/feathering), runs the same shimmy +
- * feather compositing used by `compositeTileResult` onto that clone, then
- * returns a seam-focused crop — the blank region plus a small margin of
- * context on every side — so the modal can show live merge feedback while
- * the user nudges the offset.
+ * reflects real neighbour context), runs the same shimmy + hard-cut
+ * compositing used by `compositeTileResult` onto that clone, then returns a
+ * seam-focused crop — the blank region plus a small margin of context on
+ * every side — so the modal can show live merge feedback while the user
+ * nudges the offset or seam slider.
  */
 export async function previewCompositeTileResult(
   bandCanvas: HTMLCanvasElement,
@@ -3299,17 +3421,21 @@ export async function previewCompositeTileResult(
   tileSpec: ExtensionTileSpec,
   direction: 'up' | 'down' | 'left' | 'right',
   shimmyOffset: TileShimmyOffset = { x: 0, y: 0 },
+  seamMix?: number,
   marginPx = 32,
 ): Promise<string> {
-  const { bandX, bandY, tileWidth, tileHeight, blankRegion, featherOverlap } = tileSpec
+  const { bandX, bandY, tileWidth, tileHeight, blankRegion } = tileSpec
+  const mix = seamMix === undefined ? defaultTileSeamMix(tileSpec, direction) : clampTileSeamMix(seamMix)
 
   // Clone just this tile's footprint from the live band — this is what
   // compositeTileResult would draw onto in place, so the preview matches.
   const bandSlice = document.createElement('canvas')
-  bandSlice.width  = tileWidth
+  bandSlice.width = tileWidth
   bandSlice.height = tileHeight
   const sliceCtx = bandSlice.getContext('2d')
-  if (!sliceCtx) throw new Error('Failed to get band slice canvas context')
+  if (!sliceCtx) {
+    throw new Error('Failed to get band slice canvas context')
+  }
   sliceCtx.drawImage(bandCanvas, bandX, bandY, tileWidth, tileHeight, 0, 0, tileWidth, tileHeight)
 
   const normalized = await normalizeImageToSize(
@@ -3321,7 +3447,7 @@ export async function previewCompositeTileResult(
   const tileImg = await loadImageElement(normalized)
 
   const shimmied = drawTileWithShimmy(tileImg, tileWidth, tileHeight, blankRegion, shimmyOffset)
-  compositeShimmiedTileOnto(sliceCtx, 0, 0, shimmied, tileWidth, tileHeight, featherOverlap)
+  compositeShimmiedTileOnto(sliceCtx, 0, 0, shimmied, tileWidth, tileHeight, direction, mix)
 
   // Crop to a seam-focused window: blankRegion plus a margin of context on
   // every side, clamped to the tile bounds.
@@ -3333,10 +3459,12 @@ export async function previewCompositeTileResult(
   const cropH = Math.max(1, cropB - cropY)
 
   const cropCanvas = document.createElement('canvas')
-  cropCanvas.width  = cropW
+  cropCanvas.width = cropW
   cropCanvas.height = cropH
   const cropCtx = cropCanvas.getContext('2d')
-  if (!cropCtx) return bandSlice.toDataURL('image/png')
+  if (!cropCtx) {
+    return bandSlice.toDataURL('image/png')
+  }
   cropCtx.drawImage(bandSlice, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH)
   return cropCanvas.toDataURL('image/png')
 }
