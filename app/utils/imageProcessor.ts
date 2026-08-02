@@ -1,5 +1,4 @@
 import type { InpaintTileSpec, InpaintTilePlan } from '@/app/lib/app'
-import { MAX_TILE_SHIMMY_PX } from '@/app/lib/app'
 
 export async function expandCanvas(
   originalImageDataUrl: string,
@@ -3157,12 +3156,6 @@ export interface TileShimmyOffset {
   y: number
 }
 
-/** Clamp a shimmy offset to ±MAX_TILE_SHIMMY_PX on each axis. */
-export function clampTileShimmyOffset(offset: TileShimmyOffset): TileShimmyOffset {
-  const clamp = (v: number) => Math.max(-MAX_TILE_SHIMMY_PX, Math.min(MAX_TILE_SHIMMY_PX, Math.round(v)))
-  return { x: clamp(offset.x), y: clamp(offset.y) }
-}
-
 /**
  * Build a tile-sized canvas from `tileImg` with its blank/extension content
  * nudged by `offset`, while the preserved context pixels stay exactly where
@@ -3189,9 +3182,13 @@ function drawTileWithShimmy(
   const ctx = canvas.getContext('2d')
   if (!ctx) return canvas
 
+  // Integer-pixel draw; no range cap — callers may nudge as far as needed.
+  const dx = Math.round(offset.x)
+  const dy = Math.round(offset.y)
+
   ctx.drawImage(tileImg, 0, 0)
 
-  if ((offset.x !== 0 || offset.y !== 0) && blankRegion.width > 0 && blankRegion.height > 0) {
+  if ((dx !== 0 || dy !== 0) && blankRegion.width > 0 && blankRegion.height > 0) {
     ctx.save()
     ctx.beginPath()
     ctx.rect(blankRegion.x, blankRegion.y, blankRegion.width, blankRegion.height)
@@ -3200,7 +3197,7 @@ function drawTileWithShimmy(
     ctx.drawImage(
       tileImg,
       blankRegion.x, blankRegion.y, blankRegion.width, blankRegion.height,
-      blankRegion.x + offset.x, blankRegion.y + offset.y, blankRegion.width, blankRegion.height,
+      blankRegion.x + dx, blankRegion.y + dy, blankRegion.width, blankRegion.height,
     )
     ctx.restore()
   }
@@ -3281,7 +3278,7 @@ export async function compositeTileResult(
   const bandCtx = bandCanvas.getContext('2d')
   if (!bandCtx) throw new Error('Failed to get band canvas context for composite')
 
-  const shimmied = drawTileWithShimmy(tileImg, tileWidth, tileHeight, blankRegion, clampTileShimmyOffset(shimmyOffset))
+  const shimmied = drawTileWithShimmy(tileImg, tileWidth, tileHeight, blankRegion, shimmyOffset)
   compositeShimmiedTileOnto(bandCtx, bandX, bandY, shimmied, tileWidth, tileHeight, featherOverlap)
 }
 
@@ -3323,7 +3320,7 @@ export async function previewCompositeTileResult(
   )
   const tileImg = await loadImageElement(normalized)
 
-  const shimmied = drawTileWithShimmy(tileImg, tileWidth, tileHeight, blankRegion, clampTileShimmyOffset(shimmyOffset))
+  const shimmied = drawTileWithShimmy(tileImg, tileWidth, tileHeight, blankRegion, shimmyOffset)
   compositeShimmiedTileOnto(sliceCtx, 0, 0, shimmied, tileWidth, tileHeight, featherOverlap)
 
   // Crop to a seam-focused window: blankRegion plus a margin of context on

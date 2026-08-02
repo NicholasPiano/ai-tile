@@ -8,7 +8,6 @@ import {
   buildRegionalPlanningMap,
   buildTileChunkInfo,
   buildTileInput,
-  clampTileShimmyOffset,
   compositeTileInputWithPlanning,
   computeRegionMapLayout,
   ExtensionTileSpec,
@@ -19,7 +18,7 @@ import {
   TileShimmyOffset,
 } from '@/app/utils/imageProcessor'
 import { MODELS, maskKey } from '@/app/lib/models'
-import { Direction, MAX_AI_DIMENSION, MAX_TILE_SHIMMY_PX, ReferenceImage } from '@/app/lib/app'
+import { Direction, MAX_AI_DIMENSION, ReferenceImage } from '@/app/lib/app'
 
 export function SettingsDrawer({
   open,
@@ -1340,7 +1339,7 @@ export function TileExtensionModal({
     return () => window.removeEventListener('keydown', onKey)
   }, [open, isGenerating, isAcceptingPlan, onClose])
 
-  // Keyboard shimmy nudge — Arrow keys = ±1px, Shift+Arrow = ±5px (clamped).
+  // Keyboard shimmy nudge — Arrow keys = ±1px, Shift+Arrow = ±5px (unbounded).
   // Skipped while the shimmy control isn't actionable (no result yet, tile
   // busy, or out of scan order) or while typing in a text field.
   useEffect(() => {
@@ -1363,7 +1362,7 @@ export function TileExtensionModal({
       else if (e.key === 'ArrowDown') dy = step
       else return
       e.preventDefault()
-      setShimmyOffset((prev) => clampTileShimmyOffset({ x: prev.x + dx, y: prev.y + dy }))
+      setShimmyOffset((prev) => ({ x: prev.x + dx, y: prev.y + dy }))
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -1903,7 +1902,7 @@ export function TileExtensionModal({
                     Shimmy
                   </p>
                   <p className="mt-0.5 text-[11px]" style={{ color: 'var(--text-muted)' }}>
-                    Nudge the extension content only — arrows / Shift+arrows, ±{MAX_TILE_SHIMMY_PX}px
+                    Nudge the extension content only — arrows / Shift+arrows
                   </p>
                 </div>
 
@@ -1919,7 +1918,7 @@ export function TileExtensionModal({
                   >
                     <div />
                     <button
-                      onClick={() => setShimmyOffset((prev) => clampTileShimmyOffset({ x: prev.x, y: prev.y - 1 }))}
+                      onClick={() => setShimmyOffset((prev) => ({ x: prev.x, y: prev.y - 1 }))}
                       className="btn btn-ghost flex items-center justify-center p-0"
                       title="Nudge up 1px"
                     >
@@ -1927,7 +1926,7 @@ export function TileExtensionModal({
                     </button>
                     <div />
                     <button
-                      onClick={() => setShimmyOffset((prev) => clampTileShimmyOffset({ x: prev.x - 1, y: prev.y }))}
+                      onClick={() => setShimmyOffset((prev) => ({ x: prev.x - 1, y: prev.y }))}
                       className="btn btn-ghost flex items-center justify-center p-0"
                       title="Nudge left 1px"
                     >
@@ -1941,7 +1940,7 @@ export function TileExtensionModal({
                       0
                     </button>
                     <button
-                      onClick={() => setShimmyOffset((prev) => clampTileShimmyOffset({ x: prev.x + 1, y: prev.y }))}
+                      onClick={() => setShimmyOffset((prev) => ({ x: prev.x + 1, y: prev.y }))}
                       className="btn btn-ghost flex items-center justify-center p-0"
                       title="Nudge right 1px"
                     >
@@ -1949,7 +1948,7 @@ export function TileExtensionModal({
                     </button>
                     <div />
                     <button
-                      onClick={() => setShimmyOffset((prev) => clampTileShimmyOffset({ x: prev.x, y: prev.y + 1 }))}
+                      onClick={() => setShimmyOffset((prev) => ({ x: prev.x, y: prev.y + 1 }))}
                       className="btn btn-ghost flex items-center justify-center p-0"
                       title="Nudge down 1px"
                     >

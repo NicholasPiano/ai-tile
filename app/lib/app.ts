@@ -114,15 +114,6 @@ export const PLAN_REGION_OVERLAP_TILES = 3
  */
 export const MAX_PLAN_REGIONS = 24
 
-/**
- * Maximum manual "shimmy" offset (px, either axis) a user can nudge a tile's
- * generated extension content by before accepting it into the band — see
- * `compositeTileResult` in imageProcessor.ts. Only the tile's blank/extension
- * pixels move; the preserved context strip never shifts. Kept small since
- * this is meant to fix near-miss registration, not re-author the tile.
- */
-export const MAX_TILE_SHIMMY_PX = 16
-
 // ─────────────────────────────────────────────────────────────────────────────
 // OpenRouter integration — BYOK (bring your own key) for open-source friendliness
 // ─────────────────────────────────────────────────────────────────────────────
