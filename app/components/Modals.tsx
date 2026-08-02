@@ -8,15 +8,18 @@ import {
   buildRegionalPlanningMap,
   buildTileChunkInfo,
   buildTileInput,
+  clampTileShimmyOffset,
   compositeTileInputWithPlanning,
   computeRegionMapLayout,
   ExtensionTileSpec,
   PlanRegionGrouping,
   PlanRegionSpec,
+  previewCompositeTileResult,
   PriorRegionResult,
+  TileShimmyOffset,
 } from '@/app/utils/imageProcessor'
 import { MODELS, maskKey } from '@/app/lib/models'
-import { Direction, MAX_AI_DIMENSION, ReferenceImage } from '@/app/lib/app'
+import { Direction, MAX_AI_DIMENSION, MAX_TILE_SHIMMY_PX, ReferenceImage } from '@/app/lib/app'
 
 export function SettingsDrawer({
   open,
@@ -1188,7 +1191,12 @@ export interface TileExtensionModalProps {
   onGenerate: () => void
   /** Trigger Phase 2: per-tile plan re-run. */
   onReplan: () => void
-  onAccept: () => void
+  /**
+   * Accept this tile's generated result. `offset` is the manual "shimmy"
+   * nudge (see the Shimmy control below) applied to the tile's blank/
+   * extension content only — the preserved context strip never moves.
+   */
+  onAccept: (offset: TileShimmyOffset) => void
   /**
    * Accept the current planning slice directly as the tile's final result,
    * skipping the Phase 3 high-res refinement call entirely.
@@ -1247,6 +1255,19 @@ export function TileExtensionModal({
   /** Tracks which row's hidden file input should be programmatically triggered. */
   const refImageFileInputRefs = useRef<(HTMLInputElement | null)[]>([])
 
+  /**
+   * Manual "shimmy" nudge applied to the tile's blank/extension content only
+   * when accepting (see `compositeTileResult` / `drawTileWithShimmy`). Reset
+   * whenever a different tile is shown or a fresh result is generated.
+   */
+  const [shimmyOffset, setShimmyOffset] = useState<TileShimmyOffset>({ x: 0, y: 0 })
+  /** Live seam-focused preview of the merge at the current shimmy offset. */
+  const [mergePreviewUrl, setMergePreviewUrl] = useState<string | null>(null)
+
+  useEffect(() => {
+    setShimmyOffset({ x: 0, y: 0 })
+  }, [nsIdx, preview])
+
   // Recompute the tile input image whenever the modal opens or the band canvas
   // changes (e.g. after a prior tile is accepted and composited in).
   useEffect(() => {
@@ -1261,9 +1282,8 @@ export function TileExtensionModal({
     }
   }, [open, bandCanvas, tileSpec])
 
-  // Build the tile-slice composite: INPUT with a planning guide in the
-  // blank region (high-quality upsample of the map-scale plan, no blur;
-  // same treatment as the API composite).
+  // Build the tile-slice composite: INPUT with a lightly softened planning
+  // guide in the blank region (same treatment as the API composite).
   useEffect(() => {
     if (!inputImageUrl || !planningSlice) {
       setTileSliceUrl(null)
@@ -1295,6 +1315,21 @@ export function TileExtensionModal({
     img.src = preview
   }, [preview])
 
+  // Live seam-focused merge preview at the current shimmy offset — mirrors
+  // exactly what compositeTileResult will do on Accept, without touching the
+  // live band canvas.
+  useEffect(() => {
+    if (!preview || !bandCanvas) {
+      setMergePreviewUrl(null)
+      return
+    }
+    let cancelled = false
+    previewCompositeTileResult(bandCanvas, preview, tileSpec, direction, shimmyOffset)
+      .then((url) => { if (!cancelled) setMergePreviewUrl(url) })
+      .catch(() => { if (!cancelled) setMergePreviewUrl(null) })
+    return () => { cancelled = true }
+  }, [preview, bandCanvas, tileSpec, direction, shimmyOffset])
+
   // Close on Escape when not generating or accepting the plan directly.
   useEffect(() => {
     if (!open) return
@@ -1304,6 +1339,35 @@ export function TileExtensionModal({
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [open, isGenerating, isAcceptingPlan, onClose])
+
+  // Keyboard shimmy nudge — Arrow keys = ±1px, Shift+Arrow = ±5px (clamped).
+  // Skipped while the shimmy control isn't actionable (no result yet, tile
+  // busy, or out of scan order) or while typing in a text field.
+  useEffect(() => {
+    const canShimmy = open && preview !== null && isNextPending && !isGenerating && !isAcceptingPlan
+    if (!canShimmy) return
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null
+      if (
+        target &&
+        (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable)
+      ) {
+        return
+      }
+      const step = e.shiftKey ? 5 : 1
+      let dx = 0
+      let dy = 0
+      if (e.key === 'ArrowLeft') dx = -step
+      else if (e.key === 'ArrowRight') dx = step
+      else if (e.key === 'ArrowUp') dy = -step
+      else if (e.key === 'ArrowDown') dy = step
+      else return
+      e.preventDefault()
+      setShimmyOffset((prev) => clampTileShimmyOffset({ x: prev.x + dx, y: prev.y + dy }))
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, preview, isNextPending, isGenerating, isAcceptingPlan])
 
   if (!open) return null
 
@@ -1781,9 +1845,121 @@ export function TileExtensionModal({
                         : '—'}
                     </p>
                   </div>
+
+                  {/* Cell 3 — Merge preview (seam-focused crop at the current shimmy offset) */}
+                  {hasPreview && (
+                    <div className="flex-1 min-w-0">
+                      <p
+                        className="mb-1.5 text-[11px] uppercase tracking-wider font-medium"
+                        style={{ color: 'var(--text-muted)' }}
+                      >
+                        Merge preview
+                      </p>
+                      <div
+                        className="checker relative overflow-hidden rounded-[var(--radius-sm)]"
+                        style={{
+                          border: '1px solid var(--border)',
+                          aspectRatio: tileAR,
+                          background: 'var(--surface)',
+                        }}
+                      >
+                        {mergePreviewUrl ? (
+                          <img
+                            src={mergePreviewUrl}
+                            alt="Seam merge preview"
+                            className="w-full h-full object-contain block"
+                            draggable={false}
+                          />
+                        ) : (
+                          <div className="absolute inset-0 flex items-center justify-center">
+                            <Icons.Spinner size={14} />
+                          </div>
+                        )}
+                      </div>
+                      <p
+                        className="mt-1.5 font-mono text-[11px] text-center"
+                        style={{ color: 'var(--text-muted)' }}
+                      >
+                        Seam × {shimmyOffset.x}, {shimmyOffset.y}
+                      </p>
+                    </div>
+                  )}
                 </div>
               )
             })()}
+
+            {/* Shimmy — manual nudge of the tile's extension content only,
+                to fix a near-miss registration before it locks into the band. */}
+            {hasPreview && canAct && (
+              <div
+                className="flex items-center justify-between gap-4 rounded-[var(--radius-sm)] px-3 py-2.5"
+                style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
+              >
+                <div>
+                  <p
+                    className="text-[11px] uppercase tracking-wider font-medium"
+                    style={{ color: 'var(--text-muted)' }}
+                  >
+                    Shimmy
+                  </p>
+                  <p className="mt-0.5 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                    Nudge the extension content only — arrows / Shift+arrows, ±{MAX_TILE_SHIMMY_PX}px
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-3">
+                  <span className="font-mono text-[12px]" style={{ color: 'var(--text-secondary)' }}>
+                    {shimmyOffset.x}, {shimmyOffset.y}
+                  </span>
+
+                  {/* 3×3 nudge pad */}
+                  <div
+                    className="grid gap-0.5"
+                    style={{ gridTemplateColumns: 'repeat(3, 22px)', gridTemplateRows: 'repeat(3, 22px)' }}
+                  >
+                    <div />
+                    <button
+                      onClick={() => setShimmyOffset((prev) => clampTileShimmyOffset({ x: prev.x, y: prev.y - 1 }))}
+                      className="btn btn-ghost flex items-center justify-center p-0"
+                      title="Nudge up 1px"
+                    >
+                      <Icons.ArrowUp size={11} />
+                    </button>
+                    <div />
+                    <button
+                      onClick={() => setShimmyOffset((prev) => clampTileShimmyOffset({ x: prev.x - 1, y: prev.y }))}
+                      className="btn btn-ghost flex items-center justify-center p-0"
+                      title="Nudge left 1px"
+                    >
+                      <Icons.ArrowLeft size={11} />
+                    </button>
+                    <button
+                      onClick={() => setShimmyOffset({ x: 0, y: 0 })}
+                      className="btn btn-ghost flex items-center justify-center p-0 text-[10px]"
+                      title="Reset shimmy to 0, 0"
+                    >
+                      0
+                    </button>
+                    <button
+                      onClick={() => setShimmyOffset((prev) => clampTileShimmyOffset({ x: prev.x + 1, y: prev.y }))}
+                      className="btn btn-ghost flex items-center justify-center p-0"
+                      title="Nudge right 1px"
+                    >
+                      <Icons.ArrowRight size={11} />
+                    </button>
+                    <div />
+                    <button
+                      onClick={() => setShimmyOffset((prev) => clampTileShimmyOffset({ x: prev.x, y: prev.y + 1 }))}
+                      className="btn btn-ghost flex items-center justify-center p-0"
+                      title="Nudge down 1px"
+                    >
+                      <Icons.ArrowDown size={11} />
+                    </button>
+                    <div />
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* Actions */}
             <div className="flex items-center justify-between">
@@ -1862,7 +2038,7 @@ export function TileExtensionModal({
                 </button>
 
                 <button
-                  onClick={onAccept}
+                  onClick={() => onAccept(shimmyOffset)}
                   disabled={!canAct || !hasPreview}
                   className="btn btn-primary"
                   title={

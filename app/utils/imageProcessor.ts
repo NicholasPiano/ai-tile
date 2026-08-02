@@ -1,4 +1,5 @@
 import type { InpaintTileSpec, InpaintTilePlan } from '@/app/lib/app'
+import { MAX_TILE_SHIMMY_PX } from '@/app/lib/app'
 
 export async function expandCanvas(
   originalImageDataUrl: string,
@@ -1903,17 +1904,27 @@ export function buildTileInput(
 }
 
 /**
- * Draw a planning guide into the tile blank region at full blank resolution.
+ * Draw a lightly softened planning guide into the tile blank region.
  *
  * Plan slices live at map scale (only downscaled to fit `MAX_AI_DIMENSION`).
- * Upscale them into the blank with high-quality smoothing — no extra blur —
- * so layout and colour from the plan are preserved for Phase 3 refine.
+ * Upscaling them sharp can leave pixel-grid structure the model copies; a
+ * light blur proportional to the upscale factor softens that without wiping
+ * the plan detail Phase 3 needs for guided super-resolution.
  */
 export function drawSoftenedPlanningGuide(
   ctx: CanvasRenderingContext2D,
   sliceImg: HTMLImageElement,
   blankRegion: { x: number; y: number; width: number; height: number },
 ): void {
+  const scale = Math.max(
+    blankRegion.width / Math.max(1, sliceImg.naturalWidth),
+    blankRegion.height / Math.max(1, sliceImg.naturalHeight),
+  )
+  // Lighter than the old curve (was scale×1.5, floor 8, cap 48).
+  const blurPx = scale > 1.5
+    ? Math.min(16, Math.max(3, Math.round(scale * 0.5)))
+    : 0
+
   const guide = document.createElement('canvas')
   guide.width = blankRegion.width
   guide.height = blankRegion.height
@@ -1931,7 +1942,11 @@ export function drawSoftenedPlanningGuide(
 
   gctx.imageSmoothingEnabled = true
   gctx.imageSmoothingQuality = 'high'
+  if (blurPx > 0) {
+    gctx.filter = `blur(${blurPx}px)`
+  }
   gctx.drawImage(sliceImg, 0, 0, blankRegion.width, blankRegion.height)
+  gctx.filter = 'none'
 
   ctx.drawImage(guide, blankRegion.x, blankRegion.y)
 }
@@ -1994,7 +2009,7 @@ function restoreAcceptedNeighbourOverlaps(
  * Composite a tile input image with a planning guide in the blank region.
  *
  * Used by the TileExtensionModal preview so the user sees the same plan
- * placement that Phase 3 refine receives (high-quality upsample, no blur).
+ * placement that Phase 3 refine receives (light soften on upsample).
  *
  * Pass `allTileSpecs` + `tileAccepted` and a live `bandCanvas` so that
  * accepted-neighbour overlaps can be restored with high-res pixels after the
@@ -2034,8 +2049,8 @@ export function compositeTileInputWithPlanning(
  *
  * Layout:
  *   - High-res context strip from the band canvas (preserved exactly).
- *   - Low-res plan guide upscaled into the blank region (layout + colour;
- *     only previously downscaled to fit the API dimension limit).
+ *   - Low-res plan guide lightly softened into the blank region (layout +
+ *     colour preserved; only previously downscaled to fit the API limit).
  *   - High-res pixels from accepted neighbour tiles restored on top of the
  *     plan guide wherever they overlap the current tile's blank region
  *     (e.g. the tile directly above in the same column).
@@ -2067,8 +2082,8 @@ export function buildTileSliceComposite(
 
     const sliceImg = new Image()
     sliceImg.onload = () => {
-      // Step 2: plan guide over the full blank region (overwrites any
-      // accepted-neighbour pixels that landed inside blankRegion).
+      // Step 2: lightly softened plan guide over the full blank region
+      // (overwrites any accepted-neighbour pixels inside blankRegion).
       drawSoftenedPlanningGuide(ctx, sliceImg, blankRegion)
 
       // Step 3: restore accepted-neighbour overlaps with high-res pixels so
@@ -3136,20 +3151,122 @@ function buildTileFeatherMask(
   return canvas
 }
 
+/** A 2D pixel offset used to manually nudge a tile's extension content before accept. */
+export interface TileShimmyOffset {
+  x: number
+  y: number
+}
+
+/** Clamp a shimmy offset to ±MAX_TILE_SHIMMY_PX on each axis. */
+export function clampTileShimmyOffset(offset: TileShimmyOffset): TileShimmyOffset {
+  const clamp = (v: number) => Math.max(-MAX_TILE_SHIMMY_PX, Math.min(MAX_TILE_SHIMMY_PX, Math.round(v)))
+  return { x: clamp(offset.x), y: clamp(offset.y) }
+}
+
+/**
+ * Build a tile-sized canvas from `tileImg` with its blank/extension content
+ * nudged by `offset`, while the preserved context pixels stay exactly where
+ * they were.
+ *
+ * The context strip is drawn unshifted first. Then, ONLY within the
+ * `blankRegion` footprint (clipped, so shifted content can never bleed into
+ * the context strip), the blank region's own content is redrawn sourced from
+ * `offset` pixels away — sliding the model's fill within its fixed box. Any
+ * area the shift uncovers is left transparent so whatever is already in the
+ * band (prior neighbour pixels, or nothing) shows through once this tile is
+ * composited — same as the feather step already relies on.
+ */
+function drawTileWithShimmy(
+  tileImg: HTMLImageElement,
+  tileWidth: number,
+  tileHeight: number,
+  blankRegion: { x: number; y: number; width: number; height: number },
+  offset: TileShimmyOffset,
+): HTMLCanvasElement {
+  const canvas = document.createElement('canvas')
+  canvas.width = tileWidth
+  canvas.height = tileHeight
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return canvas
+
+  ctx.drawImage(tileImg, 0, 0)
+
+  if ((offset.x !== 0 || offset.y !== 0) && blankRegion.width > 0 && blankRegion.height > 0) {
+    ctx.save()
+    ctx.beginPath()
+    ctx.rect(blankRegion.x, blankRegion.y, blankRegion.width, blankRegion.height)
+    ctx.clip()
+    ctx.clearRect(blankRegion.x, blankRegion.y, blankRegion.width, blankRegion.height)
+    ctx.drawImage(
+      tileImg,
+      blankRegion.x, blankRegion.y, blankRegion.width, blankRegion.height,
+      blankRegion.x + offset.x, blankRegion.y + offset.y, blankRegion.width, blankRegion.height,
+    )
+    ctx.restore()
+  }
+
+  return canvas
+}
+
+/**
+ * Draw a (possibly shimmied) tile canvas onto `destCtx` at `(destX, destY)`,
+ * applying the 2D separable feather mask so it blends with any already-
+ * processed neighbors along shared overlap edges. Tiles with no processed
+ * neighbors are drawn opaquely (first tile, no-op blending).
+ */
+function compositeShimmiedTileOnto(
+  destCtx: CanvasRenderingContext2D,
+  destX: number,
+  destY: number,
+  shimmiedTile: HTMLCanvasElement,
+  tileWidth: number,
+  tileHeight: number,
+  featherOverlap: TileFeatherOverlap,
+): void {
+  const hasFeather =
+    featherOverlap.top > 0 || featherOverlap.bottom > 0 ||
+    featherOverlap.left > 0 || featherOverlap.right > 0
+
+  if (!hasFeather) {
+    destCtx.drawImage(shimmiedTile, destX, destY)
+    return
+  }
+
+  const mask      = buildTileFeatherMask(tileWidth, tileHeight, featherOverlap)
+  const offscreen = document.createElement('canvas')
+  offscreen.width  = tileWidth
+  offscreen.height = tileHeight
+  const offCtx    = offscreen.getContext('2d')
+  if (!offCtx) throw new Error('Failed to get offscreen tile canvas context')
+
+  offCtx.drawImage(shimmiedTile, 0, 0)
+  offCtx.globalCompositeOperation = 'destination-in'
+  offCtx.drawImage(mask, 0, 0)
+
+  // source-over: masked tile fades to transparent at feathered edges so the
+  // already-composited band content shows through the overlap region
+  destCtx.drawImage(offscreen, destX, destY)
+}
+
 /**
  * Composite one AI tile result into the running band canvas.
  *
  * Applies the 2D separable feather mask so the tile blends with any
  * already-processed neighbors along shared overlap edges.  Tiles with no
  * processed neighbors are drawn opaquely (first tile, no-op blending).
+ *
+ * `shimmyOffset` nudges only the tile's blank/extension content (see
+ * `drawTileWithShimmy`) — the preserved context strip never moves. Defaults
+ * to `{ x: 0, y: 0 }`, matching prior behaviour exactly.
  */
 export async function compositeTileResult(
   bandCanvas: HTMLCanvasElement,
   tileResultDataUrl: string,
   tileSpec: ExtensionTileSpec,
   direction: 'up' | 'down' | 'left' | 'right',
+  shimmyOffset: TileShimmyOffset = { x: 0, y: 0 },
 ): Promise<void> {
-  const { bandX, bandY, tileWidth, tileHeight, featherOverlap } = tileSpec
+  const { bandX, bandY, tileWidth, tileHeight, blankRegion, featherOverlap } = tileSpec
 
   // Normalise AI output to exact tile dimensions (model may return slightly off).
   // Anchor to the context edge so the preserved strip stays pixel-aligned.
@@ -3159,36 +3276,72 @@ export async function compositeTileResult(
     tileHeight,
     getChunkAlign(direction),
   )
-  const tileImg    = await loadImageElement(normalized)
+  const tileImg = await loadImageElement(normalized)
 
   const bandCtx = bandCanvas.getContext('2d')
   if (!bandCtx) throw new Error('Failed to get band canvas context for composite')
 
-  const hasFeather =
-    featherOverlap.top > 0 || featherOverlap.bottom > 0 ||
-    featherOverlap.left > 0 || featherOverlap.right > 0
+  const shimmied = drawTileWithShimmy(tileImg, tileWidth, tileHeight, blankRegion, clampTileShimmyOffset(shimmyOffset))
+  compositeShimmiedTileOnto(bandCtx, bandX, bandY, shimmied, tileWidth, tileHeight, featherOverlap)
+}
 
-  if (!hasFeather) {
-    // First tile or no processed neighbors — paint directly
-    bandCtx.drawImage(tileImg, bandX, bandY)
-    return
-  }
+/**
+ * Preview what `compositeTileResult` would produce at a given shimmy offset,
+ * WITHOUT mutating the live band canvas.
+ *
+ * Clones just this tile's footprint from the live band (so the preview
+ * reflects real neighbour context/feathering), runs the same shimmy +
+ * feather compositing used by `compositeTileResult` onto that clone, then
+ * returns a seam-focused crop — the blank region plus a small margin of
+ * context on every side — so the modal can show live merge feedback while
+ * the user nudges the offset.
+ */
+export async function previewCompositeTileResult(
+  bandCanvas: HTMLCanvasElement,
+  tileResultDataUrl: string,
+  tileSpec: ExtensionTileSpec,
+  direction: 'up' | 'down' | 'left' | 'right',
+  shimmyOffset: TileShimmyOffset = { x: 0, y: 0 },
+  marginPx = 32,
+): Promise<string> {
+  const { bandX, bandY, tileWidth, tileHeight, blankRegion, featherOverlap } = tileSpec
 
-  // Apply 2D feather mask to the tile on an offscreen canvas
-  const mask      = buildTileFeatherMask(tileWidth, tileHeight, featherOverlap)
-  const offscreen = document.createElement('canvas')
-  offscreen.width  = tileWidth
-  offscreen.height = tileHeight
-  const offCtx    = offscreen.getContext('2d')
-  if (!offCtx) throw new Error('Failed to get offscreen tile canvas context')
+  // Clone just this tile's footprint from the live band — this is what
+  // compositeTileResult would draw onto in place, so the preview matches.
+  const bandSlice = document.createElement('canvas')
+  bandSlice.width  = tileWidth
+  bandSlice.height = tileHeight
+  const sliceCtx = bandSlice.getContext('2d')
+  if (!sliceCtx) throw new Error('Failed to get band slice canvas context')
+  sliceCtx.drawImage(bandCanvas, bandX, bandY, tileWidth, tileHeight, 0, 0, tileWidth, tileHeight)
 
-  offCtx.drawImage(tileImg, 0, 0)
-  offCtx.globalCompositeOperation = 'destination-in'
-  offCtx.drawImage(mask, 0, 0)
+  const normalized = await normalizeImageToSize(
+    tileResultDataUrl,
+    tileWidth,
+    tileHeight,
+    getChunkAlign(direction),
+  )
+  const tileImg = await loadImageElement(normalized)
 
-  // source-over: masked tile fades to transparent at feathered edges so the
-  // already-composited band content shows through the overlap region
-  bandCtx.drawImage(offscreen, bandX, bandY)
+  const shimmied = drawTileWithShimmy(tileImg, tileWidth, tileHeight, blankRegion, clampTileShimmyOffset(shimmyOffset))
+  compositeShimmiedTileOnto(sliceCtx, 0, 0, shimmied, tileWidth, tileHeight, featherOverlap)
+
+  // Crop to a seam-focused window: blankRegion plus a margin of context on
+  // every side, clamped to the tile bounds.
+  const cropX = Math.max(0, blankRegion.x - marginPx)
+  const cropY = Math.max(0, blankRegion.y - marginPx)
+  const cropR = Math.min(tileWidth, blankRegion.x + blankRegion.width + marginPx)
+  const cropB = Math.min(tileHeight, blankRegion.y + blankRegion.height + marginPx)
+  const cropW = Math.max(1, cropR - cropX)
+  const cropH = Math.max(1, cropB - cropY)
+
+  const cropCanvas = document.createElement('canvas')
+  cropCanvas.width  = cropW
+  cropCanvas.height = cropH
+  const cropCtx = cropCanvas.getContext('2d')
+  if (!cropCtx) return bandSlice.toDataURL('image/png')
+  cropCtx.drawImage(bandSlice, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH)
+  return cropCanvas.toDataURL('image/png')
 }
 
 /**

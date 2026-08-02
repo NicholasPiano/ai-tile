@@ -21,7 +21,7 @@ import { SPRITE_ANIMATIONS, SPRITE_FRAME_COUNT, SPRITE_FRAME_SIZE, SPRITE_GRID_C
 import { BODY_PLANS, BodyPlan, isAirborneAnim } from '@/app/lib/bodyPlans'
 import { combineExtendPrompts } from '@/app/lib/extendPrompt'
 import { CORNER_GRAFTS, ENABLE_CORNER_RECONCILE, TILESET_ATLAS_EXTRUDE_PX, TILESET_BY_ROLE, TILESET_COLS, TILESET_PADDED_SHEET_H, TILESET_PADDED_SHEET_W, TILESET_PADDED_STRIDE, TILESET_ROWS, TILESET_SHEET_H, TILESET_SHEET_W, TILESET_SLOTS, TILESET_TILE_SIZE, TILE_TEMPLATE_CELL, TILE_TEMPLATE_COLS, TILE_TEMPLATE_H, TILE_TEMPLATE_MASK, TILE_TEMPLATE_ROWS, TILE_TEMPLATE_SAMPLES, TILE_TEMPLATE_W, TileSetRole, TileSetSlot, alignAiOutputToTemplate, applyFeatheredRoleMask, buildTileSheetGuideDataUrl, createEmptyTileSet, rebuildCornerTile, reconcileAllCorners, templateRoleForCell } from '@/app/lib/tileset'
-import { alignSpriteFramesToBaseline, applyFullContextResult, buildGlobalPlanningMap, buildPerTilePlanningMap, buildRegionalExtensionView, buildRegionalPlanningMap, buildTileChunkInfo, buildTileInput, buildTileSliceComposite, buildTilePlanningMap, centerSpriteFramesHorizontally, ChunkInfo, chromaKeyToAlpha, compositeTileResult, computeRegionMapLayout, createChunkedExtension, createFullContextExtension, cropGlobalPlanExtensionView, cropPlanningResult, ExtensionTileSpec, getChunkAlign, getImageDimensions, groupTilesIntoPlanRegions, harmonizeHorizontalSeams, initBandCanvas, isolatePrimarySpriteComponent, isAiExtensionUnfilled, isTileResultUnfilled, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, mapTileRectIntoRegionLayout, measureSeamResidual, normalizeImageToSize, normalizeSpriteFrameScale, PlanRegionGrouping, PlanTileRegion, planExtensionTiles, PriorRegionResult, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk, TiledExtensionPlan } from '@/app/utils/imageProcessor'
+import { alignSpriteFramesToBaseline, applyFullContextResult, buildGlobalPlanningMap, buildPerTilePlanningMap, buildRegionalExtensionView, buildRegionalPlanningMap, buildTileChunkInfo, buildTileInput, buildTileSliceComposite, buildTilePlanningMap, centerSpriteFramesHorizontally, ChunkInfo, chromaKeyToAlpha, compositeTileResult, computeRegionMapLayout, createChunkedExtension, createFullContextExtension, cropGlobalPlanExtensionView, cropPlanningResult, ExtensionTileSpec, getChunkAlign, getImageDimensions, groupTilesIntoPlanRegions, harmonizeHorizontalSeams, initBandCanvas, isolatePrimarySpriteComponent, isAiExtensionUnfilled, isTileResultUnfilled, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, mapTileRectIntoRegionLayout, measureSeamResidual, normalizeImageToSize, normalizeSpriteFrameScale, PlanRegionGrouping, PlanTileRegion, planExtensionTiles, PriorRegionResult, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk, TiledExtensionPlan, TileShimmyOffset } from '@/app/utils/imageProcessor'
 import { SubjectBounds, drawPoseGuideSheet, measureSubjectBounds } from '@/app/utils/poseRig'
 import JSZip from 'jszip'
 
@@ -1189,8 +1189,13 @@ export default function Home() {
    * Accept the generated result for a tile, composite it into the band canvas,
    * then (once all tiles are accepted) stitch the final image.
    * Only the next pending tile in scan order can be accepted.
+   *
+   * `shimmyOffset` nudges only the tile's blank/extension content (the
+   * preserved context strip never moves) — see `compositeTileResult`. Used
+   * by the manual per-tile Accept flow; the "Generate all" auto-accept loop
+   * and "Accept plan as-is" always pass the default (0, 0).
    */
-  const acceptTile = useCallback(async (nsIdx: number) => {
+  const acceptTile = useCallback(async (nsIdx: number, shimmyOffset: TileShimmyOffset = { x: 0, y: 0 }) => {
     const plan = pendingTiledPlanRef.current
     if (!plan) return
 
@@ -1209,7 +1214,7 @@ export default function Home() {
     if (!canvas) return
 
     try {
-      await compositeTileResult(canvas, preview, tileSpec, plan.direction)
+      await compositeTileResult(canvas, preview, tileSpec, plan.direction, shimmyOffset)
     } catch (err) {
       setError((err as Error).message || 'Failed to composite tile')
       return
@@ -5217,7 +5222,7 @@ export default function Home() {
             }
             onGenerate={() => void generateTile(nsIdx)}
             onReplan={() => void generateTile(nsIdx, true)}
-            onAccept={() => void acceptTile(nsIdx)}
+            onAccept={(offset) => void acceptTile(nsIdx, offset)}
             onAcceptPlan={() => void acceptTilePlan(nsIdx)}
             onClose={() => setActiveTileModalIdx(null)}
             isReplanInProgress={plan.generatingTileIdx === nsIdx && plan.generatingPlanOnly}
