@@ -4812,22 +4812,8 @@ export default function Home() {
         }
         return
       }
-      // In parallax mode, only horizontal extends are meaningful — up/down
-      // would warp the locked game height. Silently ignore them so users
-      // don't accidentally break their parallax aspect ratio.
-      const mapping: Record<string, Direction> = mode === 'parallax'
-        ? { ArrowLeft: 'left', ArrowRight: 'right' }
-        : {
-            ArrowUp: 'up',
-            ArrowDown: 'down',
-            ArrowLeft: 'left',
-            ArrowRight: 'right',
-          }
-      const dir = mapping[e.key]
-      if (dir) {
-        e.preventDefault()
-        handleExtend(dir)
-      }
+      // Arrow keys no longer trigger extends — use the edge handles instead.
+      // (Keeps arrows free for other controls, e.g. tile shimmy.)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
