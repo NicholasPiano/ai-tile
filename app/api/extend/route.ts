@@ -90,6 +90,8 @@ export async function POST(request: NextRequest) {
       planScope,
       regionIndex,
       regionCount,
+      // Aspect-bucket hint for plan calls (padded canvas → model size grid)
+      imageConfig,
     } = await request.json() as {
       expandedCanvas: string
       direction: string
@@ -125,6 +127,14 @@ export async function POST(request: NextRequest) {
       planScope?: 'region'
       regionIndex?: number
       regionCount?: number
+      /**
+       * OpenRouter image_config for plan calls whose canvas was padded into a
+       * standard aspect bucket. Ignored when absent.
+       */
+      imageConfig?: {
+        aspect_ratio?: string
+        image_size?: string
+      }
     }
 
     if (!expandedCanvas || !direction || !extensionAmount) {
@@ -213,6 +223,37 @@ export async function POST(request: NextRequest) {
 
     content.push({ type: 'text', text: prompt })
 
+    // Gemini / GPT image models need modalities set for image output. Plan
+    // calls that were padded into an aspect bucket also pass image_config so
+    // the provider targets that bucket instead of an arbitrary size.
+    const requestBody: Record<string, unknown> = {
+      model: modelId,
+      messages: [{ role: 'user', content }],
+      modalities: ['image', 'text'],
+      max_tokens: 2000,
+      temperature: phase === 'plan'
+        ? 0.3
+        : hasBakedPlanning
+        ? (attempt === 0 ? 0.45 : attempt === 1 ? 0.55 : 0.65)
+        : (attempt === 0 ? 0.3 : attempt === 1 ? 0.5 : 0.7),
+    }
+
+    if (
+      phase === 'plan' &&
+      imageConfig &&
+      typeof imageConfig === 'object' &&
+      typeof imageConfig.aspect_ratio === 'string' &&
+      imageConfig.aspect_ratio.length > 0
+    ) {
+      const config: Record<string, string> = {
+        aspect_ratio: imageConfig.aspect_ratio,
+      }
+      if (typeof imageConfig.image_size === 'string' && imageConfig.image_size.length > 0) {
+        config.image_size = imageConfig.image_size
+      }
+      requestBody.image_config = config
+    }
+
     const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -221,16 +262,7 @@ export async function POST(request: NextRequest) {
         'HTTP-Referer': request.headers.get('referer') || 'http://localhost:3000',
         'X-Title': 'AI Image Extender',
       },
-      body: JSON.stringify({
-        model: modelId,
-        messages: [{ role: 'user', content }],
-        max_tokens: 2000,
-        temperature: phase === 'plan'
-          ? 0.3
-          : hasBakedPlanning
-          ? (attempt === 0 ? 0.45 : attempt === 1 ? 0.55 : 0.65)
-          : (attempt === 0 ? 0.3 : attempt === 1 ? 0.5 : 0.7),
-      }),
+      body: JSON.stringify(requestBody),
     })
 
     if (!response.ok) {
@@ -279,7 +311,9 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    return NextResponse.json({ imageUrl, chunkInfo })
+    // Echo the assembled prompt so Debug-mode UI can show the exact text
+    // that accompanied IMAGE 1 (built server-side; client must not guess).
+    return NextResponse.json({ imageUrl, chunkInfo, requestPrompt: prompt })
   } catch (error) {
     console.error('Error in extend route:', error)
     return NextResponse.json(

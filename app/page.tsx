@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { CommandBar } from '@/app/components/CommandBar'
 import { EditStudio } from '@/app/components/EditStudio'
 import { EmptyState } from '@/app/components/EmptyState'
-import { ApiKeyModal, ErrorToast, GenerateModal, RegionPlanModal, SettingsDrawer, TileExtensionModal, Toggle } from '@/app/components/Modals'
+import { ApiKeyModal, ErrorToast, GenerateModal, LlmRequestInspector, RegionPlanModal, SettingsDrawer, TileExtensionModal, Toggle } from '@/app/components/Modals'
 import { ParallaxStudio } from '@/app/components/ParallaxStudio'
 import { PropStudio } from '@/app/components/PropStudio'
 import { SpriteStudio } from '@/app/components/SpriteStudio'
@@ -12,16 +12,16 @@ import { TileStudio } from '@/app/components/TileStudio'
 import { TopBar } from '@/app/components/TopBar'
 import { ResultActions, VariantSelector } from '@/app/components/VariantSelector'
 import { Workspace, TilingState, TileCellDisplay } from '@/app/components/Workspace'
-import { Candidate, Direction, EXTENSION_PERCENT, MAX_AI_DIMENSION, MAX_PLAN_REGIONS, MAX_TILES_PER_EXTEND, Mode, PLAN_REGION_MAX_SCENE_DIM, PLAN_REGION_OVERLAP_TILES, REGIONAL_PLAN_TRIGGER_MULTIPLIER, ReferenceImage, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, TILE_OVERLAP_PX, timestampForFilename } from '@/app/lib/app'
+import { Candidate, Direction, EXTENSION_PERCENT, LlmRequestDebug, MAX_AI_DIMENSION, MAX_PLAN_REGIONS, MAX_TILES_PER_EXTEND, Mode, PLAN_REGION_MAX_SCENE_DIM, PLAN_REGION_OVERLAP_TILES, REGIONAL_PLAN_TRIGGER_MULTIPLIER, ReferenceImage, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, TILE_OVERLAP_PX, timestampForFilename } from '@/app/lib/app'
 import { findStyleLabel } from '@/app/lib/artStyles'
 import { DEFAULT_MODEL, MODELS, getModelConfig, skipsArtDirectorReview } from '@/app/lib/models'
 import { LAYER_ORDER, LAYER_ROLES, LayerRole, PARALLAX_MAX_AUTO_STEPS, ParallaxLayer, WORKFLOW_ORDER, createDefaultLayers, getRecommendedLayerIndex, getWorkflowPrerequisite } from '@/app/lib/parallax'
 import { PROP_BATCH, PROP_BATCH_COLS, PROP_BATCH_H, PROP_BATCH_ROWS, PROP_BATCH_W, PROP_TILE_SIZE, PropItem, nextPropId, propAtlasLayout, resolvePropNames } from '@/app/lib/props'
 import { SPRITE_ANIMATIONS, SPRITE_FRAME_COUNT, SPRITE_FRAME_SIZE, SPRITE_GRID_COLS, SPRITE_GRID_ROWS, SPRITE_SHEET_H, SPRITE_SHEET_W, SPRITE_STRIP_H, SPRITE_STRIP_W, SpriteAnimType, SpriteFrame, SpriteSheet, createEmptySpriteSheet } from '@/app/lib/sprite'
 import { BODY_PLANS, BodyPlan, isAirborneAnim } from '@/app/lib/bodyPlans'
-import { combineExtendPrompts } from '@/app/lib/extendPrompt'
+import { buildExtendPrompt, buildGlobalPlanningPrompt, buildRegionalPlanningPrompt, combineExtendPrompts } from '@/app/lib/extendPrompt'
 import { CORNER_GRAFTS, ENABLE_CORNER_RECONCILE, TILESET_ATLAS_EXTRUDE_PX, TILESET_BY_ROLE, TILESET_COLS, TILESET_PADDED_SHEET_H, TILESET_PADDED_SHEET_W, TILESET_PADDED_STRIDE, TILESET_ROWS, TILESET_SHEET_H, TILESET_SHEET_W, TILESET_SLOTS, TILESET_TILE_SIZE, TILE_TEMPLATE_CELL, TILE_TEMPLATE_COLS, TILE_TEMPLATE_H, TILE_TEMPLATE_MASK, TILE_TEMPLATE_ROWS, TILE_TEMPLATE_SAMPLES, TILE_TEMPLATE_W, TileSetRole, TileSetSlot, alignAiOutputToTemplate, applyFeatheredRoleMask, buildTileSheetGuideDataUrl, createEmptyTileSet, rebuildCornerTile, reconcileAllCorners, templateRoleForCell } from '@/app/lib/tileset'
-import { alignSpriteFramesToBaseline, applyFullContextResult, buildGlobalPlanningMap, buildPerTilePlanningMap, buildRegionalExtensionView, buildRegionalPlanningMap, buildTileChunkInfo, buildTileInput, buildTileSliceComposite, buildTilePlanningMap, centerSpriteFramesHorizontally, ChunkInfo, chromaKeyToAlpha, compositeTileResult, computeRegionMapLayout, createChunkedExtension, createFullContextExtension, cropGlobalPlanExtensionView, cropPlanningResult, defaultTileSeamMix, ExtensionTileSpec, getChunkAlign, getImageDimensions, groupTilesIntoPlanRegions, harmonizeHorizontalSeams, initBandCanvas, isolatePrimarySpriteComponent, isAiExtensionUnfilled, isTileResultUnfilled, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, mapTileRectIntoRegionLayout, measureSeamResidual, normalizeImageToSize, normalizeSpriteFrameScale, PlanRegionGrouping, PlanTileRegion, planExtensionTiles, PriorRegionResult, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk, TiledExtensionPlan, TileShimmyOffset } from '@/app/utils/imageProcessor'
+import { alignSpriteFramesToBaseline, applyFullContextResult, assembleTileFromPlanningSlice, buildGlobalPlanningMap, buildPerTilePlanningMap, buildRegionalExtensionView, buildRegionalPlanningMap, buildTileChunkInfo, buildTileInput, buildTileSliceComposite, buildTilePlanningMap, centerSpriteFramesHorizontally, ChunkInfo, chromaKeyToAlpha, compositeTileResult, computeRegionMapLayout, createChunkedExtension, createFullContextExtension, cropGlobalPlanExtensionView, cropPlanningResult, defaultTileSeamMix, ExtensionTileSpec, getImageDimensions, groupTilesIntoPlanRegions, harmonizeHorizontalSeams, initBandCanvas, isolatePrimarySpriteComponent, isAiExtensionUnfilled, isTileResultUnfilled, lockPasteTileKnownPixels, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, mapTileRectIntoRegionLayout, measureSeamResidual, normalizeSpriteFrameScale, normalizeTileImageToSize, padPlanCanvasToModelBucket, PlanRegionGrouping, PlanTileRegion, planExtensionTiles, PriorRegionResult, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk, TiledExtensionPlan, TileShimmyOffset, unpadImageFromAspectBucket } from '@/app/utils/imageProcessor'
 import { SubjectBounds, drawPoseGuideSheet, measureSubjectBounds } from '@/app/utils/poseRig'
 import JSZip from 'jszip'
 
@@ -166,6 +166,14 @@ export default function Home() {
     regionReferenceImages: ReferenceImage[][]
     /** Region index currently being generated, or null. */
     generatingRegionIdx: number | null
+    /**
+     * Debug snapshots of the last `/api/extend` payloads actually sent.
+     * Populated on every plan/refine call so Debug mode can show IMAGE 1 + prompt.
+     */
+    lastGlobalPlanRequest: LlmRequestDebug | null
+    lastRegionPlanRequests: (LlmRequestDebug | null)[]
+    lastTilePlanRequests: (LlmRequestDebug | null)[]
+    lastTileRefineRequests: (LlmRequestDebug | null)[]
     /**
      * Non-skipped tile indices whose owning region was regenerated after the
      * tile already had a result and/or was accepted — shown as a "stale"
@@ -978,8 +986,17 @@ export default function Home() {
         bakedPlanning?: boolean
         populatedRefs: Array<{ dataUrl: string; description: string }>
         effectivePrompt: string | undefined
+        /** Fallback prompt text if the API omits `requestPrompt`. */
+        clientPromptFallback: string
+        debugLabel: string
+        /** Override captured image size (plan maps differ from tile size). */
+        debugImageWidth?: number
+        debugImageHeight?: number
+        /** Aspect-bucket config for padded plan canvases. */
+        imageConfig?: { aspect_ratio: string; image_size: string }
       }
     ): Promise<string> => {
+      const phase: 'plan' | 'refine' = opts.phase === 'plan' ? 'plan' : 'refine'
       const response = await fetch('/api/extend', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -998,15 +1015,70 @@ export default function Home() {
           referenceImages: opts.populatedRefs.length > 0 ? opts.populatedRefs : undefined,
           phase: opts.phase,
           bakedPlanning: opts.bakedPlanning ?? false,
+          imageConfig: opts.imageConfig,
         }),
       })
-      const data = await response.json() as { imageUrl?: string; error?: string }
+      const data = await response.json() as {
+        imageUrl?: string
+        requestPrompt?: string
+        error?: string
+      }
+
+      // Capture IMAGE 1 + prompt + raw response (when present) so Debug mode
+      // shows exactly what left and what came back — before normalize/crop.
+      const responseImage =
+        typeof data.imageUrl === 'string' && data.imageUrl.length > 0 ? data.imageUrl : null
+      let responseImageWidth: number | undefined
+      let responseImageHeight: number | undefined
+      if (responseImage) {
+        try {
+          const dims = await getImageDimensions(responseImage)
+          responseImageWidth = dims.width
+          responseImageHeight = dims.height
+        } catch {
+          // Dimensions optional for the debug panel.
+        }
+      }
+      const debugSnap: LlmRequestDebug = {
+        label: opts.debugLabel,
+        phase,
+        imageDataUrl: expandedCanvas,
+        prompt:
+          typeof data.requestPrompt === 'string' && data.requestPrompt.length > 0
+            ? data.requestPrompt
+            : opts.clientPromptFallback,
+        referenceImages: opts.populatedRefs.map((r) => ({
+          dataUrl: r.dataUrl,
+          description: r.description,
+        })),
+        responseImageDataUrl: responseImage,
+        responseImageWidth,
+        responseImageHeight,
+        imageWidth: opts.debugImageWidth ?? tileSpec.tileWidth,
+        imageHeight: opts.debugImageHeight ?? tileSpec.tileHeight,
+        capturedAt: Date.now(),
+      }
+      setPendingTiledPlan((prev) => {
+        if (!prev) return null
+        if (phase === 'plan') {
+          const next = [...prev.lastTilePlanRequests]
+          next[nsIdx] = debugSnap
+          return { ...prev, lastTilePlanRequests: next }
+        }
+        const next = [...prev.lastTileRefineRequests]
+        next[nsIdx] = debugSnap
+        return { ...prev, lastTileRefineRequests: next }
+      })
+
       if (!response.ok) {
         const err = new Error(data.error || 'Failed to extend image tile') as Error & { status?: number }
         err.status = response.status
         throw err
       }
-      return data.imageUrl as string
+      if (!responseImage) {
+        throw new Error('Tile API returned no image')
+      }
+      return responseImage
     }
 
     try {
@@ -1023,9 +1095,9 @@ export default function Home() {
       const latestRefs = pendingTiledPlanRef.current?.tileReferenceImages[nsIdx] ?? []
       const populatedRefs = latestRefs.filter((r) => r.dataUrl.length > 0)
 
-      const tileAlign = getChunkAlign(direction)
+      // Exact stretch — never cover+center-crop (that silently shifts tiles).
       const normaliseTileResult = (dataUrl: string) =>
-        normalizeImageToSize(dataUrl, tileSpec.tileWidth, tileSpec.tileHeight, tileAlign)
+        normalizeTileImageToSize(dataUrl, tileSpec.tileWidth, tileSpec.tileHeight)
 
       let planningGuide: string | undefined
 
@@ -1082,13 +1154,42 @@ export default function Home() {
 
           const perTileMap = await buildPerTilePlanningMap(backgroundResult, tileRegion)
 
-          const rawRePlan = await callApi(perTileMap, {
+          // Pad into a model aspect bucket so the return lands on a known grid;
+          // unpad after so crop coords stay on the original map geometry.
+          const paddedRePlan = await padPlanCanvasToModelBucket(
+            perTileMap,
+            backgroundWidth,
+            backgroundHeight,
+            selectedModel,
+          )
+
+          const planClientPrompt = buildGlobalPlanningPrompt({
+            direction,
+            customPrompt: planningPrompt ?? null,
+            artStyle: artStyle !== 'none' ? artStyle : null,
+            sceneBrief: mode === 'parallax' && sceneBrief.trim() ? sceneBrief.trim() : null,
+            referenceImages: populatedRefs.map((r) => ({ description: r.description })),
+          })
+          const rawRePlan = await callApi(paddedRePlan.paddedDataUrl, {
             phase: 'plan',
             populatedRefs,
             effectivePrompt: planningPrompt,
+            clientPromptFallback: planClientPrompt,
+            debugLabel: `Phase 2 — Re-plan tile ${nsIdx + 1} (${paddedRePlan.layout.aspectRatio})`,
+            debugImageWidth: paddedRePlan.layout.paddedWidth,
+            debugImageHeight: paddedRePlan.layout.paddedHeight,
+            imageConfig: {
+              aspect_ratio: paddedRePlan.layout.aspectRatio,
+              image_size: paddedRePlan.imageSize,
+            },
           })
 
-          const normalizedRePlan = await normalizeImageToSize(rawRePlan, backgroundWidth, backgroundHeight)
+          const unpaddedRePlan = await unpadImageFromAspectBucket(rawRePlan, paddedRePlan.layout)
+          const normalizedRePlan = await normalizeTileImageToSize(
+            unpaddedRePlan,
+            backgroundWidth,
+            backgroundHeight,
+          )
           const tileSlice = await cropPlanningResult(normalizedRePlan, tileRegion)
 
           setPendingTiledPlan((prev) => {
@@ -1140,24 +1241,48 @@ export default function Home() {
           )
         : buildTileInput(canvas, tileSpec)
 
-      let raw = await normaliseTileResult(await callApi(tileCanvas, {
-        phase: 'refine',
+      const refineClientPrompt = buildExtendPrompt({
+        direction,
+        chunkInfo,
+        useFullContext: false,
+        customPrompt: refinePrompt ?? null,
+        artStyle: artStyle !== 'none' ? artStyle : null,
+        layerRole: layerRole ?? null,
+        sceneBrief: mode === 'parallax' && sceneBrief.trim() ? sceneBrief.trim() : null,
+        referenceImages: populatedRefs.map((r) => ({ description: r.description })),
+        hasBakedPlanning: !!planningGuide,
+      })
+      const refineCallOpts = {
+        phase: 'refine' as const,
         bakedPlanning: !!planningGuide,
         populatedRefs,
         effectivePrompt: refinePrompt,
-      }))
+        clientPromptFallback: refineClientPrompt,
+        debugLabel: `Phase 3 — Refine tile ${nsIdx + 1}`,
+      }
+
+      let raw = await normaliseTileResult(await callApi(tileCanvas, refineCallOpts))
 
       const unfilled = await isTileResultUnfilled(raw, tileSpec)
       if (unfilled) {
         // eslint-disable-next-line no-console
         console.warn(`⚠️ Tile ${nsIdx + 1} appears unfilled — retrying once`)
         raw = await normaliseTileResult(await callApi(tileCanvas, {
-          phase: 'refine',
-          bakedPlanning: !!planningGuide,
-          populatedRefs,
-          effectivePrompt: refinePrompt,
+          ...refineCallOpts,
+          debugLabel: `Phase 3 — Refine tile ${nsIdx + 1} (retry)`,
         }))
       }
+
+      // Lock-paste known-good band pixels (context strip + accepted-neighbour
+      // overlaps) so the RESULT view matches what merge will keep.
+      raw = await lockPasteTileKnownPixels(
+        raw,
+        canvas,
+        tileSpec,
+        direction,
+        plan.nonSkippedTileSpecs,
+        plan.tileAccepted,
+      )
 
       setPendingTiledPlan((prev) => {
         if (!prev) return null
@@ -1221,7 +1346,16 @@ export default function Home() {
     const mix = seamMix === undefined ? defaultTileSeamMix(tileSpec, plan.direction) : seamMix
 
     try {
-      await compositeTileResult(canvas, preview, tileSpec, plan.direction, shimmyOffset, mix)
+      await compositeTileResult(
+        canvas,
+        preview,
+        tileSpec,
+        plan.direction,
+        shimmyOffset,
+        mix,
+        plan.nonSkippedTileSpecs,
+        plan.tileAccepted,
+      )
     } catch (err) {
       setError((err as Error).message || 'Failed to composite tile')
       return
@@ -1305,17 +1439,26 @@ export default function Home() {
     )
 
     try {
-      const upscaled = await normalizeImageToSize(
+      const canvas = bandCanvasRef.current
+      if (!canvas) {
+        throw new Error('Band canvas not ready')
+      }
+
+      // Place the blank-only plan slice into blankRegion on a full-tile canvas
+      // (band context + neighbour locks) — never cover-scale the crop onto the
+      // whole tile, which mis-maps plan geometry.
+      const assembled = await assembleTileFromPlanningSlice(
+        canvas,
+        tileSpec,
         planningSlice,
-        tileSpec.tileWidth,
-        tileSpec.tileHeight,
-        getChunkAlign(plan.direction),
+        plan.nonSkippedTileSpecs,
+        plan.tileAccepted,
       )
 
       setPendingTiledPlan((prev) => {
         if (!prev) return null
         const next = [...prev.tilePreviews]
-        next[nsIdx] = upscaled
+        next[nsIdx] = assembled
         const staleTileIds = new Set(prev.staleTileIds)
         staleTileIds.delete(nsIdx)
         const updated = { ...prev, tilePreviews: next, staleTileIds, acceptingPlanTileIdx: null }
@@ -1388,11 +1531,26 @@ export default function Home() {
       )
 
       const effectivePrompt = customPrompt.trim() || undefined
+      const clientPromptFallback = buildGlobalPlanningPrompt({
+        direction,
+        customPrompt: effectivePrompt ?? null,
+        artStyle: artStyle !== 'none' ? artStyle : null,
+        sceneBrief: mode === 'parallax' && sceneBrief.trim() ? sceneBrief.trim() : null,
+      })
+
+      // Pad prototype into a model aspect bucket (e.g. 4:1) before the call.
+      const paddedPlan = await padPlanCanvasToModelBucket(
+        mapDataUrl,
+        mapWidth,
+        mapHeight,
+        selectedModel,
+      )
+
       const response = await fetch('/api/extend', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          expandedCanvas: mapDataUrl,
+          expandedCanvas: paddedPlan.paddedDataUrl,
           direction,
           extensionAmount: EXTENSION_PERCENT,
           customPrompt: effectivePrompt,
@@ -1402,18 +1560,68 @@ export default function Home() {
           layerRole: plan.layerRole,
           sceneBrief: mode === 'parallax' && sceneBrief.trim() ? sceneBrief.trim() : undefined,
           phase: 'plan',
+          imageConfig: {
+            aspect_ratio: paddedPlan.layout.aspectRatio,
+            image_size: paddedPlan.imageSize,
+          },
         }),
       })
-      const data = await response.json() as { imageUrl?: string; error?: string }
+      const data = await response.json() as {
+        imageUrl?: string
+        requestPrompt?: string
+        error?: string
+      }
+
+      const responseImage =
+        typeof data.imageUrl === 'string' && data.imageUrl.length > 0 ? data.imageUrl : null
+      let responseImageWidth: number | undefined
+      let responseImageHeight: number | undefined
+      if (responseImage) {
+        try {
+          const dims = await getImageDimensions(responseImage)
+          responseImageWidth = dims.width
+          responseImageHeight = dims.height
+        } catch {
+          // Dimensions optional for the debug panel.
+        }
+      }
+      const lastGlobalPlanRequest: LlmRequestDebug = {
+        label: `Phase 1 — Global plan (${paddedPlan.layout.aspectRatio} bucket)`,
+        phase: 'plan',
+        imageDataUrl: paddedPlan.paddedDataUrl,
+        prompt:
+          typeof data.requestPrompt === 'string' && data.requestPrompt.length > 0
+            ? data.requestPrompt
+            : clientPromptFallback,
+        referenceImages: [],
+        responseImageDataUrl: responseImage,
+        responseImageWidth,
+        responseImageHeight,
+        imageWidth: paddedPlan.layout.paddedWidth,
+        imageHeight: paddedPlan.layout.paddedHeight,
+        capturedAt: Date.now(),
+      }
+
       if (!response.ok) {
+        setPendingTiledPlan((prev) =>
+          prev ? { ...prev, lastGlobalPlanRequest, isGlobalPlanGenerating: false } : null
+        )
         const err = new Error(data.error || 'Global plan API call failed') as Error & { status?: number }
         err.status = response.status
         throw err
       }
 
-      const rawResult = data.imageUrl as string
-      // Normalise to exact planning-map dimensions so crop coordinates are accurate.
-      const normalizedResult = await normalizeImageToSize(rawResult, mapWidth, mapHeight)
+      if (!responseImage) {
+        setPendingTiledPlan((prev) =>
+          prev ? { ...prev, lastGlobalPlanRequest, isGlobalPlanGenerating: false } : null
+        )
+        throw new Error('Global plan API returned no image')
+      }
+
+      // Unpad bucket → prototype size, then stretch-normalize as a safety net
+      // so crop coordinates stay registered to the source↔grey seam.
+      const unpaddedResult = await unpadImageFromAspectBucket(responseImage, paddedPlan.layout)
+      const normalizedResult = await normalizeTileImageToSize(unpaddedResult, mapWidth, mapHeight)
 
       // Pre-crop each tile's slice from the global plan result.
       const globalTilePlanSlices = await Promise.all(
@@ -1439,6 +1647,7 @@ export default function Home() {
         if (!prev) return null
         return {
           ...prev,
+          lastGlobalPlanRequest,
           globalPlanningMap: mapDataUrl,
           globalPlanResult: normalizedResult,
           globalPlanExtensionView,
@@ -1515,12 +1724,28 @@ export default function Home() {
         customPrompt,
         plan.regionPrompts[regionIdx] ?? '',
       )
+      const clientPromptFallback = buildRegionalPlanningPrompt({
+        direction: plan.direction,
+        regionIndex: regionIdx,
+        regionCount: plan.regionGrouping.regions.length,
+        customPrompt: effectivePrompt ?? null,
+        artStyle: artStyle !== 'none' ? artStyle : null,
+        sceneBrief: mode === 'parallax' && sceneBrief.trim() ? sceneBrief.trim() : null,
+        referenceImages: populatedRefs.map((r) => ({ description: r.description })),
+      })
+
+      const paddedRegion = await padPlanCanvasToModelBucket(
+        mapDataUrl,
+        mapWidth,
+        mapHeight,
+        selectedModel,
+      )
 
       const response = await fetch('/api/extend', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          expandedCanvas: mapDataUrl,
+          expandedCanvas: paddedRegion.paddedDataUrl,
           direction: plan.direction,
           extensionAmount: EXTENSION_PERCENT,
           customPrompt: effectivePrompt,
@@ -1534,20 +1759,84 @@ export default function Home() {
           planScope: 'region',
           regionIndex: regionIdx,
           regionCount: plan.regionGrouping.regions.length,
+          imageConfig: {
+            aspect_ratio: paddedRegion.layout.aspectRatio,
+            image_size: paddedRegion.imageSize,
+          },
         }),
       })
-      const data = await response.json() as { imageUrl?: string; error?: string }
+      const data = await response.json() as {
+        imageUrl?: string
+        requestPrompt?: string
+        error?: string
+      }
+
+      const responseImage =
+        typeof data.imageUrl === 'string' && data.imageUrl.length > 0 ? data.imageUrl : null
+      let responseImageWidth: number | undefined
+      let responseImageHeight: number | undefined
+      if (responseImage) {
+        try {
+          const dims = await getImageDimensions(responseImage)
+          responseImageWidth = dims.width
+          responseImageHeight = dims.height
+        } catch {
+          // Dimensions optional for the debug panel.
+        }
+      }
+      const regionDebugSnap: LlmRequestDebug = {
+        label: `Region plan ${regionIdx + 1} / ${plan.regionGrouping.regions.length} (${paddedRegion.layout.aspectRatio})`,
+        phase: 'plan',
+        planScope: 'region',
+        imageDataUrl: paddedRegion.paddedDataUrl,
+        prompt:
+          typeof data.requestPrompt === 'string' && data.requestPrompt.length > 0
+            ? data.requestPrompt
+            : clientPromptFallback,
+        referenceImages: populatedRefs.map((r) => ({
+          dataUrl: r.dataUrl,
+          description: r.description,
+        })),
+        responseImageDataUrl: responseImage,
+        responseImageWidth,
+        responseImageHeight,
+        imageWidth: paddedRegion.layout.paddedWidth,
+        imageHeight: paddedRegion.layout.paddedHeight,
+        capturedAt: Date.now(),
+      }
+      const storeRegionDebug = () => {
+        setPendingTiledPlan((prev) => {
+          if (!prev) return null
+          const next = [...prev.lastRegionPlanRequests]
+          next[regionIdx] = regionDebugSnap
+          return { ...prev, lastRegionPlanRequests: next }
+        })
+      }
+
       if (!response.ok) {
+        storeRegionDebug()
         const err = new Error(data.error || 'Region plan API call failed') as Error & { status?: number }
         err.status = response.status
         throw err
       }
 
-      const rawResult = data.imageUrl as string
-      const normalizedResult = await normalizeImageToSize(rawResult, mapWidth, mapHeight)
+      if (!responseImage) {
+        storeRegionDebug()
+        throw new Error('Region plan API returned no image')
+      }
+
+      const unpaddedResult = await unpadImageFromAspectBucket(responseImage, paddedRegion.layout)
+      // Stretch — never cover+center — so region tile crops stay registered.
+      const normalizedResult = await normalizeTileImageToSize(unpaddedResult, mapWidth, mapHeight)
 
       const current = pendingTiledPlanRef.current
-      if (!current || !current.regionGrouping) return
+      if (!current || !current.regionGrouping) {
+        storeRegionDebug()
+        setPendingTiledPlan((prev) =>
+          prev ? { ...prev, generatingRegionIdx: null } : null
+        )
+        return
+      }
 
       // Crop each newly-owned tile's slice out of this region's plan result
       // into the same flattened globalTilePlanSlices array Phase 3 reads from
@@ -1595,8 +1884,11 @@ export default function Home() {
 
       setPendingTiledPlan((prev) => {
         if (!prev) return null
+        const nextRegionPlanRequests = [...prev.lastRegionPlanRequests]
+        nextRegionPlanRequests[regionIdx] = regionDebugSnap
         return {
           ...prev,
+          lastRegionPlanRequests: nextRegionPlanRequests,
           regionResults: nextRegionResults,
           regionScales: nextRegionScales,
           regionPlanningMaps: nextRegionPlanningMaps,
@@ -1911,6 +2203,10 @@ export default function Home() {
       regionPrompts: new Array<string>(regionCount).fill(''),
       regionReferenceImages: Array.from({ length: regionCount }, () => [] as ReferenceImage[]),
       generatingRegionIdx: null,
+      lastGlobalPlanRequest: null,
+      lastRegionPlanRequests: new Array<LlmRequestDebug | null>(regionCount).fill(null),
+      lastTilePlanRequests: new Array<LlmRequestDebug | null>(nonSkippedCount).fill(null),
+      lastTileRefineRequests: new Array<LlmRequestDebug | null>(nonSkippedCount).fill(null),
       staleTileIds: new Set<number>(),
     }
 
@@ -5231,6 +5527,9 @@ export default function Home() {
               setActiveRegionModalIdx(ownerIdx)
             }}
             isStale={plan.staleTileIds.has(nsIdx)}
+            debugMode={debugMode}
+            lastPlanRequest={plan.lastTilePlanRequests[nsIdx] ?? null}
+            lastRefineRequest={plan.lastTileRefineRequests[nsIdx] ?? null}
           />
         )
       })()}
@@ -5300,9 +5599,31 @@ export default function Home() {
               setActiveRegionModalIdx(null)
               setActiveTileModalIdx(nsIdx)
             }}
+            debugMode={debugMode}
+            lastPlanRequest={plan.lastRegionPlanRequests[regionIdx] ?? null}
           />
         )
       })()}
+
+      {/* Debug: last Phase-1 global plan request (IMAGE 1 + server prompt). */}
+      {debugMode &&
+        pendingTiledPlan &&
+        !pendingTiledPlan.isRegionalPlan &&
+        activeTileModalIdx === null &&
+        activeRegionModalIdx === null && (
+          <div
+            className="fixed bottom-4 left-4 z-40 w-[min(420px,calc(100vw-2rem))] max-h-[50vh] overflow-y-auto rounded-[var(--radius)] p-2 shadow-lg"
+            style={{
+              background: 'var(--bg-elev)',
+              border: '1px solid var(--border-strong)',
+            }}
+          >
+            <LlmRequestInspector
+              request={pendingTiledPlan.lastGlobalPlanRequest}
+              defaultOpen
+            />
+          </div>
+        )}
 
       <SettingsDrawer
         open={showSettings}

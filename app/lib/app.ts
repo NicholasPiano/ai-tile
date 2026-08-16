@@ -157,6 +157,39 @@ export type ReferenceImage = {
   description: string
 }
 
+/**
+ * Snapshot of one `/api/extend` call for Debug-mode inspection: the exact
+ * IMAGE 1 canvas sent to the model plus the assembled prompt text returned
+ * by the server (or a client-side rebuild if the response omitted it).
+ */
+export type LlmRequestDebug = {
+  /** Short UI label, e.g. "Phase 1 — Global plan". */
+  label: string
+  phase: 'plan' | 'refine'
+  /** Set when this was a regional plan call. */
+  planScope?: 'region'
+  /** Working-canvas data URL (IMAGE 1). */
+  imageDataUrl: string
+  /** Full text prompt sent as the final content part. */
+  prompt: string
+  /** Extra reference images included in the same request (may be empty). */
+  referenceImages: ReferenceImage[]
+  /**
+   * Raw model output image (before client normalize/crop/lock-paste), when
+   * the call succeeded. Null/undefined if the request failed before an image
+   * came back.
+   */
+  responseImageDataUrl?: string | null
+  /** Natural pixel size of `responseImageDataUrl` (before any client resize). */
+  responseImageWidth?: number
+  responseImageHeight?: number
+  /** Pixel size of `imageDataUrl` (the plan prototype / working canvas sent). */
+  imageWidth?: number
+  imageHeight?: number
+  /** `Date.now()` when this snapshot was stored. */
+  capturedAt: number
+}
+
 export const STORAGE_MODE = 'extender:mode'
 
 /**

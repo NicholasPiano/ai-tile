@@ -1,4 +1,6 @@
 import type { InpaintTileSpec, InpaintTilePlan } from '@/app/lib/app'
+import type { AspectPadLayout } from '@/app/lib/imageBuckets'
+import { planImageBucket } from '@/app/lib/imageBuckets'
 
 export async function expandCanvas(
   originalImageDataUrl: string,
@@ -342,6 +344,192 @@ export function normalizeImageToSize(
     img.onerror = () => reject(new Error('Failed to load image for normalization'))
     img.src = imageDataUrl
   })
+}
+
+/**
+ * Resize an AI image result to exact dimensions by stretching (no cover-crop,
+ * no cross-axis centering).
+ *
+ * Used for high-res tile refine results and for plan-map results (global,
+ * regional, and per-tile re-plan). Cover+center normalization silently shifts
+ * content when the model returns a wrong aspect ratio — destroying neighbour
+ * alignment at merge time and, for plans, mis-registering crop coordinates
+ * so tile slices no longer abut the source edge. Exact stretch maps the
+ * model's full frame onto the target rectangle so geometry stays corresponding
+ * even if slightly distorted.
+ *
+ * @param imageDataUrl - Source image as a data URL.
+ * @param targetWidth - Desired output width in pixels (rounded, min 1).
+ * @param targetHeight - Desired output height in pixels (rounded, min 1).
+ * @returns PNG data URL at exactly `targetWidth` × `targetHeight`.
+ */
+export function normalizeTileImageToSize(
+  imageDataUrl: string,
+  targetWidth: number,
+  targetHeight: number,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    // Reject non-finite sizes early so we never create a zero-area canvas.
+    if (!Number.isFinite(targetWidth) || !Number.isFinite(targetHeight)) {
+      reject(new Error('normalizeTileImageToSize requires finite target dimensions'))
+      return
+    }
+
+    const img = new Image()
+    img.crossOrigin = 'anonymous'
+
+    img.onload = () => {
+      const tw = Math.max(1, Math.round(targetWidth))
+      const th = Math.max(1, Math.round(targetHeight))
+      if (img.width === tw && img.height === th) {
+        resolve(imageDataUrl)
+        return
+      }
+
+      const canvas = document.createElement('canvas')
+      canvas.width = tw
+      canvas.height = th
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        resolve(imageDataUrl)
+        return
+      }
+
+      // Stretch the full frame — never cover-crop — so every input pixel maps
+      // into the output and plan/tile crop coords stay valid.
+      ctx.drawImage(img, 0, 0, tw, th)
+      resolve(canvas.toDataURL('image/png'))
+    }
+
+    img.onerror = () => reject(new Error('Failed to load image for stretch normalization'))
+    img.src = imageDataUrl
+  })
+}
+
+/**
+ * Pad colour for aspect-bucket letterboxing. Must not be the planning grey
+ * (#B0B0B0) so the model treats it as non-fill chrome; whatever happens in the
+ * pad is discarded by {@link unpadImageFromAspectBucket} anyway.
+ */
+const PLAN_ASPECT_PAD_COLOR = '#2A2A2A'
+
+/** Result of padding a plan prototype into a model aspect bucket. */
+export interface PaddedPlanCanvas {
+  /** Padded image data URL actually sent to the model. */
+  paddedDataUrl: string
+  /** Geometry of the original content inside the padded canvas. */
+  layout: AspectPadLayout
+  /** OpenRouter `image_config.image_size` tier for this padded size. */
+  imageSize: '0.5K' | '1K' | '2K' | '4K'
+}
+
+/**
+ * Embed a plan prototype into the nearest aspect-ratio bucket for `modelId`
+ * (centered pad). Returns the padded canvas plus layout needed to unpad later.
+ */
+export async function padPlanCanvasToModelBucket(
+  imageDataUrl: string,
+  width: number,
+  height: number,
+  modelId: string,
+): Promise<PaddedPlanCanvas> {
+  const planned = planImageBucket(width, height, modelId)
+  const {
+    paddedWidth, paddedHeight, contentX, contentY, contentWidth, contentHeight,
+    aspectRatio, imageSize,
+  } = planned
+
+  // Already on-bucket — no pad pixels needed.
+  if (paddedWidth === contentWidth && paddedHeight === contentHeight) {
+    return {
+      paddedDataUrl: imageDataUrl,
+      layout: {
+        aspectRatio,
+        paddedWidth,
+        paddedHeight,
+        contentX: 0,
+        contentY: 0,
+        contentWidth,
+        contentHeight,
+      },
+      imageSize,
+    }
+  }
+
+  const img = await loadImageElement(imageDataUrl)
+  const canvas = document.createElement('canvas')
+  canvas.width = paddedWidth
+  canvas.height = paddedHeight
+  const ctx = canvas.getContext('2d')
+  if (!ctx) {
+    throw new Error('Failed to get canvas context for plan aspect padding')
+  }
+
+  ctx.fillStyle = PLAN_ASPECT_PAD_COLOR
+  ctx.fillRect(0, 0, paddedWidth, paddedHeight)
+  ctx.drawImage(img, contentX, contentY, contentWidth, contentHeight)
+
+  return {
+    paddedDataUrl: canvas.toDataURL('image/jpeg', 0.92),
+    layout: {
+      aspectRatio,
+      paddedWidth,
+      paddedHeight,
+      contentX,
+      contentY,
+      contentWidth,
+      contentHeight,
+    },
+    imageSize,
+  }
+}
+
+/**
+ * Recover the original plan-prototype crop from a model response that was
+ * generated against a padded aspect-bucket canvas.
+ *
+ * 1. Stretch-normalize the raw return to the padded size (same aspect).
+ * 2. Crop out the content rect recorded at pad time.
+ */
+export async function unpadImageFromAspectBucket(
+  responseDataUrl: string,
+  layout: AspectPadLayout,
+): Promise<string> {
+  const {
+    paddedWidth, paddedHeight, contentX, contentY, contentWidth, contentHeight,
+  } = layout
+
+  const normalized = await normalizeTileImageToSize(
+    responseDataUrl,
+    paddedWidth,
+    paddedHeight,
+  )
+
+  // No pad was applied — normalized output is already the prototype size.
+  if (
+    contentX === 0 &&
+    contentY === 0 &&
+    contentWidth === paddedWidth &&
+    contentHeight === paddedHeight
+  ) {
+    return normalized
+  }
+
+  const img = await loadImageElement(normalized)
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(1, contentWidth)
+  canvas.height = Math.max(1, contentHeight)
+  const ctx = canvas.getContext('2d')
+  if (!ctx) {
+    throw new Error('Failed to get canvas context for plan aspect unpad')
+  }
+
+  ctx.drawImage(
+    img,
+    contentX, contentY, contentWidth, contentHeight,
+    0, 0, contentWidth, contentHeight,
+  )
+  return canvas.toDataURL('image/png')
 }
 
 function loadImageElement(dataUrl: string): Promise<HTMLImageElement> {
@@ -1950,6 +2138,70 @@ export function drawSoftenedPlanningGuide(
   ctx.drawImage(guide, blankRegion.x, blankRegion.y)
 }
 
+/** Axis-aligned rect in tile-local pixel coordinates. */
+interface TileLocalRect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+/**
+ * Tile-local rects inside `blankRegion` that already have accepted-neighbour
+ * content in the band. These must not be overwritten by a later tile's AI
+ * output ("prior wins" in overlap).
+ */
+function collectAcceptedNeighbourLockRects(
+  tileSpec: ExtensionTileSpec,
+  allTileSpecs: ExtensionTileSpec[] | undefined,
+  tileAccepted: boolean[] | undefined,
+): TileLocalRect[] {
+  if (!allTileSpecs || !tileAccepted) {
+    return []
+  }
+
+  const { bandX, bandY, blankRegion } = tileSpec
+  const curBandX = bandX + blankRegion.x
+  const curBandY = bandY + blankRegion.y
+  const curBandR = curBandX + blankRegion.width
+  const curBandB = curBandY + blankRegion.height
+  const rects: TileLocalRect[] = []
+
+  for (let i = 0; i < allTileSpecs.length; i++) {
+    if (!tileAccepted[i]) {
+      continue
+    }
+    const nb = allTileSpecs[i]
+    // Skip self (identity check by position).
+    if (nb.bandX === tileSpec.bandX && nb.bandY === tileSpec.bandY) {
+      continue
+    }
+
+    const nbBandX = nb.bandX + nb.blankRegion.x
+    const nbBandY = nb.bandY + nb.blankRegion.y
+    const nbBandR = nbBandX + nb.blankRegion.width
+    const nbBandB = nbBandY + nb.blankRegion.height
+
+    const ix = Math.max(curBandX, nbBandX)
+    const iy = Math.max(curBandY, nbBandY)
+    const ir = Math.min(curBandR, nbBandR)
+    const ib = Math.min(curBandB, nbBandB)
+
+    if (ir <= ix || ib <= iy) {
+      continue
+    }
+
+    rects.push({
+      x: ix - bandX,
+      y: iy - bandY,
+      width: ir - ix,
+      height: ib - iy,
+    })
+  }
+
+  return rects
+}
+
 /**
  * Restore accepted-neighbour pixels that overlap with the current tile's blank
  * region after the plan guide has been drawn over the full blank area.
@@ -1968,39 +2220,15 @@ function restoreAcceptedNeighbourOverlaps(
   allTileSpecs: ExtensionTileSpec[],
   tileAccepted: boolean[],
 ): void {
-  const { bandX, bandY, blankRegion } = tileSpec
-  // Blank region in band coordinates.
-  const curBandX = bandX + blankRegion.x
-  const curBandY = bandY + blankRegion.y
-  const curBandR = curBandX + blankRegion.width
-  const curBandB = curBandY + blankRegion.height
+  const { bandX, bandY } = tileSpec
+  const rects = collectAcceptedNeighbourLockRects(tileSpec, allTileSpecs, tileAccepted)
 
-  for (let i = 0; i < allTileSpecs.length; i++) {
-    if (!tileAccepted[i]) continue
-    const nb = allTileSpecs[i]
-    // Skip self (identity check by position).
-    if (nb.bandX === tileSpec.bandX && nb.bandY === tileSpec.bandY) continue
-
-    const nbBandX = nb.bandX + nb.blankRegion.x
-    const nbBandY = nb.bandY + nb.blankRegion.y
-    const nbBandR = nbBandX + nb.blankRegion.width
-    const nbBandB = nbBandY + nb.blankRegion.height
-
-    // Intersection in band coordinates.
-    const ix = Math.max(curBandX, nbBandX)
-    const iy = Math.max(curBandY, nbBandY)
-    const ir = Math.min(curBandR, nbBandR)
-    const ib = Math.min(curBandB, nbBandB)
-
-    if (ir <= ix || ib <= iy) continue
-
-    // Convert intersection to tile-local destination coordinates.
-    const dstX = ix - bandX
-    const dstY = iy - bandY
-    const w = ir - ix
-    const h = ib - iy
-
-    ctx.drawImage(bandCanvas, ix, iy, w, h, dstX, dstY, w, h)
+  for (const rect of rects) {
+    ctx.drawImage(
+      bandCanvas,
+      bandX + rect.x, bandY + rect.y, rect.width, rect.height,
+      rect.x, rect.y, rect.width, rect.height,
+    )
   }
 }
 
@@ -3210,19 +3438,22 @@ export function defaultTileSeamMix(
 }
 
 /**
- * Build a hard-cut alpha mask along the extension axis.
+ * Build the unlock alpha mask for painting AI tile pixels onto the band.
  *
- * AI pixels grow from the extension edge toward the context edge as
- * `seamMix` increases:
- * - 0 → fully original (mask fully transparent; band shows through)
- * - 1 → fully new (mask fully opaque)
+ * A pixel is unlocked (AI may write) only when ALL of:
+ * 1. It passes the extension-axis seam hard cut (`seamMix`)
+ * 2. It lies inside `blankRegion` (context strip is always locked)
+ * 3. It is not inside an accepted-neighbour overlap rect (prior wins)
+ *
  * Soft feathering is intentionally not applied — hard cuts are easier to repair.
  */
-function buildTileSeamHardMask(
+function buildTileUnlockMask(
   tileWidth: number,
   tileHeight: number,
+  blankRegion: TileLocalRect,
   direction: 'up' | 'down' | 'left' | 'right',
   seamMix: number,
+  lockedRects: TileLocalRect[],
 ): HTMLCanvasElement {
   const w = Math.max(1, Math.round(tileWidth))
   const h = Math.max(1, Math.round(tileHeight))
@@ -3244,6 +3475,11 @@ function buildTileSeamHardMask(
   const cutYDown = Math.round((1 - amount) * h)
   const cutYUp = Math.round(amount * h)
 
+  const blankX0 = blankRegion.x
+  const blankY0 = blankRegion.y
+  const blankX1 = blankRegion.x + blankRegion.width
+  const blankY1 = blankRegion.y + blankRegion.height
+
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       let useAi = false
@@ -3257,6 +3493,22 @@ function buildTileSeamHardMask(
         useAi = y < cutYUp
       }
 
+      // Context strip outside blankRegion is always locked to the band.
+      if (useAi && (x < blankX0 || x >= blankX1 || y < blankY0 || y >= blankY1)) {
+        useAi = false
+      }
+
+      // Accepted-neighbour overlaps inside the blank stay with the prior tile.
+      if (useAi) {
+        for (let i = 0; i < lockedRects.length; i++) {
+          const r = lockedRects[i]
+          if (x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height) {
+            useAi = false
+            break
+          }
+        }
+      }
+
       const idx = (y * w + x) * 4
       d[idx] = 255
       d[idx + 1] = 255
@@ -3267,6 +3519,93 @@ function buildTileSeamHardMask(
 
   ctx.putImageData(imageData, 0, 0)
   return canvas
+}
+
+/**
+ * Force-paste known-good band pixels over an AI tile result: the context
+ * strip outside `blankRegion`, plus any accepted-neighbour overlaps inside
+ * the blank. Used after generation so the modal RESULT view matches what
+ * merge will actually keep.
+ */
+export async function lockPasteTileKnownPixels(
+  tileResultDataUrl: string,
+  bandCanvas: HTMLCanvasElement,
+  tileSpec: ExtensionTileSpec,
+  direction: 'up' | 'down' | 'left' | 'right',
+  allTileSpecs?: ExtensionTileSpec[],
+  tileAccepted?: boolean[],
+): Promise<string> {
+  const { bandX, bandY, tileWidth, tileHeight, blankRegion } = tileSpec
+  const tileImg = await loadImageElement(tileResultDataUrl)
+
+  const canvas = document.createElement('canvas')
+  canvas.width = tileWidth
+  canvas.height = tileHeight
+  const ctx = canvas.getContext('2d')
+  if (!ctx) {
+    return tileResultDataUrl
+  }
+
+  // Start from the live band footprint (known-good context + prior tiles).
+  ctx.drawImage(bandCanvas, bandX, bandY, tileWidth, tileHeight, 0, 0, tileWidth, tileHeight)
+
+  const lockedRects = collectAcceptedNeighbourLockRects(tileSpec, allTileSpecs, tileAccepted)
+  // seamMix = 1: unlock the entire blank minus neighbour locks (no seam trim).
+  const mask = buildTileUnlockMask(tileWidth, tileHeight, blankRegion, direction, 1, lockedRects)
+
+  const offscreen = document.createElement('canvas')
+  offscreen.width = tileWidth
+  offscreen.height = tileHeight
+  const offCtx = offscreen.getContext('2d')
+  if (!offCtx) {
+    return tileResultDataUrl
+  }
+
+  offCtx.drawImage(tileImg, 0, 0)
+  offCtx.globalCompositeOperation = 'destination-in'
+  offCtx.drawImage(mask, 0, 0)
+  ctx.drawImage(offscreen, 0, 0)
+
+  return canvas.toDataURL('image/png')
+}
+
+/**
+ * Build a full-tile preview from a blank-only planning slice: band context +
+ * plan stretched into `blankRegion` + accepted-neighbour overlaps restored.
+ * Fixes the old path that cover-scaled the blank crop onto the whole tile.
+ */
+export async function assembleTileFromPlanningSlice(
+  bandCanvas: HTMLCanvasElement,
+  tileSpec: ExtensionTileSpec,
+  planningSlice: string,
+  allTileSpecs?: ExtensionTileSpec[],
+  tileAccepted?: boolean[],
+): Promise<string> {
+  const { bandX, bandY, tileWidth, tileHeight, blankRegion } = tileSpec
+  const sliceImg = await loadImageElement(planningSlice)
+
+  const canvas = document.createElement('canvas')
+  canvas.width = tileWidth
+  canvas.height = tileHeight
+  const ctx = canvas.getContext('2d')
+  if (!ctx) {
+    return planningSlice
+  }
+
+  ctx.drawImage(bandCanvas, bandX, bandY, tileWidth, tileHeight, 0, 0, tileWidth, tileHeight)
+
+  if (blankRegion.width > 0 && blankRegion.height > 0) {
+    ctx.drawImage(
+      sliceImg,
+      blankRegion.x, blankRegion.y, blankRegion.width, blankRegion.height,
+    )
+  }
+
+  if (allTileSpecs && tileAccepted) {
+    restoreAcceptedNeighbourOverlaps(ctx, bandCanvas, tileSpec, allTileSpecs, tileAccepted)
+  }
+
+  return canvas.toDataURL('image/png')
 }
 
 /**
@@ -3320,8 +3659,8 @@ function drawTileWithShimmy(
 
 /**
  * Draw a (possibly shimmied) tile canvas onto `destCtx` at `(destX, destY)`,
- * masked by a hard cut along the extension axis (`seamMix`). Transparent
- * mask regions leave the existing band content untouched — no soft feather.
+ * masked by the unlock mask (seam hard cut ∩ blankRegion ∖ neighbour locks).
+ * Locked pixels leave the existing band content untouched.
  */
 function compositeShimmiedTileOnto(
   destCtx: CanvasRenderingContext2D,
@@ -3330,8 +3669,10 @@ function compositeShimmiedTileOnto(
   shimmiedTile: HTMLCanvasElement,
   tileWidth: number,
   tileHeight: number,
+  blankRegion: TileLocalRect,
   direction: 'up' | 'down' | 'left' | 'right',
   seamMix: number,
+  lockedRects: TileLocalRect[],
 ): void {
   const amount = clampTileSeamMix(seamMix)
 
@@ -3339,6 +3680,10 @@ function compositeShimmiedTileOnto(
   if (amount <= 0) {
     return
   }
+
+  const mask = buildTileUnlockMask(
+    tileWidth, tileHeight, blankRegion, direction, amount, lockedRects,
+  )
 
   const offscreen = document.createElement('canvas')
   offscreen.width = tileWidth
@@ -3349,13 +3694,8 @@ function compositeShimmiedTileOnto(
   }
 
   offCtx.drawImage(shimmiedTile, 0, 0)
-
-  // Fully new — paint the whole tile opaquely (still no soft feather).
-  if (amount < 1) {
-    const mask = buildTileSeamHardMask(tileWidth, tileHeight, direction, amount)
-    offCtx.globalCompositeOperation = 'destination-in'
-    offCtx.drawImage(mask, 0, 0)
-  }
+  offCtx.globalCompositeOperation = 'destination-in'
+  offCtx.drawImage(mask, 0, 0)
 
   destCtx.drawImage(offscreen, destX, destY)
 }
@@ -3363,13 +3703,11 @@ function compositeShimmiedTileOnto(
 /**
  * Composite one AI tile result into the running band canvas.
  *
- * Applies a hard cut along the extension axis (`seamMix`) so the user can
- * choose how much original vs new content to keep — soft neighbor feathering
- * is intentionally disabled (hard cuts are easier to repair).
- *
- * `shimmyOffset` nudges only the tile's blank/extension content (see
- * `drawTileWithShimmy`) — the preserved context strip never moves. Defaults
- * to `{ x: 0, y: 0 }`.
+ * Alignment-preserving merge:
+ * - Stretch-normalize (no cover+center shift)
+ * - Optional shimmy of blank content only
+ * - Unlock mask: seam hard cut ∩ blankRegion ∖ accepted-neighbour overlaps
+ *   so the context strip and prior tiles are force-locked from the band
  *
  * `seamMix` defaults to the natural context/blank boundary
  * (`defaultTileSeamMix`) when omitted.
@@ -3381,18 +3719,13 @@ export async function compositeTileResult(
   direction: 'up' | 'down' | 'left' | 'right',
   shimmyOffset: TileShimmyOffset = { x: 0, y: 0 },
   seamMix?: number,
+  allTileSpecs?: ExtensionTileSpec[],
+  tileAccepted?: boolean[],
 ): Promise<void> {
   const { bandX, bandY, tileWidth, tileHeight, blankRegion } = tileSpec
   const mix = seamMix === undefined ? defaultTileSeamMix(tileSpec, direction) : clampTileSeamMix(seamMix)
 
-  // Normalise AI output to exact tile dimensions (model may return slightly off).
-  // Anchor to the context edge so the preserved strip stays pixel-aligned.
-  const normalized = await normalizeImageToSize(
-    tileResultDataUrl,
-    tileWidth,
-    tileHeight,
-    getChunkAlign(direction),
-  )
+  const normalized = await normalizeTileImageToSize(tileResultDataUrl, tileWidth, tileHeight)
   const tileImg = await loadImageElement(normalized)
 
   const bandCtx = bandCanvas.getContext('2d')
@@ -3400,8 +3733,12 @@ export async function compositeTileResult(
     throw new Error('Failed to get band canvas context for composite')
   }
 
+  const lockedRects = collectAcceptedNeighbourLockRects(tileSpec, allTileSpecs, tileAccepted)
   const shimmied = drawTileWithShimmy(tileImg, tileWidth, tileHeight, blankRegion, shimmyOffset)
-  compositeShimmiedTileOnto(bandCtx, bandX, bandY, shimmied, tileWidth, tileHeight, direction, mix)
+  compositeShimmiedTileOnto(
+    bandCtx, bandX, bandY, shimmied, tileWidth, tileHeight,
+    blankRegion, direction, mix, lockedRects,
+  )
 }
 
 /**
@@ -3409,11 +3746,9 @@ export async function compositeTileResult(
  * and seam mix, WITHOUT mutating the live band canvas.
  *
  * Clones just this tile's footprint from the live band (so the preview
- * reflects real neighbour context), runs the same shimmy + hard-cut
- * compositing used by `compositeTileResult` onto that clone, then returns a
- * seam-focused crop — the blank region plus a small margin of context on
- * every side — so the modal can show live merge feedback while the user
- * nudges the offset or seam slider.
+ * reflects real neighbour context + lock-paste), runs the same shimmy +
+ * unlock-mask compositing used by `compositeTileResult` onto that clone,
+ * then returns a seam-focused crop.
  */
 export async function previewCompositeTileResult(
   bandCanvas: HTMLCanvasElement,
@@ -3422,6 +3757,8 @@ export async function previewCompositeTileResult(
   direction: 'up' | 'down' | 'left' | 'right',
   shimmyOffset: TileShimmyOffset = { x: 0, y: 0 },
   seamMix?: number,
+  allTileSpecs?: ExtensionTileSpec[],
+  tileAccepted?: boolean[],
   marginPx = 32,
 ): Promise<string> {
   const { bandX, bandY, tileWidth, tileHeight, blankRegion } = tileSpec
@@ -3438,16 +3775,15 @@ export async function previewCompositeTileResult(
   }
   sliceCtx.drawImage(bandCanvas, bandX, bandY, tileWidth, tileHeight, 0, 0, tileWidth, tileHeight)
 
-  const normalized = await normalizeImageToSize(
-    tileResultDataUrl,
-    tileWidth,
-    tileHeight,
-    getChunkAlign(direction),
-  )
+  const normalized = await normalizeTileImageToSize(tileResultDataUrl, tileWidth, tileHeight)
   const tileImg = await loadImageElement(normalized)
 
+  const lockedRects = collectAcceptedNeighbourLockRects(tileSpec, allTileSpecs, tileAccepted)
   const shimmied = drawTileWithShimmy(tileImg, tileWidth, tileHeight, blankRegion, shimmyOffset)
-  compositeShimmiedTileOnto(sliceCtx, 0, 0, shimmied, tileWidth, tileHeight, direction, mix)
+  compositeShimmiedTileOnto(
+    sliceCtx, 0, 0, shimmied, tileWidth, tileHeight,
+    blankRegion, direction, mix, lockedRects,
+  )
 
   // Crop to a seam-focused window: blankRegion plus a margin of context on
   // every side, clamped to the tile bounds.

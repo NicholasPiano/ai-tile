@@ -19,7 +19,265 @@ import {
   TileShimmyOffset,
 } from '@/app/utils/imageProcessor'
 import { MODELS, maskKey } from '@/app/lib/models'
-import { Direction, MAX_AI_DIMENSION, ReferenceImage } from '@/app/lib/app'
+import { Direction, LlmRequestDebug, MAX_AI_DIMENSION, ReferenceImage } from '@/app/lib/app'
+
+/**
+ * Debug-mode panel showing the exact IMAGE 1 + prompt last sent to `/api/extend`
+ * and the raw returned image, for a plan or refine call.
+ */
+export function LlmRequestInspector({
+  request,
+  defaultOpen = false,
+}: {
+  request: LlmRequestDebug | null | undefined
+  defaultOpen?: boolean
+}) {
+  const [copied, setCopied] = useState(false)
+
+  if (!request) {
+    return (
+      <details className="rounded-[var(--radius-sm)]" style={{ border: '1px solid var(--border)' }}>
+        <summary
+          className="cursor-pointer select-none px-3 py-2 text-[11px] uppercase tracking-wider font-medium"
+          style={{ color: 'var(--warning, #e6a032)' }}
+        >
+          LLM request (debug) ▸
+        </summary>
+        <p className="px-3 pb-3 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+          No request captured yet for this scope. Run the plan/generate action once.
+        </p>
+      </details>
+    )
+  }
+
+  const sentW = typeof request.imageWidth === 'number' ? request.imageWidth : null
+  const sentH = typeof request.imageHeight === 'number' ? request.imageHeight : null
+  const retW = typeof request.responseImageWidth === 'number' ? request.responseImageWidth : null
+  const retH = typeof request.responseImageHeight === 'number' ? request.responseImageHeight : null
+  const dimsKnown = sentW !== null && sentH !== null && retW !== null && retH !== null
+  const dimsMatch = dimsKnown && sentW === retW && sentH === retH
+  const when = new Date(request.capturedAt).toLocaleTimeString()
+  const scopeNote = request.planScope === 'region' ? ' · region' : ''
+  const fileStem = `llm-${request.phase}${scopeNote.replace(/\s+/g, '-')}-${request.capturedAt}`
+  const responseUrl =
+    typeof request.responseImageDataUrl === 'string' && request.responseImageDataUrl.length > 0
+      ? request.responseImageDataUrl
+      : null
+
+  const copyPrompt = async () => {
+    try {
+      await navigator.clipboard.writeText(request.prompt)
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1500)
+    } catch {
+      setCopied(false)
+    }
+  }
+
+  /** Trigger a browser download for a data-URL image. */
+  const downloadDataUrl = (dataUrl: string, filename: string) => {
+    const a = document.createElement('a')
+    a.href = dataUrl
+    a.download = filename
+    a.click()
+  }
+
+  return (
+    <details
+      className="rounded-[var(--radius-sm)]"
+      style={{ border: '1px solid rgba(230,160,50,0.45)', background: 'rgba(230,160,50,0.06)' }}
+      open={defaultOpen}
+    >
+      <summary
+        className="cursor-pointer select-none px-3 py-2 text-[11px] uppercase tracking-wider font-medium"
+        style={{ color: 'var(--warning, #e6a032)' }}
+      >
+        LLM request (debug) ▸ {request.label}
+      </summary>
+      <div className="flex flex-col gap-3 px-3 pb-3">
+        <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+          {request.phase}{scopeNote}
+          {' · '}captured {when}
+        </p>
+
+        <div
+          className="rounded-[var(--radius-sm)] px-3 py-2 text-[11px] leading-snug"
+          style={{
+            border: `1px solid ${dimsMatch ? 'rgba(80,180,100,0.45)' : 'rgba(230,160,50,0.55)'}`,
+            background: dimsMatch ? 'rgba(80,180,100,0.08)' : 'rgba(230,160,50,0.1)',
+            color: 'var(--text-secondary)',
+          }}
+        >
+          <div className="font-medium" style={{ color: dimsMatch ? '#6dba7a' : 'var(--warning, #e6a032)' }}>
+            {responseUrl
+              ? dimsKnown
+                ? dimsMatch
+                  ? 'Dimensions match prototype'
+                  : 'Dimensions DO NOT match prototype'
+                : 'Returned image present — measuring sizes…'
+              : 'No returned image to compare'}
+          </div>
+          <div className="mt-1 font-mono text-[10px]">
+            Sent (prototype):{' '}
+            {sentW !== null && sentH !== null ? `${sentW}×${sentH}` : 'unknown'}
+            {' · '}
+            Returned (natural):{' '}
+            {retW !== null && retH !== null ? `${retW}×${retH}` : responseUrl ? 'unknown' : '—'}
+          </div>
+          {dimsKnown && !dimsMatch ? (
+            <p className="mt-1 text-[10px]" style={{ color: 'var(--text-muted)' }}>
+              Sent is the aspect-bucket padded canvas. Client stretch-normalizes the
+              return to {sentW}×{sentH}, then unpads to the plan prototype before
+              tile crops. Same-aspect mismatch is uniform scale; different aspect
+              warps registration.
+            </p>
+          ) : null}
+        </div>
+
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div>
+            <div className="mb-1 flex items-center justify-between gap-2">
+              <p className="text-[10px] uppercase tracking-wider font-medium" style={{ color: 'var(--text-muted)' }}>
+                Sent — IMAGE 1
+                {sentW !== null && sentH !== null ? ` · ${sentW}×${sentH}` : ''}
+              </p>
+              <button
+                type="button"
+                onClick={() => downloadDataUrl(request.imageDataUrl, `${fileStem}-sent.png`)}
+                className="btn btn-ghost text-[10px] px-2 py-0.5"
+              >
+                Download
+              </button>
+            </div>
+            <a
+              href={request.imageDataUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="block overflow-hidden rounded-[var(--radius-sm)]"
+              style={{ border: '1px solid var(--border)', background: 'var(--surface)' }}
+              title="Open full size in new tab"
+            >
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={request.imageDataUrl}
+                alt={`${request.label} — sent`}
+                className="max-h-64 w-full object-contain block"
+                draggable={false}
+              />
+            </a>
+          </div>
+
+          <div>
+            <div className="mb-1 flex items-center justify-between gap-2">
+              <p className="text-[10px] uppercase tracking-wider font-medium" style={{ color: 'var(--text-muted)' }}>
+                Returned — raw model output
+                {retW !== null && retH !== null ? ` · ${retW}×${retH}` : ''}
+              </p>
+              {responseUrl ? (
+                <button
+                  type="button"
+                  onClick={() => downloadDataUrl(responseUrl, `${fileStem}-returned.png`)}
+                  className="btn btn-ghost text-[10px] px-2 py-0.5"
+                >
+                  Download
+                </button>
+              ) : null}
+            </div>
+            {responseUrl ? (
+              <a
+                href={responseUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="block overflow-hidden rounded-[var(--radius-sm)]"
+                style={{ border: '1px solid var(--border)', background: 'var(--surface)' }}
+                title="Open full size in new tab"
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={responseUrl}
+                  alt={`${request.label} — returned`}
+                  className="max-h-64 w-full object-contain block"
+                  draggable={false}
+                />
+              </a>
+            ) : (
+              <div
+                className="flex max-h-64 min-h-[8rem] items-center justify-center rounded-[var(--radius-sm)] px-3 text-center text-[11px]"
+                style={{
+                  border: '1px dashed var(--border)',
+                  background: 'var(--surface)',
+                  color: 'var(--text-muted)',
+                }}
+              >
+                No image returned (request failed or empty response)
+              </div>
+            )}
+          </div>
+        </div>
+
+        {request.referenceImages.length > 0 && (
+          <div>
+            <p className="mb-1 text-[10px] uppercase tracking-wider font-medium" style={{ color: 'var(--text-muted)' }}>
+              Reference images ({request.referenceImages.length})
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {request.referenceImages.map((ref, i) => (
+                <div key={`ref-${i}`} className="w-20">
+                  {ref.dataUrl ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={ref.dataUrl}
+                      alt={ref.description || `Reference ${i + 2}`}
+                      className="h-16 w-20 rounded object-cover"
+                      style={{ border: '1px solid var(--border)' }}
+                      draggable={false}
+                    />
+                  ) : (
+                    <div
+                      className="flex h-16 w-20 items-center justify-center text-[10px]"
+                      style={{ border: '1px solid var(--border)', color: 'var(--text-muted)' }}
+                    >
+                      empty
+                    </div>
+                  )}
+                  <p className="mt-0.5 truncate text-[9px]" style={{ color: 'var(--text-muted)' }} title={ref.description}>
+                    IMAGE {i + 2}: {ref.description || '(no note)'}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div>
+          <div className="mb-1 flex items-center justify-between gap-2">
+            <p className="text-[10px] uppercase tracking-wider font-medium" style={{ color: 'var(--text-muted)' }}>
+              Prompt
+            </p>
+            <button
+              type="button"
+              onClick={() => { void copyPrompt() }}
+              className="btn btn-ghost text-[10px] px-2 py-0.5"
+            >
+              {copied ? 'Copied' : 'Copy'}
+            </button>
+          </div>
+          <pre
+            className="overflow-auto rounded-[var(--radius-sm)] p-3 text-[10px] leading-relaxed whitespace-pre-wrap"
+            style={{
+              background: 'var(--surface)',
+              border: '1px solid var(--border)',
+              color: 'var(--text-secondary)',
+              maxHeight: 220,
+            }}
+          >
+            {request.prompt}
+          </pre>
+        </div>
+      </div>
+    </details>
+  )
+}
 
 export function SettingsDrawer({
   open,
@@ -206,7 +464,7 @@ export function SettingsDrawer({
           <Section title="Developer">
             <Toggle
               label="Debug overlay"
-              description="Draw seam guides and log Poisson scores to the console."
+              description="Show LLM request inspector (exact IMAGE 1 + prompt for plan/refine), seam guides, and console scores."
               checked={debugMode}
               onChange={setDebugMode}
             />
@@ -1211,6 +1469,12 @@ export interface TileExtensionModalProps {
   onJumpToRegion?: () => void
   /** True if this tile's owning region was regenerated after this tile got a result — stale badge. */
   isStale?: boolean
+  /** When true, show captured LLM request snapshots for plan/refine. */
+  debugMode?: boolean
+  /** Last Phase 2 per-tile re-plan request for this tile, if any. */
+  lastPlanRequest?: LlmRequestDebug | null
+  /** Last Phase 3 refine request for this tile, if any. */
+  lastRefineRequest?: LlmRequestDebug | null
 }
 
 export function TileExtensionModal({
@@ -1244,6 +1508,9 @@ export function TileExtensionModal({
   owningRegion,
   onJumpToRegion,
   isStale,
+  debugMode = false,
+  lastPlanRequest = null,
+  lastRefineRequest = null,
 }: TileExtensionModalProps) {
   const [inputImageUrl, setInputImageUrl] = useState<string | null>(null)
   const [resultDimensions, setResultDimensions] = useState<{ width: number; height: number } | null>(null)
@@ -1333,11 +1600,20 @@ export function TileExtensionModal({
       return
     }
     let cancelled = false
-    previewCompositeTileResult(bandCanvas, preview, tileSpec, direction, shimmyOffset, seamMix)
+    previewCompositeTileResult(
+      bandCanvas,
+      preview,
+      tileSpec,
+      direction,
+      shimmyOffset,
+      seamMix,
+      allTileSpecs,
+      tileAccepted,
+    )
       .then((url) => { if (!cancelled) setMergePreviewUrl(url) })
       .catch(() => { if (!cancelled) setMergePreviewUrl(null) })
     return () => { cancelled = true }
-  }, [preview, bandCanvas, tileSpec, direction, shimmyOffset, seamMix])
+  }, [preview, bandCanvas, tileSpec, direction, shimmyOffset, seamMix, allTileSpecs, tileAccepted])
 
   // Close on Escape when not generating or accepting the plan directly.
   useEffect(() => {
@@ -1736,6 +2012,20 @@ export function TileExtensionModal({
                 {assembledPrompt}
               </pre>
             </details>
+
+            {debugMode && (
+              <div className="flex flex-col gap-2">
+                {lastPlanRequest ? (
+                  <LlmRequestInspector request={lastPlanRequest} defaultOpen={!lastRefineRequest} />
+                ) : null}
+                {lastRefineRequest ? (
+                  <LlmRequestInspector request={lastRefineRequest} defaultOpen />
+                ) : null}
+                {!lastPlanRequest && !lastRefineRequest ? (
+                  <LlmRequestInspector request={null} />
+                ) : null}
+              </div>
+            )}
 
             {/* ── Image pipeline ───────────────────────────────────── */}
             {(() => {
@@ -2193,6 +2483,10 @@ export interface RegionPlanModalProps {
   onClose: () => void
   /** Open the given tile's TileExtensionModal (closes this modal). */
   onJumpToTile: (nsIdx: number) => void
+  /** When true, show the captured LLM request for this region's plan call. */
+  debugMode?: boolean
+  /** Last regional plan request actually sent for this region, if any. */
+  lastPlanRequest?: LlmRequestDebug | null
 }
 
 export function RegionPlanModal({
@@ -2226,6 +2520,8 @@ export function RegionPlanModal({
   onRegenerate,
   onClose,
   onJumpToTile,
+  debugMode = false,
+  lastPlanRequest = null,
 }: RegionPlanModalProps) {
   const [resultDimensions, setResultDimensions] = useState<{ width: number; height: number } | null>(null)
   const refImageFileInputRefs = useRef<(HTMLInputElement | null)[]>([])
@@ -2566,6 +2862,8 @@ export function RegionPlanModal({
                 {assembledPrompt}
               </pre>
             </details>
+
+            {debugMode ? <LlmRequestInspector request={lastPlanRequest} defaultOpen /> : null}
 
             {/* ── Image pipeline ───────────────────────────────────── */}
             <div className="flex gap-4">
