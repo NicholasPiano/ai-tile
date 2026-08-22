@@ -195,6 +195,25 @@ export default function Home() {
     pendingTiledPlanRef.current = pendingTiledPlan
   }, [pendingTiledPlan])
 
+  /**
+   * Write a pending-plan update to React state and the mirror ref in the
+   * same tick. Play loops chain `generateRegionPlan` into the next region
+   * (or, on the Tiles layer, into `generateTile`) and must observe locks
+   * and results without waiting for the useEffect above.
+   */
+  const commitPendingTiledPlan = (
+    updater: (prev: PendingTiledPlan) => PendingTiledPlan,
+  ): void => {
+    setPendingTiledPlan((prev) => {
+      if (!prev) {
+        return null
+      }
+      const next = updater(prev)
+      pendingTiledPlanRef.current = next
+      return next
+    })
+  }
+
   /** Running band canvas — seeded from the source image context strip in
    * handleExtend and updated by compositeTileResult after each accepted tile. */
   const bandCanvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -219,9 +238,9 @@ export default function Home() {
   /** Index of the region whose modal is currently open, or null. */
   const [activeRegionModalIdx, setActiveRegionModalIdx] = useState<number | null>(null)
 
-  /** True while "Generate all" is auto-looping through the remaining tiles. */
+  /** True while Play is auto-looping remaining regions or tiles. */
   const [isAutoGeneratingTiles, setIsAutoGeneratingTiles] = useState(false)
-  /** Set to true to stop the auto-generate-all loop after the current tile. */
+  /** Set to true to stop the auto-generate-all loop after the current step. */
   const autoGenerateTilesStopRef = useRef(false)
 
   /** Returns the index of the first non-accepted tile, or null if all done. */
@@ -230,6 +249,43 @@ export default function Home() {
       if (!accepted[i]) return i
     }
     return null
+  }
+
+  /** Returns the index of the first region with no plan result, or null if all planned. */
+  function getNextPendingRegionIdx(regionResults: Array<string | null>): number | null {
+    for (let i = 0; i < regionResults.length; i++) {
+      if (regionResults[i] === null) {
+        return i
+      }
+    }
+    return null
+  }
+
+  /**
+   * Poll the plan ref until Phase 1 (global plan) is no longer in flight.
+   * Used by generate-all loops that may start while a plan is already running.
+   */
+  const waitForGlobalPlan = async (): Promise<void> => {
+    while (
+      pendingTiledPlanRef.current?.isGlobalPlanGenerating &&
+      !autoGenerateTilesStopRef.current
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 150))
+    }
+  }
+
+  /**
+   * Poll the plan ref until no regional plan call is in flight.
+   * Tile generation must wait rather than refining without a region guide.
+   */
+  const waitForRegionPlan = async (): Promise<void> => {
+    while (
+      pendingTiledPlanRef.current?.generatingRegionIdx !== null &&
+      pendingTiledPlanRef.current?.generatingRegionIdx !== undefined &&
+      !autoGenerateTilesStopRef.current
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 150))
+    }
   }
   // ───────────────────────────────────────────────────────────────────────────
 
@@ -1204,15 +1260,25 @@ export default function Home() {
         }
 
         // ── Phase 3: high-res tile generation ───────────────────────────────────
-        // In regional mode, auto-trigger this tile's owning region's plan on
-        // demand if it hasn't run yet — mirrors how a fresh plan auto-kicks
-        // off the (single) global plan today. Decoupled: this only ensures a
-        // plan slice EXISTS; it never regenerates an already-planned region.
+        // In regional mode, this tile must have an owning-region plan slice
+        // before refine. Wait for any in-flight region call; only start a
+        // new one if the slice is still missing. Never refine in parallel
+        // with the region — tiles are based on the region, not independent.
         const planCheck = pendingTiledPlanRef.current
         if (planCheck?.isRegionalPlan && planCheck.regionGrouping) {
           const ownerIdx = planCheck.tileRegionOwner[nsIdx]
-          if (ownerIdx >= 0 && !planCheck.regionResults[ownerIdx] && planCheck.generatingRegionIdx === null) {
-            await generateRegionPlanRef.current?.(ownerIdx)
+          if (ownerIdx >= 0 && !planCheck.regionResults[ownerIdx]) {
+            if (planCheck.generatingRegionIdx !== null) {
+              await waitForRegionPlan()
+            }
+            const afterWait = pendingTiledPlanRef.current
+            if (
+              afterWait &&
+              !afterWait.regionResults[ownerIdx] &&
+              afterWait.generatingRegionIdx === null
+            ) {
+              await generateRegionPlanRef.current?.(ownerIdx)
+            }
           }
         }
 
@@ -1675,11 +1741,9 @@ export default function Home() {
 
   /**
    * Generate (or regenerate) ONE region's plan in a regionally-planned
-   * extension. Independent of tile refine: this only updates the region's
-   * slice of `globalTilePlanSlices` (and flags any of its owned tiles that
-   * already had a result/acceptance as "stale") — it never auto-triggers
-   * Phase 3 for the region's tiles. That stays a separate, per-tile action,
-   * exactly like today's Phase‑2 per-tile re-plan pattern.
+   * extension. Updates the region's slice of `globalTilePlanSlices` and
+   * flags any of its owned tiles that already had a result as "stale".
+   * Never starts Phase 3 — tiles stay a Tiles-layer / per-tile action.
    */
   const generateRegionPlan = useCallback(async (regionIdx: number) => {
     const plan = pendingTiledPlanRef.current
@@ -1690,9 +1754,7 @@ export default function Home() {
     if (!canvas) return
     if (plan.generatingRegionIdx !== null) return
 
-    setPendingTiledPlan((prev) =>
-      prev ? { ...prev, generatingRegionIdx: regionIdx } : null
-    )
+    commitPendingTiledPlan((prev) => ({ ...prev, generatingRegionIdx: regionIdx }))
 
     try {
       const priorRegionResults: Array<PriorRegionResult | null> = plan.regionGrouping.regions.map((r, i) =>
@@ -1832,9 +1894,7 @@ export default function Home() {
       const current = pendingTiledPlanRef.current
       if (!current || !current.regionGrouping) {
         storeRegionDebug()
-        setPendingTiledPlan((prev) =>
-          prev ? { ...prev, generatingRegionIdx: null } : null
-        )
+        commitPendingTiledPlan((prev) => ({ ...prev, generatingRegionIdx: null }))
         return
       }
 
@@ -1882,8 +1942,7 @@ export default function Home() {
         extensionSize: current.extensionSize,
       })
 
-      setPendingTiledPlan((prev) => {
-        if (!prev) return null
+      commitPendingTiledPlan((prev) => {
         const nextRegionPlanRequests = [...prev.lastRegionPlanRequests]
         nextRegionPlanRequests[regionIdx] = regionDebugSnap
         return {
@@ -1911,9 +1970,7 @@ export default function Home() {
         setApiKeyRequired(true)
         setShowApiKeyModal(true)
       }
-      setPendingTiledPlan((prev) =>
-        prev ? { ...prev, generatingRegionIdx: null } : null
-      )
+      commitPendingTiledPlan((prev) => ({ ...prev, generatingRegionIdx: null }))
     }
   }, [apiKey, selectedModel, mode, sceneBrief, customPrompt, artStyle])
 
@@ -1928,37 +1985,11 @@ export default function Home() {
   }, [generateRegionPlan])
 
   /**
-   * Poll for an in-flight Phase-1 global plan to finish. We poll the ref
-   * rather than depending on React state timing, and rather than storing the
-   * in-flight promise, since the plan can also be re-run independently from
-   * "Re-run global plan" while this loop is waiting.
-   */
-  const waitForGlobalPlan = async () => {
-    while (
-      pendingTiledPlanRef.current?.isGlobalPlanGenerating &&
-      !autoGenerateTilesStopRef.current
-    ) {
-      await new Promise((resolve) => setTimeout(resolve, 150))
-    }
-  }
-
-  /** Poll for an in-flight regional plan call (any region) to finish. */
-  const waitForRegionPlan = async () => {
-    while (
-      pendingTiledPlanRef.current?.generatingRegionIdx !== null &&
-      pendingTiledPlanRef.current?.generatingRegionIdx !== undefined &&
-      !autoGenerateTilesStopRef.current
-    ) {
-      await new Promise((resolve) => setTimeout(resolve, 150))
-    }
-  }
-
-  /**
-   * "Generate all" — sequentially generates and auto-accepts every remaining
-   * tile in the current plan, so the user doesn't have to open the per-tile
-   * modal and click Generate/Accept for each cell. Reuses the exact same
-   * `generateTile` / `acceptTile` calls as the manual flow; only the looping
-   * and auto-accept behaviour is new here.
+   * "Generate all tiles" — sequentially generates and auto-accepts every
+   * remaining tile. Only used when the Tiles layer is selected. Reuses the
+   * same `generateTile` / `acceptTile` calls as the manual flow. In regional
+   * mode each tile's owning region is planned first so refine is based on
+   * that region, never run in parallel with it.
    */
   const generateAllTiles = useCallback(async () => {
     const plan = pendingTiledPlanRef.current
@@ -2031,7 +2062,65 @@ export default function Home() {
     }
   }, [isAutoGeneratingTiles, generateTile, acceptTile, generateGlobalPlan, generateRegionPlan])
 
-  /** Stop the auto-generate-all loop — the current in-flight tile still finishes. */
+  /**
+   * "Generate all regions" — sequentially plans every remaining region and
+   * stops there. Used when the Regions layer is selected. Does not generate
+   * or accept tiles; switch to the Tiles layer and press Play for that.
+   */
+  const generateAllRegions = useCallback(async () => {
+    const plan = pendingTiledPlanRef.current
+    if (!plan || !plan.isRegionalPlan || !plan.regionGrouping) {
+      return
+    }
+    if (
+      isAutoGeneratingTiles ||
+      plan.generatingRegionIdx !== null ||
+      plan.generatingTileIdx !== null ||
+      plan.acceptingPlanTileIdx !== null
+    ) {
+      return
+    }
+
+    autoGenerateTilesStopRef.current = false
+    setIsAutoGeneratingTiles(true)
+    setActiveRegionModalIdx(null)
+    setActiveTileModalIdx(null)
+
+    try {
+      while (!autoGenerateTilesStopRef.current) {
+        const current = pendingTiledPlanRef.current
+        if (!current || !current.regionGrouping) {
+          break
+        }
+        const regionIdx = getNextPendingRegionIdx(current.regionResults)
+        if (regionIdx === null) {
+          break
+        }
+
+        if (current.generatingRegionIdx !== null) {
+          await waitForRegionPlan()
+        }
+        if (
+          !autoGenerateTilesStopRef.current &&
+          !pendingTiledPlanRef.current?.regionResults[regionIdx]
+        ) {
+          setProgressMsg(`Planning region ${regionIdx + 1}/${current.regionGrouping.regions.length}…`)
+          await generateRegionPlan(regionIdx)
+        }
+
+        const generated = pendingTiledPlanRef.current
+        if (!generated || !generated.regionResults[regionIdx]) {
+          break
+        }
+      }
+    } finally {
+      setIsAutoGeneratingTiles(false)
+      autoGenerateTilesStopRef.current = false
+      setProgressMsg(null)
+    }
+  }, [isAutoGeneratingTiles, generateRegionPlan])
+
+  /** Stop the auto-generate-all loop — the current in-flight step still finishes. */
   const stopAutoGenerateTiles = useCallback(() => {
     autoGenerateTilesStopRef.current = true
   }, [])
@@ -5408,6 +5497,11 @@ export default function Home() {
           }
           onGenerateAllTiles={
             pendingTiledPlan ? () => void generateAllTiles() : undefined
+          }
+          onGenerateAllRegions={
+            pendingTiledPlan?.isRegionalPlan
+              ? () => void generateAllRegions()
+              : undefined
           }
           isAutoGeneratingTiles={isAutoGeneratingTiles}
           onStopAutoGenerateTiles={stopAutoGenerateTiles}

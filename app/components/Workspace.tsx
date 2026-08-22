@@ -433,13 +433,13 @@ function TilingEdgeControl({
   onCancel: () => void
   onRerunGlobalPlan?: () => void
   isGlobalPlanGenerating?: boolean
-  /** Kick off automatic sequential generation of every remaining tile. */
+  /** Kick off automatic sequential generation for the active layer. */
   onGenerateAll?: () => void
   /** True while the "Generate all" loop is running. */
   isAutoGenerating?: boolean
-  /** Stop the "Generate all" loop after the current tile finishes. */
+  /** Stop the "Generate all" loop after the current step finishes. */
   onStopAutoGenerate?: () => void
-  /** Whether at least one tile is still left to generate. */
+  /** Whether at least one item on the active layer is still left to generate. */
   canGenerateAll?: boolean
   /** True for a regionally-planned (very large) extension — shows the layer toggle. */
   hasRegions?: boolean
@@ -522,17 +522,23 @@ function TilingEdgeControl({
         </button>
       )}
 
-      {/* Generate all — sequentially generates + auto-accepts every
-          remaining tile; only shown when the callback is provided */}
+      {/* Generate all — on the Regions layer this plans remaining regions
+          only; on the Tiles layer it generates remaining tiles. */}
       {onGenerateAll && (
         <button
           onClick={isAutoGenerating ? onStopAutoGenerate : onGenerateAll}
           disabled={!isAutoGenerating && !canGenerateAll}
           title={
             isAutoGenerating
-              ? 'Stop generating tiles'
+              ? hasRegions && activeLayer === 'regions'
+                ? 'Stop generating regions'
+                : 'Stop generating tiles'
               : canGenerateAll
-              ? 'Generate all remaining tiles automatically'
+              ? hasRegions && activeLayer === 'regions'
+                ? 'Generate all remaining regions'
+                : 'Generate all remaining tiles automatically'
+              : hasRegions && activeLayer === 'regions'
+              ? 'All regions generated'
               : 'All tiles generated'
           }
           className="flex h-8 w-8 items-center justify-center rounded-full transition-colors"
@@ -647,6 +653,7 @@ export function Workspace({
   onTileCancel,
   onRerunGlobalPlan,
   onGenerateAllTiles,
+  onGenerateAllRegions,
   isAutoGeneratingTiles,
   onStopAutoGenerateTiles,
 }: {
@@ -674,19 +681,28 @@ export function Workspace({
   onTileCancel?: () => void
   /** Re-run Phase 1 (global plan) for the entire extension. */
   onRerunGlobalPlan?: () => void
-  /** Sequentially generate + auto-accept every remaining tile. */
+  /** Sequentially generate + auto-accept every remaining tile (Tiles layer). */
   onGenerateAllTiles?: () => void
+  /** Sequentially plan every remaining region and stop (Regions layer). */
+  onGenerateAllRegions?: () => void
   /** True while the "Generate all" loop is running. */
   isAutoGeneratingTiles?: boolean
-  /** Stop the "Generate all" loop after the current tile finishes. */
+  /** Stop the "Generate all" loop after the current step finishes. */
   onStopAutoGenerateTiles?: () => void
 }) {
   const isTiling = !!tilingState
   const hasRegions = !!tilingState?.regions && tilingState.regions.length > 0
-  /** Which grid is bold/interactive. Defaults to tiles — the region layer is
-   * an opt-in view; tiles auto-trigger their owning region's plan on demand
-   * either way, so a user who never opens the region layer sees no difference. */
+  /**
+   * Which grid is bold/interactive. Play is scoped to this layer: Regions
+   * plans remaining regions only; Tiles generates remaining tiles (based on
+   * those region plans). Defaults to tiles so a user who never opens the
+   * region layer still gets the existing generate-all-tiles path.
+   */
   const [activeLayer, setActiveLayer] = useState<'tiles' | 'regions'>('tiles')
+  const regionsLayerSelected = hasRegions && activeLayer === 'regions'
+  const canGenerateAll = regionsLayerSelected
+    ? !!tilingState?.regions?.some((region) => !region.hasResult)
+    : tilingState?.nextPendingTileIdx !== null
 
   // ── Layout helpers when tiling ──────────────────────────────────────────────
   const flexDir: React.CSSProperties['flexDirection'] =
@@ -805,7 +821,9 @@ export function Workspace({
             onTileClick={
               isAutoGeneratingTiles ? () => undefined : onTileClick ?? (() => undefined)
             }
-            onRegionClick={onRegionClick}
+            onRegionClick={
+              isAutoGeneratingTiles ? undefined : onRegionClick
+            }
             activeLayer={hasRegions ? activeLayer : 'tiles'}
           />
         )}
@@ -819,10 +837,12 @@ export function Workspace({
               onCancel={onTileCancel ?? (() => undefined)}
               onRerunGlobalPlan={onRerunGlobalPlan}
               isGlobalPlanGenerating={tilingState.isGlobalPlanGenerating}
-              onGenerateAll={onGenerateAllTiles}
+              onGenerateAll={
+                regionsLayerSelected ? onGenerateAllRegions : onGenerateAllTiles
+              }
               isAutoGenerating={isAutoGeneratingTiles}
               onStopAutoGenerate={onStopAutoGenerateTiles}
-              canGenerateAll={tilingState.nextPendingTileIdx !== null}
+              canGenerateAll={canGenerateAll}
               hasRegions={hasRegions}
               activeLayer={activeLayer}
               onLayerChange={setActiveLayer}
