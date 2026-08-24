@@ -370,6 +370,7 @@ export function EditPanel({
   const {
     phase,
     lowResPreviewUrl,
+    lowResContextUrl,
     tilePlan,
     selectedVariantIdx,
     planningCompletedCount,
@@ -381,7 +382,6 @@ export function EditPanel({
   const changeMaskUrl = selectedVariant?.changeMaskUrl ?? null
   const changeMaskOverlayUrl = selectedVariant?.changeMaskOverlayUrl ?? null
   const tileResults = selectedVariant?.tileResults ?? []
-  const stitchedPreviewUrl = selectedVariant?.stitchedPreviewUrl ?? null
 
   // ── Local form state ──────────────────────────────────────────────────────
   // Initialise from the state so that re-run resets to the previous values.
@@ -412,6 +412,13 @@ export function EditPanel({
   const isFastPath = phase === 'done' && tilePlan === null
   const canAccept  = isFastPath || doneCount > 0
   const planReady  = globalPlanUrl !== null
+  /**
+   * After a plan exists, show the clean context crop so the baked-in
+   * selection stroke does not hide the seam.
+   */
+  const selectionPreviewUrl = planReady
+    ? (lowResContextUrl ?? lowResPreviewUrl)
+    : lowResPreviewUrl
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -422,8 +429,8 @@ export function EditPanel({
         {/* ── Section 1: Context preview ─────────────────────────────────── */}
         <div className="flex flex-col gap-3 p-4">
           <SectionLabel>Selection preview</SectionLabel>
-          {lowResPreviewUrl
-            ? <ImagePreview src={lowResPreviewUrl} alt="Selection preview" />
+          {selectionPreviewUrl
+            ? <ImagePreview src={selectionPreviewUrl} alt="Selection preview" />
             : (
               <div
                 className="flex h-24 items-center justify-center rounded-lg border text-[12px]"
@@ -577,13 +584,6 @@ export function EditPanel({
                 onCycleTileVariant={onCycleTileVariant}
                 cycleDisabled={isProcessing}
               />
-
-              {stitchedPreviewUrl && (
-                <div className="flex flex-col gap-2">
-                  <SectionLabel>Stitched preview</SectionLabel>
-                  <ImagePreview src={stitchedPreviewUrl} alt="Stitched inpaint preview" />
-                </div>
-              )}
             </div>
           </>
         )}

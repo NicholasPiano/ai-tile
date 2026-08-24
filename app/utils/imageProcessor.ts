@@ -6623,3 +6623,39 @@ export async function compositeInpaintFinal(
   ctx.putImageData(opaqueStamp, destX, destY)
   return canvas.toDataURL('image/png')
 }
+
+/**
+ * Paste the model's plan crop into the source at `contextRect` with no
+ * extra blur, change-mask, or feather. The only softness is the plan's
+ * own resolution (longest edge ≤ GLOBAL_PLAN_MAX_DIM). Used for the
+ * on-screen merge preview so the user sees the plan in place, not the
+ * softened tile-guide composite.
+ */
+export async function stampPlanIntoSource(
+  sourceImageUrl: string,
+  contextRect: { x: number; y: number; w: number; h: number },
+  planImageUrl: string,
+): Promise<string> {
+  const [sourceImg, planImg] = await Promise.all([
+    loadImageElement(sourceImageUrl),
+    loadImageElement(planImageUrl),
+  ])
+  const canvas = document.createElement('canvas')
+  canvas.width = sourceImg.naturalWidth
+  canvas.height = sourceImg.naturalHeight
+  const ctx = canvas.getContext('2d')
+  if (!ctx) {
+    return sourceImageUrl
+  }
+  ctx.drawImage(sourceImg, 0, 0)
+  ctx.imageSmoothingEnabled = true
+  ctx.imageSmoothingQuality = 'high'
+  ctx.drawImage(
+    planImg,
+    contextRect.x,
+    contextRect.y,
+    contextRect.w,
+    contextRect.h,
+  )
+  return canvas.toDataURL('image/png')
+}

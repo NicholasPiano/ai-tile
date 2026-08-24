@@ -364,8 +364,9 @@ export interface InpaintVariant {
   /** Per-tile refine slots (four versions each) for this plan variant. */
   tileResults: InpaintTileSlot[]
   /**
-   * Full-image composite of this variant's running inpaint canvas stamped
-   * into the source. Null until at least one tile has been generated.
+   * Full-image merge of this variant's running inpaint canvas stamped into
+   * the source. Set as soon as the plan composite exists (before tiles);
+   * rebuilt whenever a tile version is generated or selected.
    */
   stitchedPreviewUrl: string | null
 }

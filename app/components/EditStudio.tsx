@@ -33,6 +33,7 @@ import {
   cropInpaintTileInput,
   compositeInpaintTileResult,
   compositeInpaintFinal,
+  stampPlanIntoSource,
 } from '@/app/utils/imageProcessor'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -247,7 +248,8 @@ function drawImageRect(
 
 /**
  * Draw a white label just outside the top-left corner of a rectangle.
- * Flips below the top edge when the rectangle is near the canvas top.
+ * `fontCssPx` is a screen-pixel size so labels stay readable on both
+ * small and large displayed images (the overlay buffer is natural-res).
  */
 function drawImageLabel(
   ctx: CanvasRenderingContext2D,
@@ -256,12 +258,12 @@ function drawImageLabel(
   bufW: number,
   bufH: number,
   text: string,
-  fontPx: number = 80,
+  fontCssPx: number = 12,
 ): void {
   const buf = imageRectToBuffer(r, layout, bufW, bufH)
-  const pixelScale = imagePixelScaleInBuffer(layout, bufH)
-  const scaledFont = fontPx * pixelScale
-  const pad = 6 * pixelScale
+  const cssToBuf = layout.containerH > 0 ? bufH / layout.containerH : 1
+  const scaledFont = fontCssPx * cssToBuf
+  const pad = 4 * cssToBuf
   const cx = buf.x + pad
   const aboveY = buf.y - pad
   const cy = aboveY >= scaledFont ? aboveY : buf.y + scaledFont + pad
@@ -269,14 +271,29 @@ function drawImageLabel(
   ctx.font = `600 ${scaledFont}px ui-sans-serif, system-ui, sans-serif`
   ctx.fillStyle = 'rgba(255,255,255,0.95)'
   ctx.shadowColor = 'rgba(0,0,0,0.85)'
-  ctx.shadowBlur = 6 * pixelScale
+  ctx.shadowBlur = 4 * cssToBuf
   ctx.fillText(text, cx, cy)
   ctx.restore()
 }
 
 /**
- * Render the selection overlay and (during tiling) the tile grid onto the
- * overlay canvas.
+ * True once at least one plan URL exists, or the session has left the
+ * input / in-flight planning phases. Used to hide the selection box so
+ * the merge seam is visible.
+ */
+function inpaintPlanExists(inpaintState: InpaintState | null): boolean {
+  if (!inpaintState) {
+    return false
+  }
+  if (inpaintState.phase === 'tiling' || inpaintState.phase === 'done') {
+    return true
+  }
+  return inpaintState.variants.some((variant) => variant.globalPlanUrl !== null)
+}
+
+/**
+ * Render the selection overlay onto the main image. After a plan exists
+ * the overlay stays empty so the merge (plan or tiles) is shown unmarked.
  */
 function renderOverlay(
   canvas: HTMLCanvasElement,
@@ -284,19 +301,25 @@ function renderOverlay(
   imgH: number,
   drag: DragState | null,
   inpaintState: InpaintState | null,
-  changeMaskCanvas: HTMLCanvasElement | null,
 ): void {
   const ctx = canvas.getContext('2d')
-  if (!ctx) return
+  if (!ctx) {
+    return
+  }
 
   const bufW = canvas.width
   const bufH = canvas.height
   ctx.clearRect(0, 0, bufW, bufH)
 
+  // Merge is the unmarked photo. No boxes, tile grid, or plan wash.
+  if (inpaintPlanExists(inpaintState)) {
+    return
+  }
+
   const cssRect = canvas.getBoundingClientRect()
   const layout = computeObjectContainLayout(cssRect.width, cssRect.height, imgW, imgH)
 
-  // Faint image-boundary guide — always visible.
+  // Faint image-boundary guide — visible while choosing a region.
   const imageBounds: ImageRect = { x: 0, y: 0, w: imgW, h: imgH }
   drawImageRect(ctx, imageBounds, layout, bufW, bufH, {
     strokeStyle: 'rgba(255,255,255,0.4)',
@@ -304,15 +327,18 @@ function renderOverlay(
     dash: [6, 4],
   })
 
-  if (!drag) return
+  if (!drag) {
+    return
+  }
 
   // Prefer the committed region; fall back to the in-progress drag.
   const currentSelect =
     inpaintState?.region.selectionRect ?? selectionFromDrag(drag, imageBounds)
 
-  if (currentSelect.w < 2 || currentSelect.h < 2) return
+  if (currentSelect.w < 2 || currentSelect.h < 2) {
+    return
+  }
 
-  // Context strip around the selection.
   const currentStrip = outsetRect(currentSelect, EDIT_STRIP_PX, imageBounds)
   drawImageRect(ctx, currentStrip, layout, bufW, bufH, {
     strokeStyle: 'rgba(255,255,255,1)',
@@ -321,133 +347,12 @@ function renderOverlay(
   })
   drawImageLabel(ctx, currentStrip, layout, bufW, bufH, 'Context')
 
-  // Selection rectangle.
   drawImageRect(ctx, currentSelect, layout, bufW, bufH, {
     strokeStyle: 'rgba(255,255,255,1)',
     fillStyle: 'rgba(30,100,220,0.22)',
     lineWidth: 6,
   })
   drawImageLabel(ctx, currentSelect, layout, bufW, bufH, 'Selection')
-
-  // Tile grid overlay (visible during tiling / done phase).
-  if (
-    inpaintState &&
-    (inpaintState.phase === 'tiling' || inpaintState.phase === 'done') &&
-    inpaintState.tilePlan
-  ) {
-    const { tilePlan, generatingTileIdx } = inpaintState
-    const selectedVariant = selectedInpaintVariant(inpaintState)
-    const tileSlots = selectedVariant?.tileResults ?? []
-    const { contextRect } = inpaintState.region
-
-    // ── Change mask: blue-tinted diff overlay at context rect position ────────
-    // Build a tinted canvas from the diff mask and paint it over the image area.
-    if (changeMaskCanvas) {
-      const bufContext = imageRectToBuffer(contextRect, layout, bufW, bufH)
-      const cX = Math.round(bufContext.x)
-      const cY = Math.round(bufContext.y)
-      const cW = Math.max(1, Math.round(bufContext.w))
-      const cH = Math.max(1, Math.round(bufContext.h))
-
-      const tintCanvas = document.createElement('canvas')
-      tintCanvas.width  = cW
-      tintCanvas.height = cH
-      const tintCtx = tintCanvas.getContext('2d')
-      if (tintCtx) {
-        tintCtx.fillStyle = '#1e8cff'
-        tintCtx.fillRect(0, 0, cW, cH)
-        tintCtx.globalCompositeOperation = 'destination-in'
-        tintCtx.drawImage(changeMaskCanvas, 0, 0, cW, cH)
-      }
-      ctx.globalAlpha = 0.35
-      ctx.drawImage(tintCanvas, cX, cY)
-      ctx.globalAlpha = 1
-    }
-
-    for (let i = 0; i < tilePlan.tiles.length; i++) {
-      const tile = tilePlan.tiles[i]
-      const isGenerating = generatingTileIdx === i
-      const isDone       = tileSlotHasResult(tileSlots[i])
-      const hasMask      = tile.maskSubRect !== null
-
-      const tileRect: ImageRect = {
-        x: contextRect.x + tile.x,
-        y: contextRect.y + tile.y,
-        w: tile.w,
-        h: tile.h,
-      }
-
-      // ── Tile boundary ───────────────────────────────────────────────────────
-      if (hasMask) {
-        // Masked tile — colour by status.
-        let strokeStyle = 'rgba(255,255,255,0.5)'
-        let fillStyle: string | undefined
-        if (isGenerating) {
-          strokeStyle = 'rgba(60,140,255,0.9)'
-          fillStyle   = 'rgba(60,140,255,0.08)'
-        } else if (isDone) {
-          strokeStyle = 'rgba(40,200,80,0.8)'
-          fillStyle   = 'rgba(40,200,80,0.06)'
-        }
-        drawImageRect(ctx, tileRect, layout, bufW, bufH, {
-          strokeStyle,
-          fillStyle,
-          lineWidth: 2,
-          dash: isDone || isGenerating ? [] : [4, 3],
-        })
-      } else {
-        // Pure-context tile — dim ghost outline only.
-        drawImageRect(ctx, tileRect, layout, bufW, bufH, {
-          strokeStyle: 'rgba(255,255,255,0.15)',
-          lineWidth: 1,
-          dash: [3, 5],
-        })
-      }
-
-      // ── maskSubRect and context ring (only for masked tiles, pre-done) ─────
-      if (hasMask && tile.maskSubRect && !isDone) {
-        const ms = tile.maskSubRect
-        const maskRect: ImageRect = {
-          x: contextRect.x + tile.x + ms.x,
-          y: contextRect.y + tile.y + ms.y,
-          w: ms.w,
-          h: ms.h,
-        }
-
-        // Context ring: the part of the tile outside maskSubRect.
-        // Visualised as a cool blue tint — shows what the model sees as
-        // "source pixels" (high-res, unchanged).
-        drawImageRect(ctx, tileRect, layout, bufW, bufH, {
-          strokeStyle: 'transparent',
-          fillStyle: isGenerating ? 'rgba(60,140,255,0.12)' : 'rgba(100,160,255,0.1)',
-          lineWidth: 0,
-        })
-
-        // Plan zone: the maskSubRect — this is where blurry plan pixels are
-        // baked in and the model must sharpen them.
-        drawImageRect(ctx, maskRect, layout, bufW, bufH, {
-          strokeStyle: isGenerating ? 'rgba(60,140,255,0.9)' : 'rgba(255,180,40,0.9)',
-          fillStyle:   isGenerating ? 'rgba(60,140,255,0.18)' : 'rgba(255,180,40,0.18)',
-          lineWidth: 1.5,
-        })
-
-        // Labels inside the plan zone and in the context ring.
-        drawImageLabel(ctx, maskRect, layout, bufW, bufH, 'Plan')
-
-        // Context ring label: place it at the top-left corner of the tile
-        // (which is guaranteed to be outside maskSubRect when the ring exists).
-        if (ms.x > 4 || ms.y > 4) {
-          const ringLabelRect: ImageRect = {
-            x: contextRect.x + tile.x,
-            y: contextRect.y + tile.y,
-            w: Math.max(ms.x, 24),
-            h: Math.max(ms.y, 24),
-          }
-          drawImageLabel(ctx, ringLabelRect, layout, bufW, bufH, 'Source')
-        }
-      }
-    }
-  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -579,7 +484,8 @@ async function requestGlobalPlan(args: {
 
 /**
  * Finish one variant after its plan URL is known: change mask, preview
- * visuals, and the full-resolution composite canvas.
+ * visuals, the full-resolution composite canvas, and a merge snapshot so
+ * plan cycling can show the result before any tiles run.
  */
 async function buildVariantFromPlan(args: {
   image: string
@@ -614,6 +520,14 @@ async function buildVariantFromPlan(args: {
     changeMaskCanvas,
   )
 
+  // Display merge: the plan crop pasted into the source. The softened
+  // `canvas` stays the tile-guide working layer — it is not shown.
+  const stitchedPreviewUrl = await stampPlanIntoSource(
+    args.image,
+    args.contextRect,
+    args.globalPlanUrl,
+  )
+
   return {
     variant: {
       globalPlanScale: args.globalPlanScale,
@@ -621,7 +535,7 @@ async function buildVariantFromPlan(args: {
       changeMaskUrl,
       changeMaskOverlayUrl,
       tileResults: createEmptyInpaintTileSlots(args.tileCount),
-      stitchedPreviewUrl: null,
+      stitchedPreviewUrl,
     },
     canvas,
     changeMaskCanvas,
@@ -667,6 +581,13 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
   const [drag, setDrag] = useState<DragState | null>(null)
   const [inpaintState, setInpaintState] = useState<InpaintState | null>(null)
+  /**
+   * Latest inpaint state for sequential tile generate. `generateTile` must
+   * not read `tileResults` from a stale render closure or later tiles
+   * overwrite earlier slots.
+   */
+  const inpaintStateRef = useRef<InpaintState | null>(null)
+  inpaintStateRef.current = inpaintState
   /** Bumped when the displayed image size changes so the overlay stays aligned. */
   const [layoutTick, setLayoutTick] = useState(0)
 
@@ -690,15 +611,15 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   // ── Redraw overlay on drag or inpaint state changes ────────────────────────
   useEffect(() => {
     const canvas = canvasRef.current
-    if (!canvas || !dimensions) return
-    const selectedIdx = inpaintState?.selectedVariantIdx ?? 0
+    if (!canvas || !dimensions) {
+      return
+    }
     renderOverlay(
       canvas,
       dimensions.width,
       dimensions.height,
       drag,
       inpaintState,
-      changeMaskCanvasByVariantRef.current[selectedIdx] ?? null,
     )
   }, [drag, dimensions, inpaintState, layoutTick])
 
@@ -1123,24 +1044,28 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
   const generateTile = useCallback(
     async (idx: number) => {
-      if (!inpaintState || !image || !inpaintState.tilePlan) {
+      const state = inpaintStateRef.current
+      if (!state || !image || !state.tilePlan) {
         return
       }
-      const variantIdx = inpaintState.selectedVariantIdx
-      const selected = inpaintState.variants[variantIdx]
+      const variantIdx = state.selectedVariantIdx
+      const selected = state.variants[variantIdx]
       const base = inpaintBaseCanvasByVariantRef.current[variantIdx]
       if (!selected || !selected.globalPlanUrl || !base) {
         return
       }
 
-      const tile = inpaintState.tilePlan.tiles[idx]
+      const tile = state.tilePlan.tiles[idx]
       if (!tile || !tile.maskSubRect) {
         return
       }
 
-      const { contextRect } = inpaintState.region
-      const { editPrompt } = inpaintState
-      const tilePlan = inpaintState.tilePlan
+      const { contextRect } = state.region
+      const { editPrompt } = state
+      const tilePlan = state.tilePlan
+      // Latest slots for this variant — not the render-closure copy.
+      const latestSlots =
+        inpaintStateRef.current?.variants[variantIdx]?.tileResults ?? selected.tileResults
 
       setInpaintState((prev) => (prev ? { ...prev, generatingTileIdx: idx, error: null } : null))
 
@@ -1150,7 +1075,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
         const prefixCanvas = cloneCanvas(base)
         for (let i = 0; i < idx; i++) {
           const earlier = tilePlan.tiles[i]
-          const earlierUrl = selectedTileResultUrl(selected.tileResults[i])
+          const earlierUrl = selectedTileResultUrl(latestSlots[i])
           if (!earlier || !earlier.maskSubRect || !earlierUrl) {
             continue
           }
@@ -1187,7 +1112,9 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
           versions: versionUrls,
           selectedIdx: 0,
         }
-        const nextSlots = [...selected.tileResults]
+        const liveSlots =
+          inpaintStateRef.current?.variants[variantIdx]?.tileResults ?? latestSlots
+        const nextSlots = [...liveSlots]
         nextSlots[idx] = nextSlot
 
         const stitchedPreviewUrl = await rebuildVariantComposite(
@@ -1197,6 +1124,16 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
           image,
           contextRect,
         )
+
+        const latest = inpaintStateRef.current
+        if (latest) {
+          const variants = [...latest.variants]
+          const current = variants[variantIdx]
+          if (current) {
+            variants[variantIdx] = { ...current, tileResults: nextSlots, stitchedPreviewUrl }
+            inpaintStateRef.current = { ...latest, variants, generatingTileIdx: null }
+          }
+        }
 
         setInpaintState((prev) => {
           if (!prev) {
@@ -1218,7 +1155,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
         )
       }
     },
-    [inpaintState, image, apiKey, model],
+    [image, apiKey, model],
   )
 
   // ── Callback: generate every masked tile that hasn't been generated yet ─────
@@ -1443,6 +1380,11 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     inpaintState?.phase === 'tiling'
 
   const hasSelection = !!drag?.committed || !!inpaintState
+  const selectedMergeUrl = inpaintState
+    ? selectedInpaintVariant(inpaintState)?.stitchedPreviewUrl ?? null
+    : null
+  /** Main image shows the selected merge as soon as a plan exists. */
+  const displayImageUrl = selectedMergeUrl ?? image
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -1464,7 +1406,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
             }}
           >
             <img
-              src={image}
+              src={displayImageUrl}
               alt=""
               className="block h-full w-full object-contain anim-fade"
               draggable={false}
