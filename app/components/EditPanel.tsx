@@ -2,7 +2,16 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { Icons } from '@/app/components/icons'
-import type { InpaintState, ReferenceImage } from '@/app/lib/app'
+import {
+  INPAINT_TILE_VARIANT_COUNT,
+  INPAINT_VARIANT_COUNT,
+  selectedInpaintVariant,
+  selectedTileResultUrl,
+  tileSlotHasResult,
+  type InpaintState,
+  type InpaintTileSlot,
+  type ReferenceImage,
+} from '@/app/lib/app'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -12,15 +21,19 @@ export interface EditPanelProps {
   inpaintState: InpaintState
   onGenerate: (editPrompt: string, referenceImages: ReferenceImage[]) => void
   /**
-   * Re-run the global plan with the given description (cascades to diff-mask
-   * computation + resets tiles). The description can be edited after the
-   * initial generation, so this always reflects the panel's current text.
+   * Re-run ONLY the selected variant's plan with the given description
+   * (new change mask, clears that variant's tiles). Other variants are
+   * left untouched.
    */
   onRerunPlan: (editPrompt: string) => void
   /** Generate or re-generate a single tile. */
   onRerunTile: (tileIdx: number) => void
   /** Sequentially generate every masked tile that has no result yet. */
   onGenerateAllTiles: () => void
+  /** Cycle the visible plan / mask / tile stack (wraps at both ends). */
+  onCycleVariant: (delta: 1 | -1) => void
+  /** Cycle one tile's refine version (buttons only — no keyboard). */
+  onCycleTileVariant: (tileIdx: number, delta: 1 | -1) => void
   onRerun: () => void
   onAccept: () => void
   onClose: () => void
@@ -77,6 +90,61 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 
 function Spinner() {
   return <Icons.Spinner size={14} />
+}
+
+/**
+ * Arrow cycler for the four independent plan variants. Sits above Global
+ * plan and swaps every section below it.
+ */
+function PlanVariantCycler({
+  index,
+  total,
+  disabled,
+  onPrev,
+  onNext,
+}: {
+  index: number
+  total: number
+  disabled: boolean
+  onPrev: () => void
+  onNext: () => void
+}) {
+  return (
+    <div
+      className="inline-flex items-center gap-1 rounded-full border py-0.5 pl-1 pr-2"
+      style={{
+        borderColor: 'var(--border-strong)',
+        background: 'var(--bg-elev)',
+      }}
+      role="group"
+      aria-label="Cycle between plan variants"
+    >
+      <button
+        onClick={onPrev}
+        disabled={disabled}
+        className="icon-btn h-6 w-6"
+        aria-label="Previous variant (←)"
+        title="Previous variant (←)"
+      >
+        <Icons.ArrowLeft size={13} />
+      </button>
+      <span
+        className="font-mono text-[11px] tabular-nums"
+        style={{ color: 'var(--text-secondary)' }}
+      >
+        {`${index + 1} / ${total}`}
+      </span>
+      <button
+        onClick={onNext}
+        disabled={disabled}
+        className="icon-btn h-6 w-6"
+        aria-label="Next variant (→)"
+        title="Next variant (→)"
+      >
+        <Icons.ArrowRight size={13} />
+      </button>
+    </div>
+  )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -147,14 +215,18 @@ function TileGrid({
   generatingTileIdx,
   changeMaskOverlayUrl,
   onRerunTile,
+  onCycleTileVariant,
+  cycleDisabled,
 }: {
   tilePlan: NonNullable<InpaintState['tilePlan']>
-  tileResults: Array<string | null>
+  tileResults: InpaintTileSlot[]
   generatingTileIdx: number | null
   /** Blue-highlight overlay from computeChangeMaskVisuals — used as a pending
    *  tile preview so the user can see where changes fall before generating. */
   changeMaskOverlayUrl: string | null
   onRerunTile: (idx: number) => void
+  onCycleTileVariant: (tileIdx: number, delta: 1 | -1) => void
+  cycleDisabled: boolean
 }) {
   const maskedTiles = tilePlan.tiles
     .map((tile, idx) => ({ tile, idx }))
@@ -172,60 +244,94 @@ function TileGrid({
       <div className="grid gap-1.5" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(80px, 1fr))' }}>
         {maskedTiles.map(({ tile, idx }) => {
           const isGenerating = generatingTileIdx === idx
-          const resultUrl = tileResults[idx]
-          const isDone = resultUrl !== null
+          const slot = tileResults[idx]
+          const resultUrl = selectedTileResultUrl(slot)
+          const isDone = tileSlotHasResult(slot)
+          const versionLabel = slot
+            ? `${slot.selectedIdx + 1} / ${INPAINT_TILE_VARIANT_COUNT}`
+            : `1 / ${INPAINT_TILE_VARIANT_COUNT}`
 
           return (
-            <div
-              key={idx}
-              className="group relative overflow-hidden rounded border"
-              style={{
-                aspectRatio: `${tile.w} / ${tile.h}`,
-                borderColor: isGenerating
-                  ? 'rgba(60,140,255,0.8)'
-                  : isDone
-                    ? 'rgba(40,200,80,0.6)'
-                    : 'var(--border)',
-                background: 'var(--bg-elev)',
-              }}
-            >
-              {isDone && resultUrl ? (
-                <img src={resultUrl} alt={`Tile ${idx + 1}`} className="block h-full w-full object-cover" draggable={false} />
-              ) : changeMaskOverlayUrl && !isGenerating ? (
-                // Pending tile: crop the change-mask overlay to this tile's region
-                // so the user can see where changes will fall before generating.
-                <div
-                  className="h-full w-full"
-                  style={{
-                    backgroundImage: `url(${changeMaskOverlayUrl})`,
-                    backgroundSize: `${(tilePlan.contextW / tile.w) * 100}% ${(tilePlan.contextH / tile.h) * 100}%`,
-                    backgroundPosition: `-${(tile.x / tile.w) * 100}% -${(tile.y / tile.h) * 100}%`,
-                    backgroundRepeat: 'no-repeat',
-                  }}
-                />
-              ) : (
-                <div className="flex h-full w-full items-center justify-center text-[10px]" style={{ color: 'var(--text-muted)' }}>
-                  {isGenerating ? <Spinner /> : `${tile.row + 1},${tile.col + 1}`}
-                </div>
-              )}
+            <div key={idx} className="flex flex-col gap-1">
+              <div
+                className="group relative overflow-hidden rounded border"
+                style={{
+                  aspectRatio: `${tile.w} / ${tile.h}`,
+                  borderColor: isGenerating
+                    ? 'rgba(60,140,255,0.8)'
+                    : isDone
+                      ? 'rgba(40,200,80,0.6)'
+                      : 'var(--border)',
+                  background: 'var(--bg-elev)',
+                }}
+              >
+                {isDone && resultUrl ? (
+                  <img src={resultUrl} alt={`Tile ${idx + 1}`} className="block h-full w-full object-cover" draggable={false} />
+                ) : changeMaskOverlayUrl && !isGenerating ? (
+                  <div
+                    className="h-full w-full"
+                    style={{
+                      backgroundImage: `url(${changeMaskOverlayUrl})`,
+                      backgroundSize: `${(tilePlan.contextW / tile.w) * 100}% ${(tilePlan.contextH / tile.h) * 100}%`,
+                      backgroundPosition: `-${(tile.x / tile.w) * 100}% -${(tile.y / tile.h) * 100}%`,
+                      backgroundRepeat: 'no-repeat',
+                    }}
+                  />
+                ) : (
+                  <div className="flex h-full w-full items-center justify-center text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                    {isGenerating ? <Spinner /> : `${tile.row + 1},${tile.col + 1}`}
+                  </div>
+                )}
 
-              {/* Generate (pending tiles, always visible) / Re-run (done tiles,
-                  revealed on hover). Tiles never run automatically. */}
-              {!isGenerating && (
-                <button
-                  className={
-                    isDone
-                      ? 'absolute inset-0 flex items-center justify-center opacity-0 transition-opacity group-hover:opacity-100 disabled:cursor-not-allowed'
-                      : 'absolute inset-0 flex items-center justify-center opacity-100 transition-opacity disabled:cursor-not-allowed disabled:opacity-40'
-                  }
-                  style={{ background: isDone ? 'rgba(0,0,0,0.55)' : 'rgba(0,0,0,0.35)' }}
-                  onClick={() => onRerunTile(idx)}
-                  disabled={anyBusy}
-                  title={isDone ? `Re-run tile ${idx + 1}` : `Generate tile ${idx + 1}`}
-                  aria-label={isDone ? `Re-run tile ${idx + 1}` : `Generate tile ${idx + 1}`}
+                {!isGenerating && (
+                  <button
+                    className={
+                      isDone
+                        ? 'absolute inset-0 flex items-center justify-center opacity-0 transition-opacity group-hover:opacity-100 disabled:cursor-not-allowed'
+                        : 'absolute inset-0 flex items-center justify-center opacity-100 transition-opacity disabled:cursor-not-allowed disabled:opacity-40'
+                    }
+                    style={{ background: isDone ? 'rgba(0,0,0,0.55)' : 'rgba(0,0,0,0.35)' }}
+                    onClick={() => onRerunTile(idx)}
+                    disabled={anyBusy}
+                    title={isDone ? `Re-run tile ${idx + 1} (4 versions)` : `Generate tile ${idx + 1} (4 versions)`}
+                    aria-label={isDone ? `Re-run tile ${idx + 1}` : `Generate tile ${idx + 1}`}
+                  >
+                    <Icons.Play size={14} />
+                  </button>
+                )}
+              </div>
+
+              {isDone && (
+                <div
+                  className="flex items-center justify-center gap-0.5"
+                  role="group"
+                  aria-label={`Tile ${idx + 1} versions`}
                 >
-                  <Icons.Play size={14} />
-                </button>
+                  <button
+                    className="icon-btn h-5 w-5"
+                    disabled={cycleDisabled}
+                    onClick={() => onCycleTileVariant(idx, -1)}
+                    aria-label={`Previous version of tile ${idx + 1}`}
+                    title="Previous tile version"
+                  >
+                    <Icons.ArrowLeft size={11} />
+                  </button>
+                  <span
+                    className="min-w-[2.25rem] text-center font-mono text-[10px] tabular-nums"
+                    style={{ color: 'var(--text-secondary)' }}
+                  >
+                    {versionLabel}
+                  </span>
+                  <button
+                    className="icon-btn h-5 w-5"
+                    disabled={cycleDisabled}
+                    onClick={() => onCycleTileVariant(idx, 1)}
+                    aria-label={`Next version of tile ${idx + 1}`}
+                    title="Next tile version"
+                  >
+                    <Icons.ArrowRight size={11} />
+                  </button>
+                </div>
               )}
             </div>
           )
@@ -246,9 +352,8 @@ function TileGrid({
  *
  *   1. Context preview    (always visible)
  *   2. Description + refs (input phase — locks when Generate is clicked)
- *   3. Global plan result (planning → tiling → done)
- *   4. Tile grid          (tiling → done, full path only)
- *   5. Accept / Re-run   (done)
+ *   3. Variant cycler + global plan / mask / tiles (planning → tiling → done)
+ *   4. Accept / Re-run
  */
 export function EditPanel({
   inpaintState,
@@ -256,6 +361,8 @@ export function EditPanel({
   onRerunPlan,
   onRerunTile,
   onGenerateAllTiles,
+  onCycleVariant,
+  onCycleTileVariant,
   onRerun,
   onAccept,
   onClose,
@@ -263,25 +370,30 @@ export function EditPanel({
   const {
     phase,
     lowResPreviewUrl,
-    globalPlanUrl,
-    changeMaskUrl,
-    changeMaskOverlayUrl,
     tilePlan,
-    tileResults,
+    selectedVariantIdx,
+    planningCompletedCount,
     generatingTileIdx,
     error,
   } = inpaintState
+  const selectedVariant = selectedInpaintVariant(inpaintState)
+  const globalPlanUrl = selectedVariant?.globalPlanUrl ?? null
+  const changeMaskUrl = selectedVariant?.changeMaskUrl ?? null
+  const changeMaskOverlayUrl = selectedVariant?.changeMaskOverlayUrl ?? null
+  const tileResults = selectedVariant?.tileResults ?? []
+  const stitchedPreviewUrl = selectedVariant?.stitchedPreviewUrl ?? null
 
   // ── Local form state ──────────────────────────────────────────────────────
   // Initialise from the state so that re-run resets to the previous values.
   const [editPrompt, setEditPrompt] = useState(inpaintState.editPrompt)
   const [referenceImages, setReferenceImages] = useState<ReferenceImage[]>(inpaintState.referenceImages)
 
-  // ── Auto-scroll to bottom when the phase advances or a plan arrives ───────
+  // Auto-scroll only when the pipeline stage changes — not when cycling
+  // variants, which swaps plan/mask URLs but should leave scroll in place.
   const bodyRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     bodyRef.current?.scrollTo({ top: bodyRef.current.scrollHeight, behavior: 'smooth' })
-  }, [phase, globalPlanUrl, changeMaskUrl, tilePlan])
+  }, [phase, tilePlan])
 
   // Phase-derived booleans for progressive disclosure.
   // 'tiling' is an IDLE phase — plan + diff-mask are done, user runs tiles manually.
@@ -293,7 +405,7 @@ export function EditPanel({
   const isStageBusy  = phase === 'planning'
   const isProcessing = isStageBusy || isGenerating
 
-  const doneCount   = tileResults.filter((r) => r !== null).length
+  const doneCount   = tileResults.filter((slot) => tileSlotHasResult(slot)).length
   const totalMasked = tilePlan?.tiles.filter((t) => t.maskSubRect !== null).length ?? 0
   const allTilesDone = totalMasked > 0 && doneCount === totalMasked
   // Fast path: phase reaches 'done' with tilePlan null — plan composited directly.
@@ -305,7 +417,7 @@ export function EditPanel({
     <div className="flex min-h-0 flex-1 flex-col">
 
       {/* ── Scrollable body ───────────────────────────────────────────────── */}
-      <div ref={bodyRef} className="flex flex-1 flex-col overflow-y-auto">
+      <div ref={bodyRef} className="flex min-h-0 flex-1 flex-col overflow-y-auto">
 
         {/* ── Section 1: Context preview ─────────────────────────────────── */}
         <div className="flex flex-col gap-3 p-4">
@@ -361,7 +473,7 @@ export function EditPanel({
               className="btn btn-ghost w-full"
               disabled={isProcessing || !editPrompt.trim()}
               onClick={() => onRerunPlan(editPrompt)}
-              title="Re-generate the global plan with this description (also re-runs the change mask and clears tiles)"
+              title="Re-generate only this variant's plan with this description (clears this variant's tiles)"
             >
               <Icons.Refresh size={13} />
               Re-run plan with this description
@@ -369,10 +481,19 @@ export function EditPanel({
           )}
         </div>
 
-        {/* ── Section 3: Global plan ─────────────────────────────────────── */}
+        {/* ── Section 3: Variant cycler + global plan ───────────────────── */}
         {showPlan && (
           <>
             <SectionDivider />
+            <div className="flex items-center justify-center px-4 pt-4">
+              <PlanVariantCycler
+                index={selectedVariantIdx}
+                total={INPAINT_VARIANT_COUNT}
+                disabled={isProcessing || !planReady}
+                onPrev={() => onCycleVariant(-1)}
+                onNext={() => onCycleVariant(1)}
+              />
+            </div>
             <div className="flex flex-col gap-3 p-4">
               <div className="flex items-center justify-between">
                 <SectionLabel>Global plan</SectionLabel>
@@ -382,7 +503,7 @@ export function EditPanel({
                     style={{ padding: '2px 8px', height: 24 }}
                     onClick={() => onRerunPlan(editPrompt)}
                     disabled={isProcessing || !editPrompt.trim()}
-                    title="Re-generate the global plan with the current description (also re-runs the change mask)"
+                    title="Re-generate only this variant's plan (clears this variant's tiles)"
                   >
                     <Icons.Refresh size={11} />
                     Re-run
@@ -393,7 +514,11 @@ export function EditPanel({
               {phase === 'planning' && !globalPlanUrl ? (
                 <div className="flex items-center gap-2 text-[12px]" style={{ color: 'var(--text-muted)' }}>
                   <Spinner />
-                  <span>Generating global plan…</span>
+                  <span>
+                    {inpaintState.variants.some((variant) => variant.globalPlanUrl !== null)
+                      ? 'Generating this global plan…'
+                      : `Generating global plans ${planningCompletedCount}/${INPAINT_VARIANT_COUNT}…`}
+                  </span>
                 </div>
               ) : globalPlanUrl ? (
                 <ImagePreview src={globalPlanUrl} alt="Global plan" />
@@ -426,7 +551,7 @@ export function EditPanel({
               {isGenerating ? (
                 <div className="flex items-center gap-2 text-[12px]" style={{ color: 'var(--text-muted)' }}>
                   <Spinner />
-                  <span>{`Generating tile ${(generatingTileIdx ?? 0) + 1}…`}</span>
+                  <span>{`Generating 4 versions of tile ${(generatingTileIdx ?? 0) + 1}…`}</span>
                 </div>
               ) : (
                 <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
@@ -449,7 +574,16 @@ export function EditPanel({
                 generatingTileIdx={generatingTileIdx}
                 changeMaskOverlayUrl={changeMaskOverlayUrl}
                 onRerunTile={onRerunTile}
+                onCycleTileVariant={onCycleTileVariant}
+                cycleDisabled={isProcessing}
               />
+
+              {stitchedPreviewUrl && (
+                <div className="flex flex-col gap-2">
+                  <SectionLabel>Stitched preview</SectionLabel>
+                  <ImagePreview src={stitchedPreviewUrl} alt="Stitched inpaint preview" />
+                </div>
+              )}
             </div>
           </>
         )}

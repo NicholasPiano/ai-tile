@@ -6333,11 +6333,21 @@ export function cropInpaintTileInput(
 }
 
 /**
- * Composite a tile result into the running inpaint canvas with feathered blending,
- * then re-stamp the original source pixels over every non-masked pixel in the tile.
- *
- * The second step guarantees that the context ring is pixel-perfect from the
- * original image regardless of what the model produced there.
+ * Force every pixel in an ImageData block to alpha 255 so a later
+ * source-over stamp cannot blend with whatever is already on the destination.
+ */
+function forceImageDataOpaque(imageData: ImageData): void {
+  const pixels = imageData.data
+  for (let i = 3; i < pixels.length; i += 4) {
+    pixels[i] = 255
+  }
+}
+
+/**
+ * Composite a tile result into the running inpaint canvas as a straight
+ * overwrite of the selection intersection (`maskSubRect`). The context ring
+ * stays original; the edited pixels are the model's RGB at full opacity —
+ * no source-underlay, no feather, so the original cannot ghost through.
  */
 export async function compositeInpaintTileResult(
   inpaintCanvas: HTMLCanvasElement,
@@ -6346,13 +6356,8 @@ export async function compositeInpaintTileResult(
   tileSpec: InpaintTileSpec,
   contextRect: { x: number; y: number; w: number; h: number },
 ): Promise<void> {
-  const { x: tX, y: tY, w: tW, h: tH, featherOverlap, maskSubRect } = tileSpec
+  const { x: tX, y: tY, w: tW, h: tH, maskSubRect } = tileSpec
 
-  // Build the feather mask for this tile.
-  const feather: TileFeatherOverlap = featherOverlap
-  const featherMask = buildTileFeatherMask(tW, tH, feather)
-
-  // Load the AI result and the source image in parallel.
   const [tileResultImg, sourceImg] = await Promise.all([
     loadImageElement(tileResultUrl),
     loadImageElement(sourceImageUrl),
@@ -6364,21 +6369,29 @@ export async function compositeInpaintTileResult(
   const tileCtx = tileCanvas.getContext('2d')
 
   if (tileCtx) {
-    // Step A: fill the tile canvas with the original source pixels.
-    // This guarantees a fully-opaque base.  Any transparent pixel in the AI
-    // result will therefore fall back to the source rather than punching a
-    // transparent hole through the inpaint canvas.
+    // Context ring: keep the original source pixels outside the selection.
     tileCtx.drawImage(sourceImg, contextRect.x + tX, contextRect.y + tY, tW, tH, 0, 0, tW, tH)
 
-    // Step B: draw the AI result on top (source-over).  Where the model produced
-    // fully-opaque pixels the AI content wins; where it produced transparent/
-    // semi-transparent pixels the source shows through.
-    tileCtx.drawImage(tileResultImg, 0, 0, tW, tH)
+    if (maskSubRect) {
+      const msX = Math.max(0, Math.floor(maskSubRect.x))
+      const msY = Math.max(0, Math.floor(maskSubRect.y))
+      const msW = Math.max(1, Math.min(tW - msX, Math.ceil(maskSubRect.w)))
+      const msH = Math.max(1, Math.min(tH - msY, Math.ceil(maskSubRect.h)))
 
-    // Step C: apply the feather mask so that overlapping tile edges blend smoothly.
-    tileCtx.globalCompositeOperation = 'destination-in'
-    tileCtx.drawImage(featherMask, 0, 0)
-    tileCtx.globalCompositeOperation = 'source-over'
+      // Draw the AI tile into a scratch canvas, then replace the selection
+      // intersection with those RGB values at alpha 255 — never source-over
+      // onto the original, which left ghosts where the model was translucent.
+      const scratch = document.createElement('canvas')
+      scratch.width = tW
+      scratch.height = tH
+      const scratchCtx = scratch.getContext('2d')
+      if (scratchCtx) {
+        scratchCtx.drawImage(tileResultImg, 0, 0, tW, tH)
+        const opaqueEdit = scratchCtx.getImageData(msX, msY, msW, msH)
+        forceImageDataOpaque(opaqueEdit)
+        tileCtx.putImageData(opaqueEdit, msX, msY)
+      }
+    }
 
     console.log(
       '[imageProcessor] tileResult natural dimensions:',
@@ -6387,32 +6400,22 @@ export async function compositeInpaintTileResult(
     )
   }
 
-  // Draw the feather-blended tile into the running inpaint canvas.
   const bandCtx = inpaintCanvas.getContext('2d')
   if (!bandCtx) {
     console.warn('[imageProcessor] compositeInpaintTileResult: could not get 2d context for inpaintCanvas')
     return
   }
 
-  // `generateTile` never calls this for a pure-context tile (no selection
-  // overlap at all), but guard anyway — nothing to composite in that case.
-  if (!maskSubRect) return
+  if (!maskSubRect) {
+    return
+  }
 
-  // Composite the WHOLE feathered tile onto the band, not just the
-  // selection sub-rect. Earlier versions clipped strictly to `maskSubRect`
-  // to guarantee the context ring stayed byte-for-byte original — but that
-  // also discarded any legitimate bleed the model produced just outside the
-  // selection (e.g. a shadow or highlight blending into the context band).
-  // The tile canvas built above already carries the discipline that matters:
-  // source-filled base (step A) means any pixel the model left untouched or
-  // returned transparent falls back to crisp source automatically, so a
-  // full-tile stamp only changes pixels the model actually touched.
   bandCtx.drawImage(tileCanvas, 0, 0, tW, tH, tX, tY, tW, tH)
 
   // ── Diagnostic: trace the edit through each stage at the selection centre ──
   //   src        = original source pixel
   //   result     = raw model output (fresh draw, no compositing)
-  //   tileCanvas = AI tile after source-base + result + feather (pre-band)
+  //   tileCanvas = AI tile after opaque selection overwrite (pre-band)
   //   band       = pixel actually written into the running canvas
   // Interpretation:
   //   tileCanvas ≈ src               → the feather step wiped the edit.
@@ -6583,8 +6586,8 @@ export async function buildMaskOverlay(
 
 /**
  * Stamp the completed inpaint canvas back into the full source image at
- * `contextRect`, returning the composited result as a data URL.
- * Called by EditStudio when the user accepts an edit.
+ * `contextRect` as a straight overwrite (model RGB at alpha 255). Called
+ * by EditStudio for Accept and the stitched preview.
  */
 export async function compositeInpaintFinal(
   sourceImageUrl: string,
@@ -6596,8 +6599,27 @@ export async function compositeInpaintFinal(
   canvas.width = img.naturalWidth
   canvas.height = img.naturalHeight
   const ctx = canvas.getContext('2d')
-  if (!ctx) return sourceImageUrl
+  if (!ctx) {
+    return sourceImageUrl
+  }
   ctx.drawImage(img, 0, 0)
-  ctx.drawImage(inpaintCanvas, contextRect.x, contextRect.y)
+
+  const destX = Math.max(0, Math.floor(contextRect.x))
+  const destY = Math.max(0, Math.floor(contextRect.y))
+  const destW = inpaintCanvas.width
+  const destH = inpaintCanvas.height
+
+  const stamp = document.createElement('canvas')
+  stamp.width = destW
+  stamp.height = destH
+  const stampCtx = stamp.getContext('2d')
+  if (!stampCtx) {
+    ctx.drawImage(inpaintCanvas, contextRect.x, contextRect.y)
+    return canvas.toDataURL('image/png')
+  }
+  stampCtx.drawImage(inpaintCanvas, 0, 0)
+  const opaqueStamp = stampCtx.getImageData(0, 0, destW, destH)
+  forceImageDataOpaque(opaqueStamp)
+  ctx.putImageData(opaqueStamp, destX, destY)
   return canvas.toDataURL('image/png')
 }

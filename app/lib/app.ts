@@ -262,6 +262,147 @@ export interface InpaintTilePlan {
   contextH: number
 }
 
+/** How many independent plan variants Generate produces. */
+export const INPAINT_VARIANT_COUNT = 4
+
+/** How many refine versions each tile produces with the same settings. */
+export const INPAINT_TILE_VARIANT_COUNT = 4
+
+/**
+ * Four refine results for one tile, plus which version is stamped into the
+ * running composite / stitched preview.
+ */
+export interface InpaintTileSlot {
+  versions: Array<string | null>
+  selectedIdx: number
+}
+
+/**
+ * Empty per-tile slot used before that tile has been generated.
+ */
+export function createEmptyInpaintTileSlot(): InpaintTileSlot {
+  return {
+    versions: Array.from({ length: INPAINT_TILE_VARIANT_COUNT }, () => null),
+    selectedIdx: 0,
+  }
+}
+
+/**
+ * One empty slot per tile in the shared grid.
+ */
+export function createEmptyInpaintTileSlots(tileCount: number): InpaintTileSlot[] {
+  return Array.from({ length: tileCount }, () => createEmptyInpaintTileSlot())
+}
+
+/**
+ * The refine URL currently selected for a tile slot, or null if none yet.
+ */
+export function selectedTileResultUrl(slot: InpaintTileSlot | undefined): string | null {
+  if (!slot) {
+    return null
+  }
+  const url = slot.versions[slot.selectedIdx]
+  if (typeof url !== 'string' || url.length === 0) {
+    return null
+  }
+  return url
+}
+
+/**
+ * True when this tile has at least one refine result to show / cycle.
+ */
+export function tileSlotHasResult(slot: InpaintTileSlot | undefined): boolean {
+  if (!slot) {
+    return false
+  }
+  return slot.versions.some((url) => typeof url === 'string' && url.length > 0)
+}
+
+/**
+ * Next filled version index in the given direction, wrapping. Returns the
+ * current index when the slot has no results.
+ */
+export function nextFilledTileVersionIdx(slot: InpaintTileSlot, delta: 1 | -1): number {
+  const n = slot.versions.length
+  if (n === 0) {
+    return slot.selectedIdx
+  }
+  let idx = slot.selectedIdx
+  for (let step = 0; step < n; step++) {
+    idx = (idx + delta + n) % n
+    const url = slot.versions[idx]
+    if (typeof url === 'string' && url.length > 0) {
+      return idx
+    }
+  }
+  return slot.selectedIdx
+}
+
+/**
+ * One complete post-plan stack: global plan, change mask, and that option's
+ * tile results. Generate produces {@link INPAINT_VARIANT_COUNT} of these with
+ * the same settings; the sidebar cycler swaps which one is shown.
+ */
+export interface InpaintVariant {
+  /**
+   * Scale factor from context-perimeter pixels to global-plan image pixels.
+   * Computed by buildGlobalPlanInput and used by buildGlobalInpaintComposite.
+   */
+  globalPlanScale: number
+  /** LLM global plan result URL (low-res, from the 'plan' API call). */
+  globalPlanUrl: string | null
+  /**
+   * B&W visualisation of the client-side pixel diff (white = changed, black =
+   * unchanged). Display only — never sent to the API.
+   */
+  changeMaskUrl: string | null
+  /**
+   * Global plan composited with a light-blue highlight over changed regions.
+   * Display only — never sent to the API.
+   */
+  changeMaskOverlayUrl: string | null
+  /** Per-tile refine slots (four versions each) for this plan variant. */
+  tileResults: InpaintTileSlot[]
+  /**
+   * Full-image composite of this variant's running inpaint canvas stamped
+   * into the source. Null until at least one tile has been generated.
+   */
+  stitchedPreviewUrl: string | null
+}
+
+/**
+ * Empty variant slot used before Generate finishes and when resetting.
+ */
+export function createEmptyInpaintVariant(): InpaintVariant {
+  return {
+    globalPlanScale: 1,
+    globalPlanUrl: null,
+    changeMaskUrl: null,
+    changeMaskOverlayUrl: null,
+    tileResults: [],
+    stitchedPreviewUrl: null,
+  }
+}
+
+/**
+ * Four empty variant slots — the starting set for a new inpaint session.
+ */
+export function createEmptyInpaintVariants(): InpaintVariant[] {
+  return Array.from({ length: INPAINT_VARIANT_COUNT }, () => createEmptyInpaintVariant())
+}
+
+/**
+ * The variant the sidebar and overlay currently display, or null if the
+ * selected index is out of range.
+ */
+export function selectedInpaintVariant(state: InpaintState): InpaintVariant | null {
+  const variant = state.variants[state.selectedVariantIdx]
+  if (!variant) {
+    return null
+  }
+  return variant
+}
+
 /**
  * Full phase-machine state for an active inpaint session managed by EditStudio.
  * EditPanel receives this as a prop and renders accordingly.
@@ -282,27 +423,19 @@ export interface InpaintState {
    */
   lowResPreviewUrl: string | null
   /**
-   * Scale factor from context-perimeter pixels to global-plan image pixels.
-   * Computed by buildGlobalPlanInput and used by buildGlobalInpaintComposite
-   * to size the adaptive blur applied when upscaling the plan into the shared
-   * tile composite.
+   * Shared tile-grid geometry for every variant. Null on the fast path
+   * (context fits in one tile) and before the first plan finishes.
    */
-  globalPlanScale: number
-  /** LLM global plan result URL (low-res, from the 'plan' API call). */
-  globalPlanUrl: string | null
-  /**
-   * B&W visualisation of the client-side pixel diff (white = changed, black =
-   * unchanged). Display only — never sent to the API.
-   */
-  changeMaskUrl: string | null
-  /**
-   * Global plan composited with a light-blue highlight over changed regions.
-   * Display only — never sent to the API.
-   */
-  changeMaskOverlayUrl: string | null
   tilePlan: InpaintTilePlan | null
-  /** Per-tile AI result URLs (null = not yet generated). */
-  tileResults: Array<string | null>
+  /** Independent plan / mask / tile stacks produced by Generate. */
+  variants: InpaintVariant[]
+  /** Which variant the sidebar, overlay, and Accept currently show. */
+  selectedVariantIdx: number
+  /**
+   * How many of the parallel plan calls have finished. Used for
+   * "Generating global plans 2/4…" while phase is still `planning`.
+   */
+  planningCompletedCount: number
   /** Index of the tile currently being processed. Null when idle. */
   generatingTileIdx: number | null
   error: string | null

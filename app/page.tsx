@@ -5288,7 +5288,13 @@ export default function Home() {
     (hasAnchorLayer || !!sceneBrief.trim() || sceneBriefLoading)
 
   return (
-    <main className="relative flex min-h-screen flex-col">
+    <main
+      className={
+        isEdit
+          ? 'relative flex h-screen flex-col overflow-hidden'
+          : 'relative flex min-h-screen flex-col'
+      }
+    >
       <TopBar
         hasImage={
           isParallax
@@ -5411,23 +5417,25 @@ export default function Home() {
           onDropFile={handleFile}
         />
       ) : isEdit ? (
-        <EditStudio
-          image={selectedImage}
-          dimensions={currentImageDimensions}
-          onPickFile={() => fileInputRef.current?.click()}
-          onDropFile={handleFile}
-          apiKey={apiKey}
-          model={selectedModel}
-          onAccept={(newImageUrl) => {
-            console.log('[page] EditStudio onAccept called — setting selectedImage', {
-              urlLength: newImageUrl.length,
-              prefix: newImageUrl.slice(0, 40),
-            })
-            setSelectedImage(newImageUrl)
-            setExtendedCandidates([])
-            // Inpainting preserves image dimensions — no need to reset them.
-          }}
-        />
+        <div className="flex min-h-0 flex-1 overflow-hidden">
+          <EditStudio
+            image={selectedImage}
+            dimensions={currentImageDimensions}
+            onPickFile={() => fileInputRef.current?.click()}
+            onDropFile={handleFile}
+            apiKey={apiKey}
+            model={selectedModel}
+            onAccept={(newImageUrl) => {
+              console.log('[page] EditStudio onAccept called — setting selectedImage', {
+                urlLength: newImageUrl.length,
+                prefix: newImageUrl.slice(0, 40),
+              })
+              setSelectedImage(newImageUrl)
+              setExtendedCandidates([])
+              // Inpainting preserves image dimensions — no need to reset them.
+            }}
+          />
+        </div>
       ) : !displayImage ? (
         <EmptyState
           mode={mode}

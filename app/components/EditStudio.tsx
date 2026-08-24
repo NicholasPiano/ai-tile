@@ -3,11 +3,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   EDIT_STRIP_PX,
+  INPAINT_TILE_VARIANT_COUNT,
+  INPAINT_VARIANT_COUNT,
   MAX_AI_DIMENSION,
+  createEmptyInpaintTileSlots,
+  createEmptyInpaintVariant,
+  createEmptyInpaintVariants,
+  nextFilledTileVersionIdx,
+  selectedInpaintVariant,
+  selectedTileResultUrl,
+  tileSlotHasResult,
   timestampForFilename,
   type InpaintState,
   type InpaintRegion,
   type InpaintTilePlan,
+  type InpaintTileSlot,
+  type InpaintVariant,
   type ReferenceImage,
 } from '@/app/lib/app'
 import { EditPanel } from '@/app/components/EditPanel'
@@ -324,7 +335,9 @@ function renderOverlay(
     (inpaintState.phase === 'tiling' || inpaintState.phase === 'done') &&
     inpaintState.tilePlan
   ) {
-    const { tilePlan, tileResults, generatingTileIdx } = inpaintState
+    const { tilePlan, generatingTileIdx } = inpaintState
+    const selectedVariant = selectedInpaintVariant(inpaintState)
+    const tileSlots = selectedVariant?.tileResults ?? []
     const { contextRect } = inpaintState.region
 
     // ── Change mask: blue-tinted diff overlay at context rect position ────────
@@ -354,7 +367,7 @@ function renderOverlay(
     for (let i = 0; i < tilePlan.tiles.length; i++) {
       const tile = tilePlan.tiles[i]
       const isGenerating = generatingTileIdx === i
-      const isDone       = tileResults[i] !== null
+      const isDone       = tileSlotHasResult(tileSlots[i])
       const hasMask      = tile.maskSubRect !== null
 
       const tileRect: ImageRect = {
@@ -506,9 +519,10 @@ export interface EditStudioProps {
  * selection drawing. Once the user commits a selection the sidebar transitions
  * to the input form. On submit:
  *
- *   1. Generate → buildGlobalPlanInput → /api/edit 'plan'    → globalPlanUrl
- *   2.          → computeChangeMask (client-side pixel diff, no LLM call)
- *   3.          → buildGlobalInpaintComposite: ONE full-resolution canvas —
+ *   1. Generate → buildGlobalPlanInput once, then INPAINT_VARIANT_COUNT
+ *        parallel /api/edit 'plan' calls (same settings) → variants[]
+ *   2.          → computeChangeMask per variant (client-side pixel diff)
+ *   3.          → buildGlobalInpaintComposite per variant: ONE full-resolution canvas —
  *                 crisp source everywhere, softened/feathered plan content
  *                 baked into actually-changed pixels. Not clipped to the
  *                 selection rectangle — the change mask alone decides what
@@ -533,28 +547,23 @@ const SIDEBAR_W = 360
 type EditPhaseResponse = { resultUrl?: string; error?: string }
 
 /**
- * Stage 1 — global plan. Builds the annotated plan input, calls the LLM 'plan'
- * phase, and returns the plan URL plus the context→plan-pixel scale factor.
+ * Stage 1 — global plan. Sends a prebuilt plan canvas to the LLM 'plan'
+ * phase and returns the plan URL plus the context→plan-pixel scale factor.
  */
-async function runGlobalPlanStage(args: {
-  image: string
-  region: InpaintRegion
+async function requestGlobalPlan(args: {
+  dataUrl: string
+  scale: number
   editPrompt: string
   referenceImages: ReferenceImage[]
   apiKey: string
   model: string
 }): Promise<{ globalPlanUrl: string; globalPlanScale: number }> {
-  const { dataUrl, scale } = await buildGlobalPlanInput(
-    args.image,
-    args.region.contextRect,
-    args.region.selectionRect,
-  )
   const res = await fetch('/api/edit', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       phase: 'plan',
-      imageDataUrl: dataUrl,
+      imageDataUrl: args.dataUrl,
       editPrompt: args.editPrompt,
       referenceImages: args.referenceImages,
       apiKey: args.apiKey,
@@ -565,53 +574,96 @@ async function runGlobalPlanStage(args: {
   if (!res.ok || !data.resultUrl) {
     throw new Error(data.error ?? 'Planning failed')
   }
-  return { globalPlanUrl: data.resultUrl, globalPlanScale: scale }
+  return { globalPlanUrl: data.resultUrl, globalPlanScale: args.scale }
 }
 
 /**
- * Stage 2 (removed) — change-mask extraction was replaced by the client-side
- * computeChangeMask pixel diff. This function is no longer called.
- * Kept as a tombstone to document the removal; delete after next cleanup pass.
+ * Finish one variant after its plan URL is known: change mask, preview
+ * visuals, and the full-resolution composite canvas.
  */
+async function buildVariantFromPlan(args: {
+  image: string
+  contextRect: { x: number; y: number; w: number; h: number }
+  lowResContextUrl: string | null
+  globalPlanUrl: string
+  globalPlanScale: number
+  tileCount: number
+}): Promise<{
+  variant: InpaintVariant
+  canvas: HTMLCanvasElement
+  changeMaskCanvas: HTMLCanvasElement | null
+}> {
+  let changeMaskCanvas: HTMLCanvasElement | null = null
+  if (args.lowResContextUrl) {
+    changeMaskCanvas = await computeChangeMask(args.lowResContextUrl, args.globalPlanUrl, 10)
+  }
+
+  let changeMaskUrl: string | null = null
+  let changeMaskOverlayUrl: string | null = null
+  if (changeMaskCanvas) {
+    const visuals = await buildChangeMaskVisuals(changeMaskCanvas, args.globalPlanUrl)
+    changeMaskUrl = visuals.maskUrl
+    changeMaskOverlayUrl = visuals.overlayUrl
+  }
+
+  const canvas = await buildGlobalInpaintComposite(
+    args.image,
+    args.contextRect,
+    args.globalPlanUrl,
+    args.globalPlanScale,
+    changeMaskCanvas,
+  )
+
+  return {
+    variant: {
+      globalPlanScale: args.globalPlanScale,
+      globalPlanUrl: args.globalPlanUrl,
+      changeMaskUrl,
+      changeMaskOverlayUrl,
+      tileResults: createEmptyInpaintTileSlots(args.tileCount),
+      stitchedPreviewUrl: null,
+    },
+    canvas,
+    changeMaskCanvas,
+  }
+}
 
 /**
- * Stage 3 — tiling setup. Builds the shared running composite canvas (crisp
- * source everywhere, softened global-plan content baked into the actually-
- * changed selection pixels — see `buildGlobalInpaintComposite`) and the tile
- * plan. Tiles are NOT generated here; each is run on demand by the user,
- * cropping directly from this canvas.
+ * Pixel-for-pixel copy of a canvas. Used to keep a pre-tile plan composite
+ * so tile-version cycling can rebuild the stitch from a clean base.
  */
-async function buildTilingSetup(
-  image: string,
-  region: InpaintRegion,
-  globalPlanUrl: string,
-  globalPlanScale: number,
-  changeMask: HTMLCanvasElement | null,
-): Promise<{ canvas: HTMLCanvasElement; tilePlan: InpaintTilePlan }> {
-  const canvas = await buildGlobalInpaintComposite(
-    image,
-    region.contextRect,
-    globalPlanUrl,
-    globalPlanScale,
-    changeMask,
-  )
-  const selInCtx = {
-    x: region.selectionRect.x - region.contextRect.x,
-    y: region.selectionRect.y - region.contextRect.y,
-    w: region.selectionRect.w,
-    h: region.selectionRect.h,
+function cloneCanvas(source: HTMLCanvasElement): HTMLCanvasElement {
+  const copy = document.createElement('canvas')
+  copy.width = source.width
+  copy.height = source.height
+  const ctx = copy.getContext('2d')
+  if (ctx) {
+    ctx.drawImage(source, 0, 0)
   }
-  const tilePlan = planInpaintTiles(region.contextRect.w, region.contextRect.h, selInCtx)
-  return { canvas, tilePlan }
+  return copy
 }
 
 export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, model, onAccept }: EditStudioProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const isDraggingRef = useRef(false)
-  /** Running composite surface for the tiled inpaint pass. */
-  const inpaintCanvasRef = useRef<HTMLCanvasElement | null>(null)
-  /** Client-computed pixel-diff change mask (computeChangeMask result). */
-  const changeMaskCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  /**
+   * Per-variant running composite canvases. Generate all tiles / Accept
+   * always read the slot at `selectedVariantIdx`.
+   */
+  const inpaintCanvasByVariantRef = useRef<Array<HTMLCanvasElement | null>>(
+    Array.from({ length: INPAINT_VARIANT_COUNT }, () => null),
+  )
+  /**
+   * Pre-tile plan composite per variant. Tile generate / version cycling
+   * always rebuilds the running canvas from this base plus selected tiles.
+   */
+  const inpaintBaseCanvasByVariantRef = useRef<Array<HTMLCanvasElement | null>>(
+    Array.from({ length: INPAINT_VARIANT_COUNT }, () => null),
+  )
+  /** Per-variant client-computed pixel-diff change masks. */
+  const changeMaskCanvasByVariantRef = useRef<Array<HTMLCanvasElement | null>>(
+    Array.from({ length: INPAINT_VARIANT_COUNT }, () => null),
+  )
 
   const [drag, setDrag] = useState<DragState | null>(null)
   const [inpaintState, setInpaintState] = useState<InpaintState | null>(null)
@@ -639,7 +691,15 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas || !dimensions) return
-    renderOverlay(canvas, dimensions.width, dimensions.height, drag, inpaintState, changeMaskCanvasRef.current)
+    const selectedIdx = inpaintState?.selectedVariantIdx ?? 0
+    renderOverlay(
+      canvas,
+      dimensions.width,
+      dimensions.height,
+      drag,
+      inpaintState,
+      changeMaskCanvasByVariantRef.current[selectedIdx] ?? null,
+    )
   }, [drag, dimensions, inpaintState, layoutTick])
 
   // ── Build low-res context crop + annotated preview when selection commits ────
@@ -772,12 +832,10 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       referenceImages: [],
       lowResContextUrl: null,
       lowResPreviewUrl: null,
-      globalPlanScale: 1,
-      globalPlanUrl: null,
-      changeMaskUrl: null,
-      changeMaskOverlayUrl: null,
       tilePlan: null,
-      tileResults: [],
+      variants: createEmptyInpaintVariants(),
+      selectedVariantIdx: 0,
+      planningCompletedCount: 0,
       generatingTileIdx: null,
       error: null,
     })
@@ -786,105 +844,140 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   // ── Callback: user submits description — kick off the full pipeline ─────────
 
   /**
-   * Run the global plan, then — if the context fits within MAX_AI_DIMENSION —
-   * composite the plan directly and jump to 'done' (fast path). Otherwise
-   * compute the change mask client-side via pixel diff and set up tiling.
-   * No LLM mask-extraction call is made in either path.
+   * Drop every variant's composite and change-mask canvases. Called before
+   * Generate / Re-run plan so stale slots cannot be accepted after a failure.
+   */
+  const clearVariantCanvases = () => {
+    inpaintCanvasByVariantRef.current = Array.from({ length: INPAINT_VARIANT_COUNT }, () => null)
+    inpaintBaseCanvasByVariantRef.current = Array.from({ length: INPAINT_VARIANT_COUNT }, () => null)
+    changeMaskCanvasByVariantRef.current = Array.from({ length: INPAINT_VARIANT_COUNT }, () => null)
+  }
+
+  /**
+   * Rebuild a plan variant's running canvas from its pre-tile base, then
+   * stamp every tile's currently selected refine version in scan order.
+   * Returns a full-image stitched preview URL, or null if the base is missing.
+   */
+  const rebuildVariantComposite = async (
+    variantIdx: number,
+    tileSlots: InpaintTileSlot[],
+    tilePlan: InpaintTilePlan,
+    sourceImage: string,
+    contextRect: { x: number; y: number; w: number; h: number },
+  ): Promise<string | null> => {
+    const base = inpaintBaseCanvasByVariantRef.current[variantIdx]
+    if (!base) {
+      return null
+    }
+    const working = cloneCanvas(base)
+    for (let i = 0; i < tilePlan.tiles.length; i++) {
+      const tile = tilePlan.tiles[i]
+      const resultUrl = selectedTileResultUrl(tileSlots[i])
+      if (!tile || !tile.maskSubRect || !resultUrl) {
+        continue
+      }
+      await compositeInpaintTileResult(working, sourceImage, resultUrl, tile, contextRect)
+    }
+    inpaintCanvasByVariantRef.current[variantIdx] = working
+    return compositeInpaintFinal(sourceImage, working, contextRect)
+  }
+
+  /**
+   * Run INPAINT_VARIANT_COUNT plan calls with the same prompt and input
+   * canvas, then build a change mask + composite per result. Fast path
+   * (context ≤ MAX_AI_DIMENSION) jumps to 'done'; otherwise tiles stay
+   * idle for the selected variant. No LLM mask-extraction call is made.
    */
   const runPlanAndMask = useCallback(
     async (editPrompt: string, referenceImages: ReferenceImage[], region: InpaintRegion, lowResContextUrl: string | null) => {
       try {
-        const { globalPlanUrl, globalPlanScale } = await runGlobalPlanStage({
-          image: image ?? '',
-          region,
-          editPrompt,
-          referenceImages,
-          apiKey,
-          model,
-        })
-        setInpaintState((prev) =>
-          prev ? { ...prev, globalPlanUrl, globalPlanScale, phase: 'tiling' } : null,
-        )
+        if (!image) {
+          throw new Error('Source image is missing')
+        }
 
         const { contextRect } = region
-
-        // Change mask — client-side pixel diff between the original low-res
-        // context and the plan result. Threshold 10 absorbs JPEG compression
-        // noise in the plan without masking real edits. Computed for both the
-        // fast and full paths now, since both rely on it (via
-        // buildGlobalInpaintComposite) to decide which pixels show plan
-        // content — there is no selection-rectangle clip anywhere in this
-        // pipeline; the mask alone is the authority.
-        if (lowResContextUrl) {
-          changeMaskCanvasRef.current = await computeChangeMask(lowResContextUrl, globalPlanUrl, 10)
-        } else {
-          changeMaskCanvasRef.current = null
-        }
-
-        // Build display-only visualisations of the mask (B&W + blue overlay)
-        // and store them in state so the sidebar and canvas overlay can render them.
-        let changeMaskUrl: string | null = null
-        let changeMaskOverlayUrl: string | null = null
-        if (changeMaskCanvasRef.current) {
-          const visuals = await buildChangeMaskVisuals(changeMaskCanvasRef.current, globalPlanUrl)
-          changeMaskUrl = visuals.maskUrl
-          changeMaskOverlayUrl = visuals.overlayUrl
-        }
-
-        // Fast path — context fits in a single tile, so there's no refine
-        // pass: the mask-blended composite below IS the final result.
-        if (contextRect.w <= MAX_AI_DIMENSION && contextRect.h <= MAX_AI_DIMENSION) {
-          const canvas = await buildGlobalInpaintComposite(
-            image ?? '',
-            contextRect,
-            globalPlanUrl,
-            globalPlanScale,
-            changeMaskCanvasRef.current,
-          )
-          inpaintCanvasRef.current = canvas
-          setInpaintState((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  changeMaskUrl,
-                  changeMaskOverlayUrl,
-                  phase: 'done',
-                  tilePlan: null,
-                  tileResults: [],
-                  generatingTileIdx: null,
-                }
-              : null,
-          )
-          return
-        }
-
-        // Full path — set up tiles over the same mask-blended composite.
-        const { canvas, tilePlan } = await buildTilingSetup(
-          image ?? '',
-          region,
-          globalPlanUrl,
-          globalPlanScale,
-          changeMaskCanvasRef.current,
+        const { dataUrl, scale } = await buildGlobalPlanInput(
+          image,
+          contextRect,
+          region.selectionRect,
         )
-        inpaintCanvasRef.current = canvas
+
+        const isFastPath =
+          contextRect.w <= MAX_AI_DIMENSION && contextRect.h <= MAX_AI_DIMENSION
+        const selInCtx = {
+          x: region.selectionRect.x - contextRect.x,
+          y: region.selectionRect.y - contextRect.y,
+          w: region.selectionRect.w,
+          h: region.selectionRect.h,
+        }
+        const tilePlan = isFastPath
+          ? null
+          : planInpaintTiles(contextRect.w, contextRect.h, selInCtx)
+        const tileCount = tilePlan?.tiles.length ?? 0
+
+        const planResults = await Promise.all(
+          Array.from({ length: INPAINT_VARIANT_COUNT }, async () => {
+            const result = await requestGlobalPlan({
+              dataUrl,
+              scale,
+              editPrompt,
+              referenceImages,
+              apiKey,
+              model,
+            })
+            setInpaintState((prev) =>
+              prev
+                ? { ...prev, planningCompletedCount: prev.planningCompletedCount + 1 }
+                : null,
+            )
+            return result
+          }),
+        )
+
+        const built = await Promise.all(
+          planResults.map((plan) =>
+            buildVariantFromPlan({
+              image,
+              contextRect,
+              lowResContextUrl,
+              globalPlanUrl: plan.globalPlanUrl,
+              globalPlanScale: plan.globalPlanScale,
+              tileCount,
+            }),
+          ),
+        )
+
+        inpaintCanvasByVariantRef.current = built.map((item) => item.canvas)
+        inpaintBaseCanvasByVariantRef.current = built.map((item) => cloneCanvas(item.canvas))
+        changeMaskCanvasByVariantRef.current = built.map((item) => item.changeMaskCanvas)
 
         setInpaintState((prev) =>
           prev
             ? {
                 ...prev,
-                changeMaskUrl,
-                changeMaskOverlayUrl,
-                phase: 'tiling',
+                variants: built.map((item) => item.variant),
+                selectedVariantIdx: 0,
+                planningCompletedCount: INPAINT_VARIANT_COUNT,
+                phase: isFastPath ? 'done' : 'tiling',
                 tilePlan,
-                tileResults: Array<string | null>(tilePlan.tiles.length).fill(null),
                 generatingTileIdx: null,
               }
             : null,
         )
       } catch (e) {
+        clearVariantCanvases()
         setInpaintState((prev) =>
           prev
-            ? { ...prev, phase: 'input', error: e instanceof Error ? e.message : 'Generation failed', generatingTileIdx: null }
+            ? {
+                ...prev,
+                phase: 'input',
+                error: e instanceof Error ? e.message : 'Generation failed',
+                generatingTileIdx: null,
+                planningCompletedCount: 0,
+                variants: createEmptyInpaintVariants(),
+                selectedVariantIdx: 0,
+                tilePlan: null,
+              }
             : null,
         )
       }
@@ -899,9 +992,22 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       if (!inpaintState || !image) return
       const { region, lowResContextUrl } = inpaintState
 
-      inpaintCanvasRef.current = null
+      clearVariantCanvases()
       setInpaintState((prev) =>
-        prev ? { ...prev, phase: 'planning', editPrompt, referenceImages, error: null } : null,
+        prev
+          ? {
+              ...prev,
+              phase: 'planning',
+              editPrompt,
+              referenceImages,
+              error: null,
+              variants: createEmptyInpaintVariants(),
+              selectedVariantIdx: 0,
+              planningCompletedCount: 0,
+              tilePlan: null,
+              generatingTileIdx: null,
+            }
+          : null,
       )
 
       await runPlanAndMask(editPrompt, referenceImages, region, lowResContextUrl)
@@ -909,37 +1015,107 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     [inpaintState, image, runPlanAndMask],
   )
 
-  // ── Callback: re-run the global plan (cascades to tiling, resets tiles) ─────
-  // The description can be edited in the sidebar after the initial generation,
-  // so this always re-runs with whatever text is currently in the panel
-  // (falling back to the last-submitted description if it was cleared).
-
+  /**
+   * Re-run ONLY the currently selected variant's plan. Other variants keep
+   * their plan, mask, canvas, and tiles. This variant's tiles are cleared
+   * because they were based on the old plan.
+   */
   const handleRerunPlan = useCallback(async (editPrompt: string) => {
-    if (!inpaintState || !image) return
-    const { region, referenceImages, lowResContextUrl } = inpaintState
+    if (!inpaintState || !image) {
+      return
+    }
+    const variantIdx = inpaintState.selectedVariantIdx
+    const previousVariant = inpaintState.variants[variantIdx]
+    const previousCanvas = inpaintCanvasByVariantRef.current[variantIdx] ?? null
+    const previousBase = inpaintBaseCanvasByVariantRef.current[variantIdx] ?? null
+    const previousMask = changeMaskCanvasByVariantRef.current[variantIdx] ?? null
+    if (!previousVariant) {
+      return
+    }
+
+    const { region, referenceImages, lowResContextUrl, tilePlan } = inpaintState
     const nextEditPrompt = editPrompt.trim() || inpaintState.editPrompt
+    const { contextRect } = region
+    const tileCount = tilePlan?.tiles.length ?? 0
 
-    inpaintCanvasRef.current = null
-    changeMaskCanvasRef.current = null
-    setInpaintState((prev) =>
-      prev
-        ? {
-            ...prev,
-            phase: 'planning',
-            editPrompt: nextEditPrompt,
-            error: null,
-            globalPlanUrl: null,
-            changeMaskUrl: null,
-            changeMaskOverlayUrl: null,
-            tilePlan: null,
-            tileResults: [],
-            generatingTileIdx: null,
-          }
-        : null,
-    )
+    inpaintCanvasByVariantRef.current[variantIdx] = null
+    inpaintBaseCanvasByVariantRef.current[variantIdx] = null
+    changeMaskCanvasByVariantRef.current[variantIdx] = null
+    setInpaintState((prev) => {
+      if (!prev) {
+        return null
+      }
+      const variants = [...prev.variants]
+      variants[variantIdx] = createEmptyInpaintVariant()
+      return {
+        ...prev,
+        phase: 'planning',
+        editPrompt: nextEditPrompt,
+        error: null,
+        variants,
+        generatingTileIdx: null,
+      }
+    })
 
-    await runPlanAndMask(nextEditPrompt, referenceImages, region, lowResContextUrl)
-  }, [inpaintState, image, runPlanAndMask])
+    try {
+      const { dataUrl, scale } = await buildGlobalPlanInput(
+        image,
+        contextRect,
+        region.selectionRect,
+      )
+      const plan = await requestGlobalPlan({
+        dataUrl,
+        scale,
+        editPrompt: nextEditPrompt,
+        referenceImages,
+        apiKey,
+        model,
+      })
+      const built = await buildVariantFromPlan({
+        image,
+        contextRect,
+        lowResContextUrl,
+        globalPlanUrl: plan.globalPlanUrl,
+        globalPlanScale: plan.globalPlanScale,
+        tileCount,
+      })
+
+      inpaintCanvasByVariantRef.current[variantIdx] = built.canvas
+      inpaintBaseCanvasByVariantRef.current[variantIdx] = cloneCanvas(built.canvas)
+      changeMaskCanvasByVariantRef.current[variantIdx] = built.changeMaskCanvas
+      setInpaintState((prev) => {
+        if (!prev) {
+          return null
+        }
+        const variants = [...prev.variants]
+        variants[variantIdx] = built.variant
+        return {
+          ...prev,
+          variants,
+          phase: prev.tilePlan ? 'tiling' : 'done',
+          generatingTileIdx: null,
+        }
+      })
+    } catch (e) {
+      inpaintCanvasByVariantRef.current[variantIdx] = previousCanvas
+      inpaintBaseCanvasByVariantRef.current[variantIdx] = previousBase
+      changeMaskCanvasByVariantRef.current[variantIdx] = previousMask
+      setInpaintState((prev) => {
+        if (!prev) {
+          return null
+        }
+        const variants = [...prev.variants]
+        variants[variantIdx] = previousVariant
+        return {
+          ...prev,
+          variants,
+          phase: prev.tilePlan ? 'tiling' : 'done',
+          generatingTileIdx: null,
+          error: e instanceof Error ? e.message : 'Plan generation failed',
+        }
+      })
+    }
+  }, [inpaintState, image, apiKey, model])
 
   // ── Callback: generate / re-run a single tile ──────────────────────────────
   // This is the ONLY path that produces tile pixels — tiles never run
@@ -947,52 +1123,92 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
   const generateTile = useCallback(
     async (idx: number) => {
-      const canvas = inpaintCanvasRef.current
-      if (!inpaintState || !image || !inpaintState.tilePlan || !inpaintState.globalPlanUrl || !canvas) return
+      if (!inpaintState || !image || !inpaintState.tilePlan) {
+        return
+      }
+      const variantIdx = inpaintState.selectedVariantIdx
+      const selected = inpaintState.variants[variantIdx]
+      const base = inpaintBaseCanvasByVariantRef.current[variantIdx]
+      if (!selected || !selected.globalPlanUrl || !base) {
+        return
+      }
 
       const tile = inpaintState.tilePlan.tiles[idx]
-      if (!tile.maskSubRect) return
+      if (!tile || !tile.maskSubRect) {
+        return
+      }
 
       const { contextRect } = inpaintState.region
       const { editPrompt } = inpaintState
+      const tilePlan = inpaintState.tilePlan
 
       setInpaintState((prev) => (prev ? { ...prev, generatingTileIdx: idx, error: null } : null))
 
       try {
-        // Plain crop from the shared running canvas — it already contains the
-        // softened global-plan content baked into changed selection pixels,
-        // plus the sharpened output of any already-processed neighbour tiles.
-        // Mirrors the extend pipeline's crop-from-band-canvas approach.
-        const tileInputUrl = cropInpaintTileInput(canvas, tile)
+        // Crop from a prefix rebuild (base + earlier tiles only) so a re-run
+        // of this tile is not conditioned on its own previous version.
+        const prefixCanvas = cloneCanvas(base)
+        for (let i = 0; i < idx; i++) {
+          const earlier = tilePlan.tiles[i]
+          const earlierUrl = selectedTileResultUrl(selected.tileResults[i])
+          if (!earlier || !earlier.maskSubRect || !earlierUrl) {
+            continue
+          }
+          await compositeInpaintTileResult(prefixCanvas, image, earlierUrl, earlier, contextRect)
+        }
+        const tileInputUrl = cropInpaintTileInput(prefixCanvas, tile)
 
-        // Reference images are intentionally omitted here — they steer the
-        // global plan's style/composition, but a tile only needs to sharpen
-        // the blurry plan crop it was given. Re-sending them risks pulling
-        // the tile back toward the global brief instead of local fidelity.
-        const tileRes = await fetch('/api/edit', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            phase: 'refine',
-            imageDataUrl: tileInputUrl,
-            editPrompt,
-            tileIndex: tile.row * tile.totalCols + tile.col + 1,
-            tileCount: tile.totalRows * tile.totalCols,
-            apiKey,
-            model,
+        const requestBody = {
+          phase: 'refine' as const,
+          imageDataUrl: tileInputUrl,
+          editPrompt,
+          tileIndex: tile.row * tile.totalCols + tile.col + 1,
+          tileCount: tile.totalRows * tile.totalCols,
+          apiKey,
+          model,
+        }
+
+        const versionUrls = await Promise.all(
+          Array.from({ length: INPAINT_TILE_VARIANT_COUNT }, async () => {
+            const tileRes = await fetch('/api/edit', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(requestBody),
+            })
+            const tileData = await tileRes.json() as { resultUrl?: string; error?: string }
+            if (!tileRes.ok || !tileData.resultUrl) {
+              throw new Error(tileData.error ?? 'Tile refinement failed')
+            }
+            return tileData.resultUrl
           }),
-        })
-        const tileData = await tileRes.json() as { resultUrl?: string; error?: string }
-        if (!tileRes.ok || !tileData.resultUrl) throw new Error(tileData.error ?? 'Tile refinement failed')
+        )
 
-        await compositeInpaintTileResult(canvas, image, tileData.resultUrl, tile, contextRect)
+        const nextSlot: InpaintTileSlot = {
+          versions: versionUrls,
+          selectedIdx: 0,
+        }
+        const nextSlots = [...selected.tileResults]
+        nextSlots[idx] = nextSlot
 
-        const resultUrl = tileData.resultUrl
+        const stitchedPreviewUrl = await rebuildVariantComposite(
+          variantIdx,
+          nextSlots,
+          tilePlan,
+          image,
+          contextRect,
+        )
+
         setInpaintState((prev) => {
-          if (!prev) return null
-          const tileResults = [...prev.tileResults]
-          tileResults[idx] = resultUrl
-          return { ...prev, tileResults, generatingTileIdx: null }
+          if (!prev) {
+            return null
+          }
+          const variants = [...prev.variants]
+          const current = variants[variantIdx]
+          if (!current) {
+            return { ...prev, generatingTileIdx: null }
+          }
+          variants[variantIdx] = { ...current, tileResults: nextSlots, stitchedPreviewUrl }
+          return { ...prev, variants, generatingTileIdx: null }
         })
       } catch (e) {
         setInpaintState((prev) =>
@@ -1009,10 +1225,13 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
   const handleGenerateAllTiles = useCallback(async () => {
     const plan = inpaintState?.tilePlan
-    if (!plan) return
+    const selected = inpaintState ? selectedInpaintVariant(inpaintState) : null
+    if (!plan || !selected) {
+      return
+    }
     const pending = plan.tiles
       .map((tile, idx) => ({ tile, idx }))
-      .filter(({ tile, idx }) => tile.maskSubRect !== null && (inpaintState?.tileResults[idx] ?? null) === null)
+      .filter(({ tile, idx }) => tile.maskSubRect !== null && !tileSlotHasResult(selected.tileResults[idx]))
       .map(({ idx }) => idx)
 
     for (const idx of pending) {
@@ -1020,21 +1239,79 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     }
   }, [inpaintState, generateTile])
 
+  /**
+   * Cycle one tile's refine version (button-only). Rebuilds the running
+   * canvas and stitched preview from the plan base + every tile's current
+   * selection so the preview always matches the arrows.
+   */
+  const tileCycleLockRef = useRef(false)
+
+  const handleCycleTileVariant = useCallback(async (tileIdx: number, delta: 1 | -1) => {
+    if (!inpaintState || !image || !inpaintState.tilePlan) {
+      return
+    }
+    if (
+      tileCycleLockRef.current ||
+      inpaintState.generatingTileIdx !== null ||
+      inpaintState.phase === 'planning'
+    ) {
+      return
+    }
+    const variantIdx = inpaintState.selectedVariantIdx
+    const current = inpaintState.variants[variantIdx]
+    const slot = current?.tileResults[tileIdx]
+    if (!current || !slot || !tileSlotHasResult(slot)) {
+      return
+    }
+
+    const nextIdx = nextFilledTileVersionIdx(slot, delta)
+    if (nextIdx === slot.selectedIdx) {
+      return
+    }
+
+    const nextSlots = [...current.tileResults]
+    nextSlots[tileIdx] = { ...slot, selectedIdx: nextIdx }
+
+    tileCycleLockRef.current = true
+    try {
+      const stitchedPreviewUrl = await rebuildVariantComposite(
+        variantIdx,
+        nextSlots,
+        inpaintState.tilePlan,
+        image,
+        inpaintState.region.contextRect,
+      )
+
+      setInpaintState((prev) => {
+        if (!prev) {
+          return null
+        }
+        const variants = [...prev.variants]
+        const latest = variants[variantIdx]
+        if (!latest) {
+          return prev
+        }
+        variants[variantIdx] = { ...latest, tileResults: nextSlots, stitchedPreviewUrl }
+        return { ...prev, variants }
+      })
+    } finally {
+      tileCycleLockRef.current = false
+    }
+  }, [inpaintState, image])
+
   // ── Callback: re-run the whole pipeline (back to input phase) ──────────────
 
   const handleRerun = useCallback(() => {
-    inpaintCanvasRef.current = null
-    changeMaskCanvasRef.current = null
+    clearVariantCanvases()
     setInpaintState((prev) =>
       prev
         ? {
             ...prev,
             phase: 'input',
-            globalPlanUrl: null,
-            changeMaskUrl: null,
-            changeMaskOverlayUrl: null,
             tilePlan: null,
-            tileResults: [],
+            variants: createEmptyInpaintVariants(),
+            selectedVariantIdx: 0,
+            planningCompletedCount: 0,
             generatingTileIdx: null,
             error: null,
           }
@@ -1044,8 +1321,27 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
   // ── Callback: accept — stamp inpaint canvas into full image ────────────────
 
+  /**
+   * Cycle the visible variant. Disabled while planning or while a tile is
+   * in flight so we never refine or accept the wrong canvas.
+   */
+  const handleCycleVariant = useCallback((delta: 1 | -1) => {
+    setInpaintState((prev) => {
+      if (!prev || prev.phase === 'planning' || prev.generatingTileIdx !== null) {
+        return prev
+      }
+      const n = prev.variants.length
+      if (n <= 1) {
+        return prev
+      }
+      const next = (prev.selectedVariantIdx + delta + n) % n
+      return { ...prev, selectedVariantIdx: next }
+    })
+  }, [])
+
   const handleAccept = useCallback(async () => {
-    const inpaintCanvas = inpaintCanvasRef.current
+    const variantIdx = inpaintState?.selectedVariantIdx ?? 0
+    const inpaintCanvas = inpaintCanvasByVariantRef.current[variantIdx]
 
     if (!inpaintCanvas) {
       console.warn('[EditStudio] handleAccept: inpaintCanvas is null')
@@ -1095,7 +1391,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       onAccept(newImageUrl)
       setInpaintState(null)
       setDrag(null)
-      inpaintCanvasRef.current = null
+      clearVariantCanvases()
     } catch (e) {
       console.error('[EditStudio] handleAccept error:', e)
       setInpaintState((prev) =>
@@ -1107,11 +1403,34 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   // ── Callback: close panel — clear everything ───────────────────────────────
 
   const handleClose = useCallback(() => {
-    inpaintCanvasRef.current = null
-    changeMaskCanvasRef.current = null
+    clearVariantCanvases()
     setInpaintState(null)
     setDrag(null)
   }, [])
+
+  // Cycle variants with ← → when the description field is not focused.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') {
+        return
+      }
+      const target = e.target
+      if (target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement) {
+        return
+      }
+      if (!inpaintState || inpaintState.phase === 'planning' || inpaintState.generatingTileIdx !== null) {
+        return
+      }
+      const hasPlans = inpaintState.variants.some((variant) => variant.globalPlanUrl !== null)
+      if (!hasPlans) {
+        return
+      }
+      e.preventDefault()
+      handleCycleVariant(e.key === 'ArrowLeft' ? -1 : 1)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [inpaintState, handleCycleVariant])
 
   // ── Empty state ────────────────────────────────────────────────────────────
 
@@ -1126,13 +1445,18 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   const hasSelection = !!drag?.committed || !!inpaintState
 
   return (
-    <div className="flex flex-1 overflow-hidden">
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
 
-      {/* ── Image area ──────────────────────────────────────────────────────── */}
-      <div className="flex flex-1 flex-col items-center justify-center px-6 pb-6 pt-2 min-w-0 min-h-0">
-        <div className="relative anim-fade flex min-h-0 w-full flex-1 flex-col min-w-0">
+      {/*
+        Image frame and sidebar share one flex row so they are the same
+        height. The dimension meta row sits below and does not stretch the panel.
+      */}
+      <div className="flex min-h-0 flex-1 pt-2">
+
+        {/* ── Image frame ─────────────────────────────────────────────────── */}
+        <div className="relative min-h-0 min-w-0 flex-1 px-6">
           <div
-            className="relative min-h-0 w-full flex-1 overflow-hidden checker rounded-[var(--radius-lg)]"
+            className="relative h-full min-h-0 overflow-hidden checker rounded-[var(--radius-lg)] anim-fade"
             style={{
               border: '1px solid var(--border)',
               boxShadow:
@@ -1163,35 +1487,13 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
               }}
             />
           </div>
-
-          {/* Below-image meta row */}
-          <div className="mt-4 flex h-7 items-center gap-3">
-            <div
-              className="rounded-full border px-2.5 py-1 font-mono text-[11px]"
-              style={{
-                borderColor: 'var(--border)',
-                background: 'var(--bg-elev)',
-                color: 'var(--text-secondary)',
-              }}
-            >
-              {dimensions.width} × {dimensions.height}
-            </div>
-            {drag && !drag.committed && (
-              <span className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
-                Release to confirm selection
-              </span>
-            )}
-          </div>
         </div>
-      </div>
 
       {/* ── Sidebar ─────────────────────────────────────────────────────────── */}
       <div
-        className="flex min-h-0 flex-col"
+        className="flex min-h-0 shrink-0 flex-col"
         style={{
           width: SIDEBAR_W,
-          flexShrink: 0,
-          maxHeight: '100vh',
           borderLeft: '1px solid var(--border)',
           background: 'var(--bg)',
         }}
@@ -1242,6 +1544,8 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
             onRerunPlan={(editPrompt) => { void handleRerunPlan(editPrompt) }}
             onRerunTile={(idx) => { void generateTile(idx) }}
             onGenerateAllTiles={() => { void handleGenerateAllTiles() }}
+            onCycleVariant={handleCycleVariant}
+            onCycleTileVariant={(tileIdx, delta) => { void handleCycleTileVariant(tileIdx, delta) }}
             onRerun={handleRerun}
             onAccept={() => { void handleAccept() }}
             onClose={handleClose}
@@ -1271,6 +1575,26 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
               </p>
             </div>
           </div>
+        )}
+      </div>
+      </div>
+
+      {/* Below-image meta row — outside the shared-height row */}
+      <div className="mt-4 mb-6 flex h-7 shrink-0 items-center gap-3 px-6">
+        <div
+          className="rounded-full border px-2.5 py-1 font-mono text-[11px]"
+          style={{
+            borderColor: 'var(--border)',
+            background: 'var(--bg-elev)',
+            color: 'var(--text-secondary)',
+          }}
+        >
+          {dimensions.width} × {dimensions.height}
+        </div>
+        {drag && !drag.committed && (
+          <span className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
+            Release to confirm selection
+          </span>
         )}
       </div>
 
