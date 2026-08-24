@@ -265,6 +265,16 @@ export interface InpaintTilePlan {
 /** How many independent plan variants Generate produces. */
 export const INPAINT_VARIANT_COUNT = 4
 
+/** How many options a region plan or per-tile re-plan produces. */
+export const PLAN_VARIANT_COUNT = 4
+
+/**
+ * Empty option list for one region or tile-plan slot.
+ */
+export function createEmptyPlanVersions(): Array<string | null> {
+  return Array.from({ length: PLAN_VARIANT_COUNT }, () => null)
+}
+
 /** How many refine versions each tile produces with the same settings. */
 export const INPAINT_TILE_VARIANT_COUNT = 4
 

@@ -12,7 +12,7 @@ import { TileStudio } from '@/app/components/TileStudio'
 import { TopBar } from '@/app/components/TopBar'
 import { ResultActions, VariantSelector } from '@/app/components/VariantSelector'
 import { Workspace, TilingState, TileCellDisplay } from '@/app/components/Workspace'
-import { Candidate, Direction, EXTENSION_PERCENT, LlmRequestDebug, MAX_AI_DIMENSION, MAX_PLAN_REGIONS, MAX_TILES_PER_EXTEND, Mode, PLAN_REGION_MAX_SCENE_DIM, PLAN_REGION_OVERLAP_TILES, REGIONAL_PLAN_TRIGGER_MULTIPLIER, ReferenceImage, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, TILE_OVERLAP_PX, timestampForFilename } from '@/app/lib/app'
+import { Candidate, Direction, EXTENSION_PERCENT, LlmRequestDebug, MAX_AI_DIMENSION, MAX_PLAN_REGIONS, MAX_TILES_PER_EXTEND, Mode, PLAN_REGION_MAX_SCENE_DIM, PLAN_REGION_OVERLAP_TILES, PLAN_VARIANT_COUNT, REGIONAL_PLAN_TRIGGER_MULTIPLIER, ReferenceImage, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, TILE_OVERLAP_PX, createEmptyPlanVersions, timestampForFilename } from '@/app/lib/app'
 import { findStyleLabel } from '@/app/lib/artStyles'
 import { DEFAULT_MODEL, MODELS, getModelConfig, skipsArtDirectorReview } from '@/app/lib/models'
 import { LAYER_ORDER, LAYER_ROLES, LayerRole, PARALLAX_MAX_AUTO_STEPS, ParallaxLayer, WORKFLOW_ORDER, createDefaultLayers, getRecommendedLayerIndex, getWorkflowPrerequisite } from '@/app/lib/parallax'
@@ -100,10 +100,24 @@ export default function Home() {
     /** Per non-skipped tile: result data URL after API call, or null. */
     tilePreviews: (string | null)[]
     /**
+     * Four Phase-3 refine options per tile. `tilePreviews[i]` is the
+     * selected option.
+     */
+    tileResultVersions: Array<Array<string | null>>
+    /** Which of the four refine options is active. */
+    selectedTileResultIdx: number[]
+    /**
      * Per non-skipped tile: per-tile plan override slice (Phase 2 re-plan result).
      * null = derive slice from the global plan; non-null = use this override.
      */
     tilePlanningSlices: (string | null)[]
+    /**
+     * Four Phase-2 re-plan options per tile. `tilePlanningSlices[i]` is the
+     * selected option when any version is filled.
+     */
+    tilePlanVersions: Array<Array<string | null>>
+    /** Which of the four tile-plan options is active. */
+    selectedTilePlanVariantIdx: number[]
     /** Per non-skipped tile: whether the user has accepted the generated result. */
     tileAccepted: boolean[]
     /** Per non-skipped tile: user-supplied reference images (may be empty array). */
@@ -158,6 +172,19 @@ export default function Home() {
     regionPlanningMaps: (string | null)[]
     /** Per-region filled plan result, aligned to regionGrouping.regions. */
     regionResults: (string | null)[]
+    /**
+     * Four plan options per region. `regionResults[i]` is the selected
+     * option (`versions[selectedRegionVariantIdx[i]]`).
+     */
+    regionResultVersions: Array<Array<string | null>>
+    /** Which of the four region-plan options is active. */
+    selectedRegionVariantIdx: number[]
+    /**
+     * Crop rects (in that region's plan image) for each owned tile.
+     * Stored so cycling region options can recrop slices without rebuilding
+     * the planning map.
+     */
+    regionTileCrops: Array<Array<{ nsIdx: number; rect: PlanTileRegion }> | null>
     /** Per-region scale factor (band px → region map px), aligned to regionGrouping.regions. */
     regionScales: number[]
     /** Per-region prompt override (empty = use global), aligned to regionGrouping.regions. */
@@ -1226,8 +1253,8 @@ export default function Home() {
             sceneBrief: mode === 'parallax' && sceneBrief.trim() ? sceneBrief.trim() : null,
             referenceImages: populatedRefs.map((r) => ({ description: r.description })),
           })
-          const rawRePlan = await callApi(paddedRePlan.paddedDataUrl, {
-            phase: 'plan',
+          const rePlanOpts = {
+            phase: 'plan' as const,
             populatedRefs,
             effectivePrompt: planningPrompt,
             clientPromptFallback: planClientPrompt,
@@ -1238,23 +1265,44 @@ export default function Home() {
               aspect_ratio: paddedRePlan.layout.aspectRatio,
               image_size: paddedRePlan.imageSize,
             },
-          })
+          }
 
-          const unpaddedRePlan = await unpadImageFromAspectBucket(rawRePlan, paddedRePlan.layout)
-          const normalizedRePlan = await normalizeTileImageToSize(
-            unpaddedRePlan,
-            backgroundWidth,
-            backgroundHeight,
+          const tileSlices = await Promise.all(
+            Array.from({ length: PLAN_VARIANT_COUNT }, async () => {
+              const rawRePlan = await callApi(paddedRePlan.paddedDataUrl, rePlanOpts)
+              const unpaddedRePlan = await unpadImageFromAspectBucket(rawRePlan, paddedRePlan.layout)
+              const normalizedRePlan = await normalizeTileImageToSize(
+                unpaddedRePlan,
+                backgroundWidth,
+                backgroundHeight,
+              )
+              return cropPlanningResult(normalizedRePlan, tileRegion)
+            }),
           )
-          const tileSlice = await cropPlanningResult(normalizedRePlan, tileRegion)
+          const tileSlice = tileSlices[0]
+          if (typeof tileSlice !== 'string' || tileSlice.length === 0) {
+            throw new Error('Tile re-plan returned no image')
+          }
 
           setPendingTiledPlan((prev) => {
             if (!prev) return null
             const slices = [...prev.tilePlanningSlices]
             slices[nsIdx] = tileSlice
+            const versions = [...prev.tilePlanVersions]
+            versions[nsIdx] = tileSlices
+            const selectedIdx = [...prev.selectedTilePlanVariantIdx]
+            selectedIdx[nsIdx] = 0
             const staleTileIds = new Set(prev.staleTileIds)
             staleTileIds.delete(nsIdx)
-            return { ...prev, tilePlanningSlices: slices, staleTileIds, generatingTileIdx: null, generatingPlanOnly: false }
+            return {
+              ...prev,
+              tilePlanningSlices: slices,
+              tilePlanVersions: versions,
+              selectedTilePlanVariantIdx: selectedIdx,
+              staleTileIds,
+              generatingTileIdx: null,
+              generatingPlanOnly: false,
+            }
           })
           return
         }
@@ -1327,36 +1375,61 @@ export default function Home() {
         debugLabel: `Phase 3 — Refine tile ${nsIdx + 1}`,
       }
 
-      let raw = await normaliseTileResult(await callApi(tileCanvas, refineCallOpts))
-
-      const unfilled = await isTileResultUnfilled(raw, tileSpec)
-      if (unfilled) {
-        // eslint-disable-next-line no-console
-        console.warn(`⚠️ Tile ${nsIdx + 1} appears unfilled — retrying once`)
-        raw = await normaliseTileResult(await callApi(tileCanvas, {
+      /**
+       * One refine call, optional unfilled retry, then lock-paste context
+       * pixels so the option matches what Accept will keep.
+       */
+      const generateOneRefine = async (label: string): Promise<string> => {
+        let raw = await normaliseTileResult(await callApi(tileCanvas, {
           ...refineCallOpts,
-          debugLabel: `Phase 3 — Refine tile ${nsIdx + 1} (retry)`,
+          debugLabel: label,
         }))
+        const unfilled = await isTileResultUnfilled(raw, tileSpec)
+        if (unfilled) {
+          raw = await normaliseTileResult(await callApi(tileCanvas, {
+            ...refineCallOpts,
+            debugLabel: `${label} (retry)`,
+          }))
+        }
+        return lockPasteTileKnownPixels(
+          raw,
+          canvas,
+          tileSpec,
+          direction,
+          plan.nonSkippedTileSpecs,
+          plan.tileAccepted,
+        )
       }
 
-      // Lock-paste known-good band pixels (context strip + accepted-neighbour
-      // overlaps) so the RESULT view matches what merge will keep.
-      raw = await lockPasteTileKnownPixels(
-        raw,
-        canvas,
-        tileSpec,
-        direction,
-        plan.nonSkippedTileSpecs,
-        plan.tileAccepted,
+      const resultVersions = await Promise.all(
+        Array.from({ length: PLAN_VARIANT_COUNT }, (_unused, optionIdx) =>
+          generateOneRefine(`Phase 3 — Refine tile ${nsIdx + 1} option ${optionIdx + 1}`),
+        ),
       )
+      const raw = resultVersions[0]
+      if (typeof raw !== 'string' || raw.length === 0) {
+        throw new Error('Tile API returned no image')
+      }
 
       setPendingTiledPlan((prev) => {
         if (!prev) return null
         const next = [...prev.tilePreviews]
         next[nsIdx] = raw
+        const nextVersions = [...prev.tileResultVersions]
+        nextVersions[nsIdx] = resultVersions
+        const nextSelected = [...prev.selectedTileResultIdx]
+        nextSelected[nsIdx] = 0
         const staleTileIds = new Set(prev.staleTileIds)
         staleTileIds.delete(nsIdx)
-        const updated = { ...prev, tilePreviews: next, staleTileIds, generatingTileIdx: null, generatingPlanOnly: false }
+        const updated = {
+          ...prev,
+          tilePreviews: next,
+          tileResultVersions: nextVersions,
+          selectedTileResultIdx: nextSelected,
+          staleTileIds,
+          generatingTileIdx: null,
+          generatingPlanOnly: false,
+        }
         // Sync the ref immediately (not just on next render) so callers that
         // chain straight into acceptTile — e.g. the "Generate all" loop —
         // read the freshly-generated preview instead of a stale null.
@@ -1525,9 +1598,22 @@ export default function Home() {
         if (!prev) return null
         const next = [...prev.tilePreviews]
         next[nsIdx] = assembled
+        const nextVersions = [...prev.tileResultVersions]
+        const assembledVersions = createEmptyPlanVersions()
+        assembledVersions[0] = assembled
+        nextVersions[nsIdx] = assembledVersions
+        const nextSelected = [...prev.selectedTileResultIdx]
+        nextSelected[nsIdx] = 0
         const staleTileIds = new Set(prev.staleTileIds)
         staleTileIds.delete(nsIdx)
-        const updated = { ...prev, tilePreviews: next, staleTileIds, acceptingPlanTileIdx: null }
+        const updated = {
+          ...prev,
+          tilePreviews: next,
+          tileResultVersions: nextVersions,
+          selectedTileResultIdx: nextSelected,
+          staleTileIds,
+          acceptingPlanTileIdx: null,
+        }
         pendingTiledPlanRef.current = updated
         return updated
       })
@@ -1723,6 +1809,8 @@ export default function Home() {
           globalPlanHeight: mapHeight,
           // Reset per-tile overrides so they match the new plan baseline.
           tilePlanningSlices: new Array<string | null>(prev.nonSkippedCount).fill(null),
+          tilePlanVersions: Array.from({ length: prev.nonSkippedCount }, () => createEmptyPlanVersions()),
+          selectedTilePlanVariantIdx: new Array<number>(prev.nonSkippedCount).fill(0),
           isGlobalPlanGenerating: false,
         }
       })
@@ -1803,109 +1891,121 @@ export default function Home() {
         selectedModel,
       )
 
-      const response = await fetch('/api/extend', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          expandedCanvas: paddedRegion.paddedDataUrl,
-          direction: plan.direction,
-          extensionAmount: EXTENSION_PERCENT,
-          customPrompt: effectivePrompt,
-          artStyle: artStyle !== 'none' ? artStyle : undefined,
-          apiKey: apiKey || undefined,
-          model: selectedModel,
-          layerRole: plan.layerRole,
-          sceneBrief: mode === 'parallax' && sceneBrief.trim() ? sceneBrief.trim() : undefined,
-          referenceImages: populatedRefs.length > 0 ? populatedRefs : undefined,
+      /**
+       * One region-plan API call. Shared request body so the four options
+       * differ only by model sampling.
+       */
+      const requestOneRegionPlan = async (): Promise<{
+        normalizedResult: string
+        debugSnap: LlmRequestDebug
+      }> => {
+        const response = await fetch('/api/extend', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            expandedCanvas: paddedRegion.paddedDataUrl,
+            direction: plan.direction,
+            extensionAmount: EXTENSION_PERCENT,
+            customPrompt: effectivePrompt,
+            artStyle: artStyle !== 'none' ? artStyle : undefined,
+            apiKey: apiKey || undefined,
+            model: selectedModel,
+            layerRole: plan.layerRole,
+            sceneBrief: mode === 'parallax' && sceneBrief.trim() ? sceneBrief.trim() : undefined,
+            referenceImages: populatedRefs.length > 0 ? populatedRefs : undefined,
+            phase: 'plan',
+            planScope: 'region',
+            regionIndex: regionIdx,
+            regionCount: plan.regionGrouping.regions.length,
+            imageConfig: {
+              aspect_ratio: paddedRegion.layout.aspectRatio,
+              image_size: paddedRegion.imageSize,
+            },
+          }),
+        })
+        const data = await response.json() as {
+          imageUrl?: string
+          requestPrompt?: string
+          error?: string
+        }
+
+        const responseImage =
+          typeof data.imageUrl === 'string' && data.imageUrl.length > 0 ? data.imageUrl : null
+        let responseImageWidth: number | undefined
+        let responseImageHeight: number | undefined
+        if (responseImage) {
+          try {
+            const dims = await getImageDimensions(responseImage)
+            responseImageWidth = dims.width
+            responseImageHeight = dims.height
+          } catch {
+            // Dimensions optional for the debug panel.
+          }
+        }
+        const debugSnap: LlmRequestDebug = {
+          label: `Region plan ${regionIdx + 1} / ${plan.regionGrouping.regions.length} (${paddedRegion.layout.aspectRatio})`,
           phase: 'plan',
           planScope: 'region',
-          regionIndex: regionIdx,
-          regionCount: plan.regionGrouping.regions.length,
-          imageConfig: {
-            aspect_ratio: paddedRegion.layout.aspectRatio,
-            image_size: paddedRegion.imageSize,
-          },
-        }),
-      })
-      const data = await response.json() as {
-        imageUrl?: string
-        requestPrompt?: string
-        error?: string
-      }
-
-      const responseImage =
-        typeof data.imageUrl === 'string' && data.imageUrl.length > 0 ? data.imageUrl : null
-      let responseImageWidth: number | undefined
-      let responseImageHeight: number | undefined
-      if (responseImage) {
-        try {
-          const dims = await getImageDimensions(responseImage)
-          responseImageWidth = dims.width
-          responseImageHeight = dims.height
-        } catch {
-          // Dimensions optional for the debug panel.
+          imageDataUrl: paddedRegion.paddedDataUrl,
+          prompt:
+            typeof data.requestPrompt === 'string' && data.requestPrompt.length > 0
+              ? data.requestPrompt
+              : clientPromptFallback,
+          referenceImages: populatedRefs.map((r) => ({
+            dataUrl: r.dataUrl,
+            description: r.description,
+          })),
+          responseImageDataUrl: responseImage,
+          responseImageWidth,
+          responseImageHeight,
+          imageWidth: paddedRegion.layout.paddedWidth,
+          imageHeight: paddedRegion.layout.paddedHeight,
+          capturedAt: Date.now(),
         }
-      }
-      const regionDebugSnap: LlmRequestDebug = {
-        label: `Region plan ${regionIdx + 1} / ${plan.regionGrouping.regions.length} (${paddedRegion.layout.aspectRatio})`,
-        phase: 'plan',
-        planScope: 'region',
-        imageDataUrl: paddedRegion.paddedDataUrl,
-        prompt:
-          typeof data.requestPrompt === 'string' && data.requestPrompt.length > 0
-            ? data.requestPrompt
-            : clientPromptFallback,
-        referenceImages: populatedRefs.map((r) => ({
-          dataUrl: r.dataUrl,
-          description: r.description,
-        })),
-        responseImageDataUrl: responseImage,
-        responseImageWidth,
-        responseImageHeight,
-        imageWidth: paddedRegion.layout.paddedWidth,
-        imageHeight: paddedRegion.layout.paddedHeight,
-        capturedAt: Date.now(),
-      }
-      const storeRegionDebug = () => {
-        setPendingTiledPlan((prev) => {
-          if (!prev) return null
-          const next = [...prev.lastRegionPlanRequests]
-          next[regionIdx] = regionDebugSnap
-          return { ...prev, lastRegionPlanRequests: next }
-        })
+
+        if (!response.ok) {
+          const err = new Error(data.error || 'Region plan API call failed') as Error & { status?: number }
+          err.status = response.status
+          throw err
+        }
+        if (!responseImage) {
+          throw new Error('Region plan API returned no image')
+        }
+
+        const unpaddedResult = await unpadImageFromAspectBucket(responseImage, paddedRegion.layout)
+        const normalizedResult = await normalizeTileImageToSize(unpaddedResult, mapWidth, mapHeight)
+        return { normalizedResult, debugSnap }
       }
 
-      if (!response.ok) {
-        storeRegionDebug()
-        const err = new Error(data.error || 'Region plan API call failed') as Error & { status?: number }
-        err.status = response.status
-        throw err
-      }
-
-      if (!responseImage) {
-        storeRegionDebug()
+      const optionResults = await Promise.all(
+        Array.from({ length: PLAN_VARIANT_COUNT }, () => requestOneRegionPlan()),
+      )
+      const versions = optionResults.map((item) => item.normalizedResult)
+      const regionDebugSnap = optionResults[0]?.debugSnap
+      const normalizedResult = versions[0]
+      if (!normalizedResult || !regionDebugSnap) {
         throw new Error('Region plan API returned no image')
       }
 
-      const unpaddedResult = await unpadImageFromAspectBucket(responseImage, paddedRegion.layout)
-      // Stretch — never cover+center — so region tile crops stay registered.
-      const normalizedResult = await normalizeTileImageToSize(unpaddedResult, mapWidth, mapHeight)
-
       const current = pendingTiledPlanRef.current
       if (!current || !current.regionGrouping) {
-        storeRegionDebug()
         commitPendingTiledPlan((prev) => ({ ...prev, generatingRegionIdx: null }))
         return
       }
 
-      // Crop each newly-owned tile's slice out of this region's plan result
-      // into the same flattened globalTilePlanSlices array Phase 3 reads from
-      // — identical contract to the single whole-scene plan path.
+      const regionCrops = Array.from(tileRegionsInMap.entries()).map(([nsIdx, rect]) => ({
+        nsIdx,
+        rect,
+      }))
+
+      // Crop each newly-owned tile's slice out of the selected region plan.
       const nextGlobalTilePlanSlices = [...current.globalTilePlanSlices]
       const nextStale = new Set(current.staleTileIds)
-      for (const [nsIdx, mapRect] of Array.from(tileRegionsInMap.entries())) {
-        if (mapRect.width === 0 || mapRect.height === 0) continue
-        nextGlobalTilePlanSlices[nsIdx] = await cropPlanningResult(normalizedResult, mapRect)
+      for (const { nsIdx, rect } of regionCrops) {
+        if (rect.width === 0 || rect.height === 0) {
+          continue
+        }
+        nextGlobalTilePlanSlices[nsIdx] = await cropPlanningResult(normalizedResult, rect)
         if (current.tilePreviews[nsIdx] || current.tileAccepted[nsIdx]) {
           nextStale.add(nsIdx)
         } else {
@@ -1920,8 +2020,6 @@ export default function Home() {
       const nextRegionPlanningMaps = [...current.regionPlanningMaps]
       nextRegionPlanningMaps[regionIdx] = mapDataUrl
 
-      // Refresh the extension-view background composite now that a new
-      // region result is available.
       const viewport = current.direction === 'down'
         ? { x: 0, y: current.contextSize, width: current.bandWidth, height: current.extensionSize }
         : current.direction === 'up'
@@ -1929,11 +2027,20 @@ export default function Home() {
         : current.direction === 'right'
         ? { x: current.contextSize, y: 0, width: current.extensionSize, height: current.bandHeight }
         : { x: 0, y: 0, width: current.extensionSize, height: current.bandHeight }
-      const priorForView: Array<PriorRegionResult | null> = current.regionGrouping.regions.map((r, i) =>
-        (i === regionIdx ? normalizedResult : nextRegionResults[i])
-          ? { resultUrl: (i === regionIdx ? normalizedResult : nextRegionResults[i]) as string, scale: nextRegionScales[i], bandRect: r.bandRect }
-          : null
-      )
+      const selectedUrlAt = (idx: number): string | null => {
+        const url = nextRegionResults[idx]
+        if (typeof url === 'string' && url.length > 0) {
+          return url
+        }
+        return null
+      }
+      const priorForView: Array<PriorRegionResult | null> = current.regionGrouping.regions.map((r, i) => {
+        const url = selectedUrlAt(i)
+        if (!url) {
+          return null
+        }
+        return { resultUrl: url, scale: nextRegionScales[i], bandRect: r.bandRect }
+      })
       const extensionView = await buildRegionalExtensionView(priorForView, viewport, MAX_AI_DIMENSION, {
         direction: current.direction,
         imageWidth: current.imageWidth,
@@ -1945,21 +2052,33 @@ export default function Home() {
       commitPendingTiledPlan((prev) => {
         const nextRegionPlanRequests = [...prev.lastRegionPlanRequests]
         nextRegionPlanRequests[regionIdx] = regionDebugSnap
+        const nextVersions = [...prev.regionResultVersions]
+        nextVersions[regionIdx] = versions
+        const nextSelected = [...prev.selectedRegionVariantIdx]
+        nextSelected[regionIdx] = 0
+        const nextCrops = [...prev.regionTileCrops]
+        nextCrops[regionIdx] = regionCrops
         return {
           ...prev,
           lastRegionPlanRequests: nextRegionPlanRequests,
           regionResults: nextRegionResults,
+          regionResultVersions: nextVersions,
+          selectedRegionVariantIdx: nextSelected,
+          regionTileCrops: nextCrops,
           regionScales: nextRegionScales,
           regionPlanningMaps: nextRegionPlanningMaps,
           globalTilePlanSlices: nextGlobalTilePlanSlices,
           globalPlanExtensionView: extensionView || prev.globalPlanExtensionView,
           staleTileIds: nextStale,
           generatingRegionIdx: null,
-          // Reset this region's owned tiles' Phase-2 per-tile overrides so
-          // they match the new region plan baseline (mirrors the whole-scene
-          // plan's reset of tilePlanningSlices).
           tilePlanningSlices: prev.tilePlanningSlices.map((slice, nsIdx) =>
             prev.tileRegionOwner[nsIdx] === regionIdx ? null : slice
+          ),
+          tilePlanVersions: prev.tilePlanVersions.map((row, nsIdx) =>
+            prev.tileRegionOwner[nsIdx] === regionIdx ? createEmptyPlanVersions() : row
+          ),
+          selectedTilePlanVariantIdx: prev.selectedTilePlanVariantIdx.map((idx, nsIdx) =>
+            prev.tileRegionOwner[nsIdx] === regionIdx ? 0 : idx
           ),
         }
       })
@@ -1973,6 +2092,176 @@ export default function Home() {
       commitPendingTiledPlan((prev) => ({ ...prev, generatingRegionIdx: null }))
     }
   }, [apiKey, selectedModel, mode, sceneBrief, customPrompt, artStyle])
+
+  /**
+   * Cycle this region's four plan options and recrop owned tile slices
+   * from the newly selected result.
+   */
+  const cycleRegionPlanVariant = useCallback(async (regionIdx: number, delta: 1 | -1) => {
+    const current = pendingTiledPlanRef.current
+    if (!current || !current.regionGrouping || current.generatingRegionIdx !== null) {
+      return
+    }
+    const versions = current.regionResultVersions[regionIdx]
+    if (!versions) {
+      return
+    }
+    const n = versions.length
+    if (n === 0) {
+      return
+    }
+    let nextIdx = (current.selectedRegionVariantIdx[regionIdx] + delta + n) % n
+    for (let step = 0; step < n; step++) {
+      const url = versions[nextIdx]
+      if (typeof url === 'string' && url.length > 0) {
+        break
+      }
+      nextIdx = (nextIdx + delta + n) % n
+    }
+    const resultUrl = versions[nextIdx]
+    if (typeof resultUrl !== 'string' || resultUrl.length === 0) {
+      return
+    }
+    if (nextIdx === current.selectedRegionVariantIdx[regionIdx]) {
+      return
+    }
+
+    const crops = current.regionTileCrops[regionIdx] ?? []
+    const nextGlobalTilePlanSlices = [...current.globalTilePlanSlices]
+    const nextStale = new Set(current.staleTileIds)
+    for (const { nsIdx, rect } of crops) {
+      if (rect.width === 0 || rect.height === 0) {
+        continue
+      }
+      nextGlobalTilePlanSlices[nsIdx] = await cropPlanningResult(resultUrl, rect)
+      if (current.tilePreviews[nsIdx] || current.tileAccepted[nsIdx]) {
+        nextStale.add(nsIdx)
+      } else {
+        nextStale.delete(nsIdx)
+      }
+    }
+
+    const nextRegionResults = [...current.regionResults]
+    nextRegionResults[regionIdx] = resultUrl
+    const nextSelected = [...current.selectedRegionVariantIdx]
+    nextSelected[regionIdx] = nextIdx
+
+    const viewport = current.direction === 'down'
+      ? { x: 0, y: current.contextSize, width: current.bandWidth, height: current.extensionSize }
+      : current.direction === 'up'
+        ? { x: 0, y: 0, width: current.bandWidth, height: current.extensionSize }
+        : current.direction === 'right'
+          ? { x: current.contextSize, y: 0, width: current.extensionSize, height: current.bandHeight }
+          : { x: 0, y: 0, width: current.extensionSize, height: current.bandHeight }
+    const priorForView: Array<PriorRegionResult | null> = current.regionGrouping.regions.map((r, i) => {
+      const url = nextRegionResults[i]
+      if (typeof url !== 'string' || url.length === 0) {
+        return null
+      }
+      return { resultUrl: url, scale: current.regionScales[i], bandRect: r.bandRect }
+    })
+    const extensionView = await buildRegionalExtensionView(priorForView, viewport, MAX_AI_DIMENSION, {
+      direction: current.direction,
+      imageWidth: current.imageWidth,
+      imageHeight: current.imageHeight,
+      contextSize: current.contextSize,
+      extensionSize: current.extensionSize,
+    })
+
+    commitPendingTiledPlan((prev) => ({
+      ...prev,
+      regionResults: nextRegionResults,
+      selectedRegionVariantIdx: nextSelected,
+      globalTilePlanSlices: nextGlobalTilePlanSlices,
+      globalPlanExtensionView: extensionView || prev.globalPlanExtensionView,
+      staleTileIds: nextStale,
+      tilePlanningSlices: prev.tilePlanningSlices.map((slice, nsIdx) =>
+        prev.tileRegionOwner[nsIdx] === regionIdx ? null : slice
+      ),
+      tilePlanVersions: prev.tilePlanVersions.map((row, nsIdx) =>
+        prev.tileRegionOwner[nsIdx] === regionIdx ? createEmptyPlanVersions() : row
+      ),
+      selectedTilePlanVariantIdx: prev.selectedTilePlanVariantIdx.map((idx, nsIdx) =>
+        prev.tileRegionOwner[nsIdx] === regionIdx ? 0 : idx
+      ),
+    }))
+  }, [])
+
+  /**
+   * Cycle this tile's four Phase-2 plan options. Refine / accept-plan use
+   * the selected slice.
+   */
+  const cycleTilePlanVariant = useCallback((nsIdx: number, delta: 1 | -1) => {
+    commitPendingTiledPlan((prev) => {
+      const versions = prev.tilePlanVersions[nsIdx]
+      if (!versions) {
+        return prev
+      }
+      const n = versions.length
+      if (n === 0) {
+        return prev
+      }
+      let nextIdx = (prev.selectedTilePlanVariantIdx[nsIdx] + delta + n) % n
+      for (let step = 0; step < n; step++) {
+        const url = versions[nextIdx]
+        if (typeof url === 'string' && url.length > 0) {
+          break
+        }
+        nextIdx = (nextIdx + delta + n) % n
+      }
+      const selected = versions[nextIdx]
+      if (typeof selected !== 'string' || selected.length === 0) {
+        return prev
+      }
+      const nextSelected = [...prev.selectedTilePlanVariantIdx]
+      nextSelected[nsIdx] = nextIdx
+      const nextSlices = [...prev.tilePlanningSlices]
+      nextSlices[nsIdx] = selected
+      return {
+        ...prev,
+        selectedTilePlanVariantIdx: nextSelected,
+        tilePlanningSlices: nextSlices,
+      }
+    })
+  }, [])
+
+  /**
+   * Cycle this tile's four refine results. Accept / merge use the selected
+   * preview.
+   */
+  const cycleTileResultVariant = useCallback((nsIdx: number, delta: 1 | -1) => {
+    commitPendingTiledPlan((prev) => {
+      const versions = prev.tileResultVersions[nsIdx]
+      if (!versions) {
+        return prev
+      }
+      const n = versions.length
+      if (n === 0) {
+        return prev
+      }
+      let nextIdx = (prev.selectedTileResultIdx[nsIdx] + delta + n) % n
+      for (let step = 0; step < n; step++) {
+        const url = versions[nextIdx]
+        if (typeof url === 'string' && url.length > 0) {
+          break
+        }
+        nextIdx = (nextIdx + delta + n) % n
+      }
+      const selected = versions[nextIdx]
+      if (typeof selected !== 'string' || selected.length === 0) {
+        return prev
+      }
+      const nextSelected = [...prev.selectedTileResultIdx]
+      nextSelected[nsIdx] = nextIdx
+      const nextPreviews = [...prev.tilePreviews]
+      nextPreviews[nsIdx] = selected
+      return {
+        ...prev,
+        selectedTileResultIdx: nextSelected,
+        tilePreviews: nextPreviews,
+      }
+    })
+  }, [])
 
   // Keep the ref in sync so startTiledPlan (zero-dep useCallback) can call it.
   useEffect(() => {
@@ -2269,7 +2558,11 @@ export default function Home() {
       imageHeight: dims.height,
       tilePrompts: new Array<string>(nonSkippedCount).fill(''),
       tilePreviews: new Array<string | null>(nonSkippedCount).fill(null),
+      tileResultVersions: Array.from({ length: nonSkippedCount }, () => createEmptyPlanVersions()),
+      selectedTileResultIdx: new Array<number>(nonSkippedCount).fill(0),
       tilePlanningSlices: new Array<string | null>(nonSkippedCount).fill(null),
+      tilePlanVersions: Array.from({ length: nonSkippedCount }, () => createEmptyPlanVersions()),
+      selectedTilePlanVariantIdx: new Array<number>(nonSkippedCount).fill(0),
       tileAccepted: new Array<boolean>(nonSkippedCount).fill(false),
       tileReferenceImages: Array.from({ length: nonSkippedCount }, () => [] as ReferenceImage[]),
       generatingTileIdx: null,
@@ -2288,6 +2581,9 @@ export default function Home() {
       tileRegionOwner,
       regionPlanningMaps: new Array<string | null>(regionCount).fill(null),
       regionResults: new Array<string | null>(regionCount).fill(null),
+      regionResultVersions: Array.from({ length: regionCount }, () => createEmptyPlanVersions()),
+      selectedRegionVariantIdx: new Array<number>(regionCount).fill(0),
+      regionTileCrops: new Array<Array<{ nsIdx: number; rect: PlanTileRegion }> | null>(regionCount).fill(null),
       regionScales: new Array<number>(regionCount).fill(1),
       regionPrompts: new Array<string>(regionCount).fill(''),
       regionReferenceImages: Array.from({ length: regionCount }, () => [] as ReferenceImage[]),
@@ -5186,6 +5482,10 @@ export default function Home() {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
         return
       }
+      // Region / tile plan modals own ← → for their 4 options.
+      if (activeTileModalIdx !== null || activeRegionModalIdx !== null) {
+        return
+      }
       // In parallax mode the active "image" is the active layer; in extender
       // mode it's the global selectedImage.
       const sourceAvailable =
@@ -5220,6 +5520,8 @@ export default function Home() {
     mode,
     parallaxAutoExtending,
     activeLayer,
+    activeTileModalIdx,
+    activeRegionModalIdx,
   ])
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -5632,6 +5934,12 @@ export default function Home() {
             debugMode={debugMode}
             lastPlanRequest={plan.lastTilePlanRequests[nsIdx] ?? null}
             lastRefineRequest={plan.lastTileRefineRequests[nsIdx] ?? null}
+            planOptionCount={(plan.tilePlanVersions[nsIdx] ?? []).filter((url) => typeof url === 'string' && url.length > 0).length}
+            planOptionIdx={plan.selectedTilePlanVariantIdx[nsIdx] ?? 0}
+            onCyclePlanOption={(delta) => cycleTilePlanVariant(nsIdx, delta)}
+            resultOptionCount={(plan.tileResultVersions[nsIdx] ?? []).filter((url) => typeof url === 'string' && url.length > 0).length}
+            resultOptionIdx={plan.selectedTileResultIdx[nsIdx] ?? 0}
+            onCycleResultOption={(delta) => cycleTileResultVariant(nsIdx, delta)}
           />
         )
       })()}
@@ -5703,6 +6011,9 @@ export default function Home() {
             }}
             debugMode={debugMode}
             lastPlanRequest={plan.lastRegionPlanRequests[regionIdx] ?? null}
+            planOptionCount={(plan.regionResultVersions[regionIdx] ?? []).filter((url) => typeof url === 'string' && url.length > 0).length}
+            planOptionIdx={plan.selectedRegionVariantIdx[regionIdx] ?? 0}
+            onCyclePlanOption={(delta) => { void cycleRegionPlanVariant(regionIdx, delta) }}
           />
         )
       })()}
