@@ -6625,21 +6625,68 @@ export async function compositeInpaintFinal(
 }
 
 /**
+ * Paste the model's plan crop into a context-sized canvas as a straight
+ * overwrite. No change-mask, blur, or feather — the plan RGB replaces the
+ * source in `contextRect` at alpha 255 so a later Accept cannot blend.
+ */
+export async function stampPlanIntoContextCanvas(
+  sourceImageUrl: string,
+  contextRect: { x: number; y: number; w: number; h: number },
+  planImageUrl: string,
+): Promise<HTMLCanvasElement> {
+  const [sourceImg, planImg] = await Promise.all([
+    loadImageElement(sourceImageUrl),
+    loadImageElement(planImageUrl),
+  ])
+  const destW = Math.max(1, Math.round(contextRect.w))
+  const destH = Math.max(1, Math.round(contextRect.h))
+  const canvas = document.createElement('canvas')
+  canvas.width = destW
+  canvas.height = destH
+  const ctx = canvas.getContext('2d')
+  if (!ctx) {
+    return canvas
+  }
+
+  // Original context as the fallback under the plan, then replace it.
+  ctx.drawImage(
+    sourceImg,
+    contextRect.x,
+    contextRect.y,
+    destW,
+    destH,
+    0,
+    0,
+    destW,
+    destH,
+  )
+  ctx.imageSmoothingEnabled = true
+  ctx.imageSmoothingQuality = 'high'
+  ctx.drawImage(planImg, 0, 0, destW, destH)
+
+  const opaqueStamp = ctx.getImageData(0, 0, destW, destH)
+  forceImageDataOpaque(opaqueStamp)
+  ctx.putImageData(opaqueStamp, 0, 0)
+  return canvas
+}
+
+/**
  * Paste the model's plan crop into the source at `contextRect` with no
  * extra blur, change-mask, or feather. The only softness is the plan's
  * own resolution (longest edge ≤ GLOBAL_PLAN_MAX_DIM). Used for the
- * on-screen merge preview so the user sees the plan in place, not the
- * softened tile-guide composite.
+ * on-screen merge preview and Accept so both show a hard overwrite.
  */
 export async function stampPlanIntoSource(
   sourceImageUrl: string,
   contextRect: { x: number; y: number; w: number; h: number },
   planImageUrl: string,
 ): Promise<string> {
-  const [sourceImg, planImg] = await Promise.all([
-    loadImageElement(sourceImageUrl),
-    loadImageElement(planImageUrl),
-  ])
+  const sourceImg = await loadImageElement(sourceImageUrl)
+  const stampedContext = await stampPlanIntoContextCanvas(
+    sourceImageUrl,
+    contextRect,
+    planImageUrl,
+  )
   const canvas = document.createElement('canvas')
   canvas.width = sourceImg.naturalWidth
   canvas.height = sourceImg.naturalHeight
@@ -6648,14 +6695,17 @@ export async function stampPlanIntoSource(
     return sourceImageUrl
   }
   ctx.drawImage(sourceImg, 0, 0)
-  ctx.imageSmoothingEnabled = true
-  ctx.imageSmoothingQuality = 'high'
-  ctx.drawImage(
-    planImg,
-    contextRect.x,
-    contextRect.y,
-    contextRect.w,
-    contextRect.h,
-  )
+
+  const destX = Math.max(0, Math.floor(contextRect.x))
+  const destY = Math.max(0, Math.floor(contextRect.y))
+  const destW = stampedContext.width
+  const destH = stampedContext.height
+  const stampCtx = stampedContext.getContext('2d')
+  if (stampCtx) {
+    const opaqueStamp = stampCtx.getImageData(0, 0, destW, destH)
+    ctx.putImageData(opaqueStamp, destX, destY)
+  } else {
+    ctx.drawImage(stampedContext, destX, destY)
+  }
   return canvas.toDataURL('image/png')
 }

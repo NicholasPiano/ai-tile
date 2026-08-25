@@ -33,6 +33,7 @@ import {
   cropInpaintTileInput,
   compositeInpaintTileResult,
   compositeInpaintFinal,
+  stampPlanIntoContextCanvas,
   stampPlanIntoSource,
 } from '@/app/utils/imageProcessor'
 
@@ -427,21 +428,17 @@ export interface EditStudioProps {
  *   1. Generate → buildGlobalPlanInput once, then INPAINT_VARIANT_COUNT
  *        parallel /api/edit 'plan' calls (same settings) → variants[]
  *   2.          → computeChangeMask per variant (client-side pixel diff)
- *   3.          → buildGlobalInpaintComposite per variant: ONE full-resolution canvas —
- *                 crisp source everywhere, softened/feathered plan content
- *                 baked into actually-changed pixels. Not clipped to the
- *                 selection rectangle — the change mask alone decides what
- *                 shows plan content, so legitimate bleed into the context
- *                 band (e.g. a shadow/highlight) is kept rather than discarded.
- *   Fast path (context ≤ MAX_AI_DIMENSION): the composite above IS the final
- *     result — no refine pass needed, jump straight to phase 'done'.
+ *   3.          → buildGlobalInpaintComposite per variant: softened tile
+ *                 guide only (change-mask + blur). Display / Accept use
+ *                 stampPlanIntoContextCanvas — a hard overwrite of the plan.
+ *   Fast path (context ≤ MAX_AI_DIMENSION): the hard plan stamp IS the
+ *     final result — no refine pass needed, jump straight to phase 'done'.
  *   Full path (context > MAX_AI_DIMENSION):
  *   3a.         → planInpaintTiles (phase → 'tiling', idle)
- *   4. Per tile (manual): cropInpaintTileInput (plain crop from the shared
- *        running canvas — already-sharpened neighbour tiles show through
- *        automatically) → /api/edit 'refine' → compositeInpaintTileResult
- *        (stamps the whole tile, same no-clip rule) (generateTile / Generate-all)
- *   5. Accept → compositeInpaintFinal → onAccept
+ *   4. Per tile (manual): cropInpaintTileInput (plain crop from the softened
+ *        guide + earlier tiles) → /api/edit 'refine' → compositeInpaintTileResult
+ *        (hard overwrite of maskSubRect onto the hard plan stamp)
+ *   5. Accept → stitchedPreviewUrl (same overwrite the user is looking at)
  *
  * Re-run controls exist for the plan (cascades to mask/tiles), the mask
  * (reuses the plan), and each tile individually (full path only).
@@ -496,7 +493,10 @@ async function buildVariantFromPlan(args: {
   tileCount: number
 }): Promise<{
   variant: InpaintVariant
+  /** Softened change-mask composite — tile-refine guide only, never Accept. */
   canvas: HTMLCanvasElement
+  /** Hard plan overwrite — display / Accept / tile-merge base. */
+  hardCanvas: HTMLCanvasElement
   changeMaskCanvas: HTMLCanvasElement | null
 }> {
   let changeMaskCanvas: HTMLCanvasElement | null = null
@@ -520,8 +520,14 @@ async function buildVariantFromPlan(args: {
     changeMaskCanvas,
   )
 
-  // Display merge: the plan crop pasted into the source. The softened
-  // `canvas` stays the tile-guide working layer — it is not shown.
+  // Display / Accept merge: the plan crop pasted into the source. The
+  // softened `canvas` stays the tile-guide working layer — it is not
+  // shown and must not be what Accept writes back.
+  const hardCanvas = await stampPlanIntoContextCanvas(
+    args.image,
+    args.contextRect,
+    args.globalPlanUrl,
+  )
   const stitchedPreviewUrl = await stampPlanIntoSource(
     args.image,
     args.contextRect,
@@ -538,6 +544,7 @@ async function buildVariantFromPlan(args: {
       stitchedPreviewUrl,
     },
     canvas,
+    hardCanvas,
     changeMaskCanvas,
   }
 }
@@ -561,17 +568,24 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const isDraggingRef = useRef(false)
   /**
-   * Per-variant running composite canvases. Generate all tiles / Accept
-   * always read the slot at `selectedVariantIdx`.
+   * Per-variant running Accept canvas: hard plan stamp + selected tiles.
+   * Never the softened change-mask composite.
    */
   const inpaintCanvasByVariantRef = useRef<Array<HTMLCanvasElement | null>>(
     Array.from({ length: INPAINT_VARIANT_COUNT }, () => null),
   )
   /**
-   * Pre-tile plan composite per variant. Tile generate / version cycling
-   * always rebuilds the running canvas from this base plus selected tiles.
+   * Softened change-mask plan composite per variant. Tile refine crops
+   * from this guide plus earlier tiles — it is not shown or accepted.
    */
   const inpaintBaseCanvasByVariantRef = useRef<Array<HTMLCanvasElement | null>>(
+    Array.from({ length: INPAINT_VARIANT_COUNT }, () => null),
+  )
+  /**
+   * Immutable hard plan overwrite per variant. Tile-version cycling
+   * rebuilds the Accept canvas from this plus selected tiles.
+   */
+  const inpaintHardCanvasByVariantRef = useRef<Array<HTMLCanvasElement | null>>(
     Array.from({ length: INPAINT_VARIANT_COUNT }, () => null),
   )
   /** Per-variant client-computed pixel-diff change masks. */
@@ -771,13 +785,14 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   const clearVariantCanvases = () => {
     inpaintCanvasByVariantRef.current = Array.from({ length: INPAINT_VARIANT_COUNT }, () => null)
     inpaintBaseCanvasByVariantRef.current = Array.from({ length: INPAINT_VARIANT_COUNT }, () => null)
+    inpaintHardCanvasByVariantRef.current = Array.from({ length: INPAINT_VARIANT_COUNT }, () => null)
     changeMaskCanvasByVariantRef.current = Array.from({ length: INPAINT_VARIANT_COUNT }, () => null)
   }
 
   /**
-   * Rebuild a plan variant's running canvas from its pre-tile base, then
-   * stamp every tile's currently selected refine version in scan order.
-   * Returns a full-image stitched preview URL, or null if the base is missing.
+   * Rebuild a plan variant's Accept canvas from its hard plan stamp, then
+   * overwrite every tile's selected refine version in scan order.
+   * Returns a full-image stitched preview URL, or null if the stamp is missing.
    */
   const rebuildVariantComposite = async (
     variantIdx: number,
@@ -786,11 +801,11 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     sourceImage: string,
     contextRect: { x: number; y: number; w: number; h: number },
   ): Promise<string | null> => {
-    const base = inpaintBaseCanvasByVariantRef.current[variantIdx]
-    if (!base) {
+    const hardBase = inpaintHardCanvasByVariantRef.current[variantIdx]
+    if (!hardBase) {
       return null
     }
-    const working = cloneCanvas(base)
+    const working = cloneCanvas(hardBase)
     for (let i = 0; i < tilePlan.tiles.length; i++) {
       const tile = tilePlan.tiles[i]
       const resultUrl = selectedTileResultUrl(tileSlots[i])
@@ -868,8 +883,9 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
           ),
         )
 
-        inpaintCanvasByVariantRef.current = built.map((item) => item.canvas)
-        inpaintBaseCanvasByVariantRef.current = built.map((item) => cloneCanvas(item.canvas))
+        inpaintHardCanvasByVariantRef.current = built.map((item) => item.hardCanvas)
+        inpaintCanvasByVariantRef.current = built.map((item) => cloneCanvas(item.hardCanvas))
+        inpaintBaseCanvasByVariantRef.current = built.map((item) => item.canvas)
         changeMaskCanvasByVariantRef.current = built.map((item) => item.changeMaskCanvas)
 
         setInpaintState((prev) =>
@@ -949,6 +965,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     const previousVariant = inpaintState.variants[variantIdx]
     const previousCanvas = inpaintCanvasByVariantRef.current[variantIdx] ?? null
     const previousBase = inpaintBaseCanvasByVariantRef.current[variantIdx] ?? null
+    const previousHard = inpaintHardCanvasByVariantRef.current[variantIdx] ?? null
     const previousMask = changeMaskCanvasByVariantRef.current[variantIdx] ?? null
     if (!previousVariant) {
       return
@@ -961,6 +978,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
     inpaintCanvasByVariantRef.current[variantIdx] = null
     inpaintBaseCanvasByVariantRef.current[variantIdx] = null
+    inpaintHardCanvasByVariantRef.current[variantIdx] = null
     changeMaskCanvasByVariantRef.current[variantIdx] = null
     setInpaintState((prev) => {
       if (!prev) {
@@ -1001,8 +1019,9 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
         tileCount,
       })
 
-      inpaintCanvasByVariantRef.current[variantIdx] = built.canvas
-      inpaintBaseCanvasByVariantRef.current[variantIdx] = cloneCanvas(built.canvas)
+      inpaintHardCanvasByVariantRef.current[variantIdx] = built.hardCanvas
+      inpaintCanvasByVariantRef.current[variantIdx] = cloneCanvas(built.hardCanvas)
+      inpaintBaseCanvasByVariantRef.current[variantIdx] = built.canvas
       changeMaskCanvasByVariantRef.current[variantIdx] = built.changeMaskCanvas
       setInpaintState((prev) => {
         if (!prev) {
@@ -1020,6 +1039,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     } catch (e) {
       inpaintCanvasByVariantRef.current[variantIdx] = previousCanvas
       inpaintBaseCanvasByVariantRef.current[variantIdx] = previousBase
+      inpaintHardCanvasByVariantRef.current[variantIdx] = previousHard
       changeMaskCanvasByVariantRef.current[variantIdx] = previousMask
       setInpaintState((prev) => {
         if (!prev) {
@@ -1278,15 +1298,9 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
   const handleAccept = useCallback(async () => {
     const variantIdx = inpaintState?.selectedVariantIdx ?? 0
+    const selected = inpaintState ? selectedInpaintVariant(inpaintState) : null
     const inpaintCanvas = inpaintCanvasByVariantRef.current[variantIdx]
 
-    if (!inpaintCanvas) {
-      console.warn('[EditStudio] handleAccept: inpaintCanvas is null')
-      setInpaintState((prev) =>
-        prev ? { ...prev, error: 'Cannot accept: inpaint canvas is missing. Please try regenerating.' } : null,
-      )
-      return
-    }
     if (!image) {
       console.warn('[EditStudio] handleAccept: image prop is null/empty')
       setInpaintState((prev) =>
@@ -1300,13 +1314,34 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     }
 
     try {
+      // Accept the hard overwrite already on screen. Rebuild after tiles
+      // also starts from that stamp, so Accept never writes the softened
+      // change-mask blend that is only a tile-refine guide.
+      const previewUrl = selected?.stitchedPreviewUrl ?? null
       console.log('[EditStudio] handleAccept: compositing final image…', {
         contextRect: inpaintState.region.contextRect,
-        canvasW: inpaintCanvas.width,
-        canvasH: inpaintCanvas.height,
+        canvasW: inpaintCanvas?.width ?? null,
+        canvasH: inpaintCanvas?.height ?? null,
         phase: inpaintState.phase,
+        hasPreviewUrl: previewUrl !== null,
       })
-      const newImageUrl = await compositeInpaintFinal(image, inpaintCanvas, inpaintState.region.contextRect)
+
+      let newImageUrl = previewUrl
+      if (!newImageUrl) {
+        if (!inpaintCanvas) {
+          console.warn('[EditStudio] handleAccept: inpaintCanvas is null')
+          setInpaintState((prev) =>
+            prev ? { ...prev, error: 'Cannot accept: inpaint canvas is missing. Please try regenerating.' } : null,
+          )
+          return
+        }
+        newImageUrl = await compositeInpaintFinal(
+          image,
+          inpaintCanvas,
+          inpaintState.region.contextRect,
+        )
+      }
+
       const isSameAsSource = newImageUrl === image
       console.log('[EditStudio] handleAccept: composite done', {
         urlLength: newImageUrl.length,
@@ -1317,8 +1352,6 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       })
 
       if (isSameAsSource) {
-        // The compositeInpaintFinal helper fell back to returning the source URL
-        // unchanged — this means canvas.getContext('2d') returned null.
         setInpaintState((prev) =>
           prev ? { ...prev, error: 'Compositing failed: could not get canvas context. Try reloading the page.' } : null,
         )
