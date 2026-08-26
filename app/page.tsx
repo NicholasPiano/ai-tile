@@ -5719,7 +5719,7 @@ export default function Home() {
           onDropFile={handleFile}
         />
       ) : isEdit ? (
-        <div className="flex min-h-0 flex-1 overflow-hidden">
+        <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
           <EditStudio
             image={selectedImage}
             dimensions={currentImageDimensions}

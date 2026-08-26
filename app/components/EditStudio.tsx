@@ -151,11 +151,6 @@ function imageRectToBuffer(
   return { x: tl.x, y: tl.y, w: br.x - tl.x, h: br.y - tl.y }
 }
 
-/** Approximate image-pixel → canvas-buffer scale for stroke widths and labels. */
-function imagePixelScaleInBuffer(layout: ObjectContainLayout, bufH: number): number {
-  return layout.s * bufH / layout.containerH
-}
-
 function normaliseRect(a: ImagePoint, b: ImagePoint): ImageRect {
   return {
     x: Math.min(a.x, b.x),
@@ -180,6 +175,135 @@ function clampRect(r: ImageRect, bounds: ImageRect): ImageRect {
   const x2 = clamp(r.x + r.w, bounds.x, bounds.x + bounds.w)
   const y2 = clamp(r.y + r.h, bounds.y, bounds.y + bounds.h)
   return { x, y, w: x2 - x, h: y2 - y }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Viewport zoom / pan (CSS pixels; zoom 1 = one image pixel per CSS pixel)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Floor so a 4k image can still be seen in full inside the frame. */
+const VIEW_MIN_ZOOM = 0.1
+/** Ceiling for pixel inspection past native resolution. */
+const VIEW_MAX_ZOOM = 8
+/** Multiplier applied once per toolbar + / − click. */
+const VIEW_ZOOM_FACTOR = 1.12
+/**
+ * Pinch / ctrl-wheel scale per CSS-pixel of deltaY. Trackpads fire many
+ * small events; a discrete 1.12× step per event was far too jumpy.
+ */
+const VIEW_PINCH_ZOOM_SENSITIVITY = 0.01
+
+/** Pan/zoom of the image inside the clipped edit viewport. */
+type ViewTransform = {
+  zoom: number
+  panX: number
+  panY: number
+}
+
+/** CSS-pixel size of the clipped image frame. */
+type ViewportSize = {
+  w: number
+  h: number
+}
+
+/**
+ * Clamp zoom to the allowed range.
+ */
+function clampZoom(zoom: number): number {
+  return clamp(zoom, VIEW_MIN_ZOOM, VIEW_MAX_ZOOM)
+}
+
+/**
+ * Uniform scale that fits the whole image inside the viewport.
+ */
+function fitZoomForViewport(
+  viewport: ViewportSize,
+  imgW: number,
+  imgH: number,
+): number {
+  if (viewport.w <= 0 || viewport.h <= 0 || imgW <= 0 || imgH <= 0) {
+    return 1
+  }
+  return clampZoom(Math.min(viewport.w / imgW, viewport.h / imgH))
+}
+
+/**
+ * Keep the image on screen: centered when it is smaller than the frame,
+ * otherwise clamped so the frame stays filled with image pixels.
+ */
+function clampViewTransform(
+  view: ViewTransform,
+  viewport: ViewportSize,
+  imgW: number,
+  imgH: number,
+): ViewTransform {
+  const zoom = clampZoom(view.zoom)
+  const contentW = imgW * zoom
+  const contentH = imgH * zoom
+  let panX = view.panX
+  let panY = view.panY
+  if (viewport.w <= 0 || viewport.h <= 0) {
+    return { zoom, panX, panY }
+  }
+  if (contentW <= viewport.w) {
+    panX = (viewport.w - contentW) / 2
+  } else {
+    panX = clamp(view.panX, viewport.w - contentW, 0)
+  }
+  if (contentH <= viewport.h) {
+    panY = (viewport.h - contentH) / 2
+  } else {
+    panY = clamp(view.panY, viewport.h - contentH, 0)
+  }
+  return { zoom, panX, panY }
+}
+
+/**
+ * Center the image at `zoom` (full-resolution when zoom is 1).
+ */
+function centeredView(
+  zoom: number,
+  viewport: ViewportSize,
+  imgW: number,
+  imgH: number,
+): ViewTransform {
+  return clampViewTransform(
+    { zoom: clampZoom(zoom), panX: 0, panY: 0 },
+    viewport,
+    imgW,
+    imgH,
+  )
+}
+
+/**
+ * Change zoom while keeping the image point under `origin` (viewport CSS
+ * coordinates) fixed — wheel-zoom toward the cursor.
+ */
+function zoomViewAt(
+  view: ViewTransform,
+  nextZoom: number,
+  originX: number,
+  originY: number,
+  viewport: ViewportSize,
+  imgW: number,
+  imgH: number,
+): ViewTransform {
+  if (view.zoom <= 0) {
+    return centeredView(nextZoom, viewport, imgW, imgH)
+  }
+  const zoom = clampZoom(nextZoom)
+  const imgX = (originX - view.panX) / view.zoom
+  const imgY = (originY - view.panY) / view.zoom
+  return clampViewTransform(
+    {
+      zoom,
+      panX: originX - imgX * zoom,
+      panY: originY - imgY * zoom,
+    },
+    viewport,
+    imgW,
+    imgH,
+  )
 }
 
 /** Normalise and clamp an in-progress or committed drag to the image bounds. */
@@ -240,10 +364,12 @@ function drawImageRect(
   },
 ): void {
   const buf = imageRectToBuffer(r, layout, bufW, bufH)
-  const pixelScale = imagePixelScaleInBuffer(layout, bufH)
+  const cssToBuf = layout.containerH > 0 ? bufH / layout.containerH : 1
+  const dash = options.dash?.map((n) => n * cssToBuf)
   drawBufferRect(ctx, buf, {
     ...options,
-    lineWidth: (options.lineWidth ?? 1.5) * pixelScale,
+    dash,
+    lineWidth: (options.lineWidth ?? 1.5) * cssToBuf,
   })
 }
 
@@ -566,7 +692,13 @@ function cloneCanvas(source: HTMLCanvasElement): HTMLCanvasElement {
 
 export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, model, onAccept }: EditStudioProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const viewportRef = useRef<HTMLDivElement>(null)
   const isDraggingRef = useRef(false)
+  const isPanningRef = useRef(false)
+  const panLastRef = useRef<{ x: number; y: number } | null>(null)
+  const spaceDownRef = useRef(false)
+  const viewportSizeRef = useRef<ViewportSize>({ w: 0, h: 0 })
+  const viewReadyRef = useRef(false)
   /**
    * Per-variant running Accept canvas: hard plan stamp + selected tiles.
    * Never the softened change-mask composite.
@@ -604,6 +736,15 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   inpaintStateRef.current = inpaintState
   /** Bumped when the displayed image size changes so the overlay stays aligned. */
   const [layoutTick, setLayoutTick] = useState(0)
+  /**
+   * Zoom/pan inside the clipped image frame. `zoom === 1` is full
+   * resolution (one image pixel per CSS pixel).
+   */
+  const [view, setView] = useState<ViewTransform>({ zoom: 1, panX: 0, panY: 0 })
+  const [spaceDown, setSpaceDown] = useState(false)
+  const [isPanning, setIsPanning] = useState(false)
+
+  spaceDownRef.current = spaceDown
 
   // ── Sync canvas buffer to natural image dimensions ─────────────────────────
   useEffect(() => {
@@ -613,7 +754,47 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     canvas.height = dimensions.height
   }, [dimensions])
 
-  // ── Redraw overlay when the fitted image resizes (window / sidebar layout) ─
+  // ── Size the clipped viewport; start at 1:1, then keep pan legal ───────────
+  // Reset only when the *pixel size* changes (a new photo). Accepting an
+  // edit replaces the data URL but keeps the same dimensions — the view
+  // must stay put.
+  useEffect(() => {
+    viewReadyRef.current = false
+  }, [dimensions?.width, dimensions?.height])
+
+  useEffect(() => {
+    const viewport = viewportRef.current
+    if (!viewport) {
+      return
+    }
+    const applySize = (next: ViewportSize) => {
+      viewportSizeRef.current = next
+      if (!dimensions || next.w <= 0 || next.h <= 0) {
+        return
+      }
+      if (!viewReadyRef.current) {
+        viewReadyRef.current = true
+        setView(centeredView(1, next, dimensions.width, dimensions.height))
+        return
+      }
+      setView((prev) => clampViewTransform(prev, next, dimensions.width, dimensions.height))
+    }
+    const ro = new ResizeObserver((entries) => {
+      const entry = entries[0]
+      if (!entry) {
+        return
+      }
+      applySize({
+        w: entry.contentRect.width,
+        h: entry.contentRect.height,
+      })
+    })
+    ro.observe(viewport)
+    applySize({ w: viewport.clientWidth, h: viewport.clientHeight })
+    return () => ro.disconnect()
+  }, [dimensions])
+
+  // ── Redraw overlay when the displayed image box resizes ────────────────────
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
@@ -621,6 +802,91 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     ro.observe(canvas)
     return () => ro.disconnect()
   }, [dimensions, image])
+
+  // ── Trackpad two-finger drag pans; pinch / ctrl-wheel zooms ────────────────
+  useEffect(() => {
+    const viewport = viewportRef.current
+    if (!viewport || !dimensions) {
+      return
+    }
+    /**
+     * Convert a wheel delta into CSS pixels. Trackpad two-finger drags
+     * arrive as `DOM_DELTA_PIXEL`; mouse wheels are often line-based.
+     */
+    const wheelDeltaPx = (delta: number, deltaMode: number): number => {
+      if (deltaMode === WheelEvent.DOM_DELTA_LINE) {
+        return delta * 16
+      }
+      if (deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+        return delta * viewportSizeRef.current.h
+      }
+      return delta
+    }
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      // Pinch-to-zoom (Chrome/Safari) and ctrl/cmd + wheel stay zoom.
+      if (e.ctrlKey || e.metaKey) {
+        const rect = viewport.getBoundingClientRect()
+        const originX = e.clientX - rect.left
+        const originY = e.clientY - rect.top
+        const dy = wheelDeltaPx(e.deltaY, e.deltaMode)
+        const factor = Math.exp(-dy * VIEW_PINCH_ZOOM_SENSITIVITY)
+        setView((prev) =>
+          zoomViewAt(
+            prev,
+            prev.zoom * factor,
+            originX,
+            originY,
+            viewportSizeRef.current,
+            dimensions.width,
+            dimensions.height,
+          ),
+        )
+        return
+      }
+      const dx = wheelDeltaPx(e.deltaX, e.deltaMode)
+      const dy = wheelDeltaPx(e.deltaY, e.deltaMode)
+      setView((prev) =>
+        clampViewTransform(
+          { ...prev, panX: prev.panX - dx, panY: prev.panY - dy },
+          viewportSizeRef.current,
+          dimensions.width,
+          dimensions.height,
+        ),
+      )
+    }
+    viewport.addEventListener('wheel', onWheel, { passive: false })
+    return () => viewport.removeEventListener('wheel', onWheel)
+  }, [dimensions])
+
+  // ── Space holds pan (so selection drag stays the default) ──────────────────
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code !== 'Space' || e.repeat) {
+        return
+      }
+      const target = e.target
+      if (target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement) {
+        return
+      }
+      e.preventDefault()
+      spaceDownRef.current = true
+      setSpaceDown(true)
+    }
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code !== 'Space') {
+        return
+      }
+      spaceDownRef.current = false
+      setSpaceDown(false)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    window.addEventListener('keyup', onKeyUp)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      window.removeEventListener('keyup', onKeyUp)
+    }
+  }, [])
 
   // ── Redraw overlay on drag or inpaint state changes ────────────────────────
   useEffect(() => {
@@ -694,6 +960,10 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       const canvas = canvasRef.current
       if (!canvas) return
       if (inpaintState) return
+      // Space or middle-mouse is pan — let the viewport handler take it.
+      if (spaceDownRef.current || e.button === 1) {
+        return
+      }
       e.preventDefault()
       isDraggingRef.current = true
       const pt = toImageCoord(e, canvas, dimensions.width, dimensions.height)
@@ -744,6 +1014,92 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       })
     }
   }, [dimensions])
+
+  /**
+   * Pan the image inside the frame. Used for space/middle-mouse while
+   * selecting, and for any drag after a selection exists.
+   */
+  const handleViewportPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      const wantPan =
+        spaceDownRef.current || e.button === 1 || inpaintState !== null
+      if (!wantPan || isDraggingRef.current) {
+        return
+      }
+      e.preventDefault()
+      isPanningRef.current = true
+      panLastRef.current = { x: e.clientX, y: e.clientY }
+      setIsPanning(true)
+      e.currentTarget.setPointerCapture(e.pointerId)
+    },
+    [inpaintState],
+  )
+
+  const handleViewportPointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!isPanningRef.current || !panLastRef.current || !dimensions) {
+        return
+      }
+      const dx = e.clientX - panLastRef.current.x
+      const dy = e.clientY - panLastRef.current.y
+      panLastRef.current = { x: e.clientX, y: e.clientY }
+      setView((prev) =>
+        clampViewTransform(
+          { ...prev, panX: prev.panX + dx, panY: prev.panY + dy },
+          viewportSizeRef.current,
+          dimensions.width,
+          dimensions.height,
+        ),
+      )
+    },
+    [dimensions],
+  )
+
+  const handleViewportPointerUp = useCallback(() => {
+    isPanningRef.current = false
+    panLastRef.current = null
+    setIsPanning(false)
+  }, [])
+
+  /**
+   * Step zoom from the viewport center (toolbar + / −).
+   */
+  const nudgeZoom = useCallback(
+    (direction: 1 | -1) => {
+      if (!dimensions) {
+        return
+      }
+      const vp = viewportSizeRef.current
+      const factor = direction === 1 ? VIEW_ZOOM_FACTOR : 1 / VIEW_ZOOM_FACTOR
+      setView((prev) =>
+        zoomViewAt(
+          prev,
+          prev.zoom * factor,
+          vp.w / 2,
+          vp.h / 2,
+          vp,
+          dimensions.width,
+          dimensions.height,
+        ),
+      )
+    },
+    [dimensions],
+  )
+
+  const setZoomPreset = useCallback(
+    (preset: 'fit' | 'full') => {
+      if (!dimensions) {
+        return
+      }
+      const vp = viewportSizeRef.current
+      const zoom =
+        preset === 'fit'
+          ? fitZoomForViewport(vp, dimensions.width, dimensions.height)
+          : 1
+      setView(centeredView(zoom, vp, dimensions.width, dimensions.height))
+    },
+    [dimensions],
+  )
 
   // ── Initialise InpaintState when drag commits ──────────────────────────────
   useEffect(() => {
@@ -1419,56 +1775,100 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   /** Main image shows the selected merge as soon as a plan exists. */
   const displayImageUrl = selectedMergeUrl ?? image
 
+  const contentW = dimensions.width * view.zoom
+  const contentH = dimensions.height * view.zoom
+  const zoomPct = Math.round(view.zoom * 100)
+  const viewportCursor = isPanning
+    ? 'grabbing'
+    : spaceDown || inpaintState
+      ? 'grab'
+      : 'default'
+  const canvasCursor = spaceDown || isPanning
+    ? isPanning
+      ? 'grabbing'
+      : 'grab'
+    : inpaintState || isProcessing
+      ? 'default'
+      : 'crosshair'
+
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
 
       {/*
-        Image frame and sidebar share one flex row so they are the same
-        height. The dimension meta row sits below and does not stretch the panel.
+        Image frame takes leftover width only. The sidebar is a fixed
+        column so the photo can never push it off-screen.
       */}
-      <div className="flex min-h-0 flex-1 pt-2">
+      <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden pt-2">
 
         {/* ── Image frame ─────────────────────────────────────────────────── */}
-        <div className="relative min-h-0 min-w-0 flex-1 px-6">
+        <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden px-6">
           <div
-            className="relative h-full min-h-0 overflow-hidden checker rounded-[var(--radius-lg)] anim-fade"
+            ref={viewportRef}
+            className="relative h-full min-h-0 min-w-0 overflow-hidden checker rounded-[var(--radius-lg)] anim-fade"
+            onPointerDown={handleViewportPointerDown}
+            onPointerMove={handleViewportPointerMove}
+            onPointerUp={handleViewportPointerUp}
+            onPointerCancel={handleViewportPointerUp}
             style={{
               border: '1px solid var(--border)',
               boxShadow:
                 '0 1px 0 rgba(255,255,255,0.04) inset, 0 24px 48px -12px rgba(0,0,0,0.5), 0 0 0 1px rgba(0,0,0,0.4)',
+              cursor: viewportCursor,
+              touchAction: 'none',
+              overscrollBehavior: 'none',
             }}
           >
-            <img
-              src={displayImageUrl}
-              alt=""
-              className="block h-full w-full object-contain anim-fade"
-              draggable={false}
-            />
-
-            <canvas
-              ref={canvasRef}
-              onMouseDown={handleMouseDown}
-              onMouseMove={handleMouseMove}
-              onMouseUp={handleMouseUp}
-              onMouseLeave={handleMouseLeave}
+            <div
+              className="absolute"
               style={{
-                position: 'absolute',
-                inset: 0,
-                width: '100%',
-                height: '100%',
-                cursor: inpaintState || isProcessing ? 'default' : 'crosshair',
-                touchAction: 'none',
-                pointerEvents: inpaintState || isProcessing ? 'none' : 'auto',
+                left: view.panX,
+                top: view.panY,
+                width: contentW,
+                height: contentH,
               }}
-            />
+            >
+              <img
+                src={displayImageUrl}
+                alt=""
+                width={dimensions.width}
+                height={dimensions.height}
+                className="anim-fade block"
+                draggable={false}
+                style={{
+                  width: contentW,
+                  height: contentH,
+                  maxWidth: 'none',
+                  maxHeight: 'none',
+                }}
+              />
+
+              <canvas
+                ref={canvasRef}
+                onMouseDown={handleMouseDown}
+                onMouseMove={handleMouseMove}
+                onMouseUp={handleMouseUp}
+                onMouseLeave={handleMouseLeave}
+                style={{
+                  position: 'absolute',
+                  inset: 0,
+                  width: contentW,
+                  height: contentH,
+                  cursor: canvasCursor,
+                  touchAction: 'none',
+                  pointerEvents: inpaintState || isProcessing ? 'none' : 'auto',
+                }}
+              />
+            </div>
           </div>
         </div>
 
       {/* ── Sidebar ─────────────────────────────────────────────────────────── */}
       <div
-        className="flex min-h-0 shrink-0 flex-col"
+        className="flex min-h-0 shrink-0 flex-col overflow-hidden"
         style={{
           width: SIDEBAR_W,
+          minWidth: SIDEBAR_W,
+          maxWidth: SIDEBAR_W,
           borderLeft: '1px solid var(--border)',
           background: 'var(--bg)',
         }}
@@ -1555,7 +1955,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       </div>
 
       {/* Below-image meta row — outside the shared-height row */}
-      <div className="mt-4 mb-6 flex h-7 shrink-0 items-center gap-3 px-6">
+      <div className="mb-6 mt-4 flex min-h-7 shrink-0 flex-wrap items-center gap-3 px-6">
         <div
           className="rounded-full border px-2.5 py-1 font-mono text-[11px]"
           style={{
@@ -1564,11 +1964,50 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
             color: 'var(--text-secondary)',
           }}
         >
-          {dimensions.width} × {dimensions.height}
+          {`${dimensions.width} × ${dimensions.height}`}
+        </div>
+        <div className="flex items-center gap-1">
+          <button
+            className="btn btn-ghost text-[12px]"
+            style={{ padding: '2px 8px', height: 28 }}
+            onClick={() => nudgeZoom(-1)}
+            title="Zoom out"
+          >
+            <Icons.Minus size={12} />
+          </button>
+          <button
+            className="btn btn-ghost font-mono text-[11px]"
+            style={{ padding: '2px 8px', height: 28, minWidth: 52 }}
+            onClick={() => setZoomPreset('full')}
+            title="Display at full resolution (100%)"
+          >
+            {`${zoomPct}%`}
+          </button>
+          <button
+            className="btn btn-ghost text-[12px]"
+            style={{ padding: '2px 8px', height: 28 }}
+            onClick={() => nudgeZoom(1)}
+            title="Zoom in"
+          >
+            <Icons.Plus size={12} />
+          </button>
+          <button
+            className="btn btn-ghost text-[12px]"
+            style={{ padding: '2px 8px', height: 28 }}
+            onClick={() => setZoomPreset('fit')}
+            title="Fit the whole image in the frame"
+          >
+            Fit
+          </button>
         </div>
         {drag && !drag.committed && (
           <span className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
             Release to confirm selection
+          </span>
+        )}
+        {!drag?.committed && !inpaintState && (
+          <span className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
+            Two-finger drag to pan · Pinch or +/− to zoom
           </span>
         )}
       </div>
