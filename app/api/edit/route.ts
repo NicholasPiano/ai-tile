@@ -66,10 +66,10 @@ function extractImageFromAny(node: unknown): string | null {
  *     globalPlanUrl     — the 'plan' phase result to compare against
  *
  *   phase: 'refine'
- *     imageDataUrl      — full-res tile with plan content baked in + blue border
+ *     imageDataUrl      — full-res tile: hard plan in the selection, crisp
+ *                         source (or earlier tiles) in the context ring
  *     editPrompt        — original edit description, passed only as loose context
- *                         (reference images are NOT sent for this phase — the
- *                         blurry plan crop is the only content signal a tile needs)
+ *                         (reference images are NOT sent for this phase)
  *
  * All phases return { resultUrl: string }.
  */
@@ -170,8 +170,8 @@ export async function POST(request: NextRequest) {
       ]
 
       // Reference images only apply to the global plan — they steer overall
-      // composition/style. Tiles refine an already-decided blurry preview and
-      // must not be pulled back toward the global style brief.
+      // composition/style. Tiles refine the approved plan crop and must not
+      // be pulled back toward the global style brief.
       if (phase === 'plan' && Array.isArray(referenceImages)) {
         for (const ref of referenceImages) {
           if (ref.dataUrl) {

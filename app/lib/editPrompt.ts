@@ -95,18 +95,10 @@ export interface TilePositionContext {
 /**
  * Prompt for per-tile high-resolution refinement.
  *
- * The model receives a single image where the edit zone contains blurry pixels
- * (softened, upscaled plan content) and everything outside is crisp — either
- * original source or, at shared edges, already-sharpened neighbouring tiles.
- * The blurry / crisp contrast is the sole zone marker — no border annotation.
- *
- * This is a super-resolution / detail pass, NOT a second inpaint. The global
- * plan already decided composition and content; this stage's only job is to
- * render the blurry preview at full resolution, matching the crisp
- * surroundings. The original edit description is included purely as loose
- * context — a tile is often a small, cropped fragment of the full selection
- * (sometimes an almost-featureless sliver of it) and must NOT be redrawn as
- * if it had to depict the whole instruction on its own.
+ * The model receives a single image: the approved global plan, upscaled
+ * into the selection with no extra blur, and crisp original (or already
+ * refined neighbour) pixels outside that selection. This is a detail pass,
+ * not a second inpaint — composition is already decided.
  */
 export function buildTileRefinementPrompt(
   editDescription: string,
@@ -115,34 +107,32 @@ export function buildTileRefinementPrompt(
   const lines = [
     'You are an expert photo detail-enhancement tool performing a super-resolution pass.',
     '',
-    'You have been given an image. Part of it is BLURRY — a low-resolution preview',
-    'of already-decided content. Everything else is CRISP — leave those pixels',
-    'exactly unchanged.',
+    'You have been given an image. Part of it is a LOWER-RESOLUTION COMPOSITION PLAN',
+    'of already-decided content (upscaled in place, not blurred). Everything else is',
+    'CRISP original or already-refined pixels — leave those pixels exactly unchanged.',
     '',
-    'YOUR ONLY JOB: sharpen the blurry area into full-resolution detail that matches',
-    'what it is already previewing. This is NOT a request to invent new content —',
-    'the composition, shapes, and colours in the blurry area are already correct;',
-    'you are only adding resolution and texture.',
+    'YOUR ONLY JOB: redraw the planned area at full resolution as a faithful, detailed',
+    'version of that exact plan — same shapes, same colours, same layout — now sharp',
+    'and richly detailed, blending seamlessly with the crisp surroundings.',
+    'This is NOT a request to invent new content.',
     '',
     'TASK:',
-    '1. Find the blurry area.',
-    '2. Redraw it at full resolution as a faithful, detailed version of that exact',
-    '   blurry content — same shapes, same colours, same layout — now sharp and',
-    '   richly detailed, blending seamlessly with the crisp surroundings.',
+    '1. Find the planned (lower-resolution) area.',
+    '2. Redraw it at full native detail without changing composition.',
     '3. Leave every crisp pixel unchanged.',
     '',
     'The crisp pixels define the rendering style — match their texture, lighting,',
     'colour, and level of detail exactly in the redrawn area.',
     '',
-    'Do NOT copy or shift content from the crisp area into the blurry area.',
-    'Do NOT add objects, shapes, or scene elements that are not already implied by',
-    'the blurry preview, even if they would fit the description below.',
+    'Do NOT copy or shift content from the crisp area into the planned area.',
+    'Do NOT add objects, shapes, or scene elements that are not already in the plan,',
+    'even if they would fit the description below.',
     '',
     `For loose context only, this tile is a small crop from a larger edit whose`,
     `overall goal was: "${editDescription}". This tile may show only a tiny,`,
     'unremarkable fragment of that larger edit (e.g. plain sky, a patch of texture,',
     'or empty background) — if so, that is correct and expected. Use the',
-    'description only to resolve genuine ambiguity in the blurry pixels; never as',
+    'description only to resolve genuine ambiguity in the plan; never as',
     'a reason to depict the full instruction within this one tile.',
   ]
 

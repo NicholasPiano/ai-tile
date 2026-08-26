@@ -177,6 +177,23 @@ function clampRect(r: ImageRect, bounds: ImageRect): ImageRect {
   return { x, y, w: x2 - x, h: y2 - y }
 }
 
+/**
+ * Snap a rect to integer image pixels so the plan canvas, tile grid, and
+ * Accept stamp all share the same coordinates.
+ */
+function snapImageRect(r: ImageRect): ImageRect {
+  const x = Math.round(r.x)
+  const y = Math.round(r.y)
+  const x2 = Math.round(r.x + r.w)
+  const y2 = Math.round(r.y + r.h)
+  return {
+    x,
+    y,
+    w: Math.max(1, x2 - x),
+    h: Math.max(1, y2 - y),
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Viewport zoom / pan (CSS pixels; zoom 1 = one image pixel per CSS pixel)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -554,16 +571,16 @@ export interface EditStudioProps {
  *   1. Generate → buildGlobalPlanInput once, then INPAINT_VARIANT_COUNT
  *        parallel /api/edit 'plan' calls (same settings) → variants[]
  *   2.          → computeChangeMask per variant (client-side pixel diff)
- *   3.          → buildGlobalInpaintComposite per variant: softened tile
- *                 guide only (change-mask + blur). Display / Accept use
- *                 stampPlanIntoContextCanvas — a hard overwrite of the plan.
+ *   3.          → buildGlobalInpaintComposite per variant: hard plan inside
+ *                 the selection (no extra blur), crisp source in the ring.
+ *                 Display / Accept use stampPlanIntoContextCanvas.
  *   Fast path (context ≤ MAX_AI_DIMENSION): the hard plan stamp IS the
  *     final result — no refine pass needed, jump straight to phase 'done'.
  *   Full path (context > MAX_AI_DIMENSION):
  *   3a.         → planInpaintTiles (phase → 'tiling', idle)
- *   4. Per tile (manual): cropInpaintTileInput (plain crop from the softened
- *        guide + earlier tiles) → /api/edit 'refine' → compositeInpaintTileResult
- *        (hard overwrite of maskSubRect onto the hard plan stamp)
+ *   4. Per tile (manual): cropInpaintTileInput (plain crop from the hard
+ *        plan guide + earlier tiles) → /api/edit 'refine' → compositeInpaintTileResult
+ *        (aligned overwrite of maskSubRect onto the hard plan stamp)
  *   5. Accept → stitchedPreviewUrl (same overwrite the user is looking at)
  *
  * Re-run controls exist for the plan (cascades to mask/tiles), the mask
@@ -613,13 +630,14 @@ async function requestGlobalPlan(args: {
 async function buildVariantFromPlan(args: {
   image: string
   contextRect: { x: number; y: number; w: number; h: number }
+  selectionRect: { x: number; y: number; w: number; h: number }
   lowResContextUrl: string | null
   globalPlanUrl: string
   globalPlanScale: number
   tileCount: number
 }): Promise<{
   variant: InpaintVariant
-  /** Softened change-mask composite — tile-refine guide only, never Accept. */
+  /** Hard plan in the selection — tile-refine guide. */
   canvas: HTMLCanvasElement
   /** Hard plan overwrite — display / Accept / tile-merge base. */
   hardCanvas: HTMLCanvasElement
@@ -642,13 +660,11 @@ async function buildVariantFromPlan(args: {
     args.image,
     args.contextRect,
     args.globalPlanUrl,
-    args.globalPlanScale,
-    changeMaskCanvas,
+    args.selectionRect,
   )
 
   // Display / Accept merge: the plan crop pasted into the source. The
-  // softened `canvas` stays the tile-guide working layer — it is not
-  // shown and must not be what Accept writes back.
+  // `canvas` is the tile-refine guide (same plan, no extra blur).
   const hardCanvas = await stampPlanIntoContextCanvas(
     args.image,
     args.contextRect,
@@ -707,8 +723,8 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     Array.from({ length: INPAINT_VARIANT_COUNT }, () => null),
   )
   /**
-   * Softened change-mask plan composite per variant. Tile refine crops
-   * from this guide plus earlier tiles — it is not shown or accepted.
+   * Hard plan-in-selection canvas per variant. Tile refine crops from
+   * this guide plus earlier tiles — it is not shown or accepted.
    */
   const inpaintBaseCanvasByVariantRef = useRef<Array<HTMLCanvasElement | null>>(
     Array.from({ length: INPAINT_VARIANT_COUNT }, () => null),
@@ -908,10 +924,10 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     if (!drag?.committed || !image || !dimensions) return
 
     const imageBounds: ImageRect = { x: 0, y: 0, w: dimensions.width, h: dimensions.height }
-    const sel = selectionFromDrag(drag, imageBounds)
+    const sel = snapImageRect(selectionFromDrag(drag, imageBounds))
     if (sel.w < 1 || sel.h < 1) return
 
-    const contextRect = outsetRect(sel, EDIT_STRIP_PX, imageBounds)
+    const contextRect = snapImageRect(outsetRect(sel, EDIT_STRIP_PX, imageBounds))
 
     buildLowResContextCrop(image, contextRect).then(({ dataUrl }) => {
       // Annotated preview: draw the selection box on top of the clean crop.
@@ -1106,10 +1122,10 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     if (!drag?.committed || !dimensions || inpaintState) return
 
     const imageBounds: ImageRect = { x: 0, y: 0, w: dimensions.width, h: dimensions.height }
-    const sel = selectionFromDrag(drag, imageBounds)
+    const sel = snapImageRect(selectionFromDrag(drag, imageBounds))
     if (sel.w < 1 || sel.h < 1) return
 
-    const contextRect = outsetRect(sel, EDIT_STRIP_PX, imageBounds)
+    const contextRect = snapImageRect(outsetRect(sel, EDIT_STRIP_PX, imageBounds))
 
     const region: InpaintRegion = {
       selectionRect: sel,
@@ -1231,6 +1247,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
             buildVariantFromPlan({
               image,
               contextRect,
+              selectionRect: region.selectionRect,
               lowResContextUrl,
               globalPlanUrl: plan.globalPlanUrl,
               globalPlanScale: plan.globalPlanScale,
@@ -1369,6 +1386,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       const built = await buildVariantFromPlan({
         image,
         contextRect,
+        selectionRect: region.selectionRect,
         lowResContextUrl,
         globalPlanUrl: plan.globalPlanUrl,
         globalPlanScale: plan.globalPlanScale,

@@ -5980,8 +5980,10 @@ export function planInpaintTiles(
   maxDimension: number = 1536,
   overlapPx: number = 384,
 ): InpaintTilePlan {
-  const colPlan = planTilingAxis(contextW, maxDimension, overlapPx)
-  const rowPlan = planTilingAxis(contextH, maxDimension, overlapPx)
+  const width = Math.max(1, Math.round(contextW))
+  const height = Math.max(1, Math.round(contextH))
+  const colPlan = planTilingAxis(width, maxDimension, overlapPx)
+  const rowPlan = planTilingAxis(height, maxDimension, overlapPx)
 
   const tiles: InpaintTileSpec[] = []
 
@@ -6001,10 +6003,10 @@ export function planInpaintTiles(
       }
 
       // Intersect the mask with this tile's bounds in context-perimeter coords.
-      const iX1 = Math.max(maskRect.x, x)
-      const iY1 = Math.max(maskRect.y, y)
-      const iX2 = Math.min(maskRect.x + maskRect.w, x + w)
-      const iY2 = Math.min(maskRect.y + maskRect.h, y + h)
+      const iX1 = Math.max(Math.round(maskRect.x), x)
+      const iY1 = Math.max(Math.round(maskRect.y), y)
+      const iX2 = Math.min(Math.round(maskRect.x + maskRect.w), x + w)
+      const iY2 = Math.min(Math.round(maskRect.y + maskRect.h), y + h)
 
       // Convert intersection to tile-local coordinates.
       const maskSubRect: InpaintTileSpec['maskSubRect'] =
@@ -6022,7 +6024,7 @@ export function planInpaintTiles(
     }
   }
 
-  return { tiles, contextW, contextH }
+  return { tiles, contextW: width, contextH: height }
 }
 
 /**
@@ -6064,9 +6066,8 @@ export async function buildLowResContextCrop(
  *   - Changed pixels  → fully opaque   (RGBA [255, 255, 255, 255])
  *   - Unchanged pixels → fully transparent (RGBA [0, 0, 0, 0])
  *
- * This mask is used by buildGlobalInpaintComposite to decide, for each pixel
- * inside the selection, whether to show the softened plan (changed) or the
- * crisp source (unchanged). The result replaces the LLM mask-extraction call.
+ * This mask is a sidebar visualisation only. Tile refine now crops from a
+ * hard plan-in-selection canvas, not from a change-mask composite.
  *
  * @param threshold  Per-channel maximum difference considered "same".
  *                   Default 10 absorbs JPEG compression noise in the plan
@@ -6205,106 +6206,52 @@ export async function buildChangeMaskVisuals(
 
 
 /**
- * Build the shared full-resolution composite for the tiled inpaint pass.
+ * Build the shared full-resolution canvas that tile refine crops from.
  *
- *   1. Base layer: crisp source pixels for the ENTIRE context region.
- *   2. Plan layer: the global plan image upscaled to full context resolution,
- *      with an adaptive blur applied — the blur radius scales with how much
- *      upscaling is actually happening (mirrors `drawSoftenedPlanningGuide`
- *      in the extend pipeline), so a plan crop close to native resolution
- *      gets little/no extra softening while a heavily-upscaled low-res plan
- *      gets enough to hide blocky resampling artifacts.
- *   3. Feathered mask: the raw pixel-diff change mask is blurred before use
- *      so the plan layer fades in/out smoothly across the diff boundary
- *      instead of a hard, jagged cut — and so the transition band straddles
- *      rather than sits exactly on the boundary.
- *   4. The masked, softened plan layer is composited over the crisp base —
- *      pixels the plan left unchanged keep their crisp source values.
- *
- * Deliberately NOT clipped to the user's selection rectangle: the change
- * mask (step 3) is the sole authority on what shows plan content. If the
- * model legitimately changed a few pixels just outside the drawn selection
- * (e.g. a shadow or highlight blending into the context band), those pixels
- * are allowed through rather than forced back to crisp source. Tiles that
- * have no overlap with the selection at all are still skipped upstream by
- * `planInpaintTiles`/`generateTile`, so this only affects bleed near the
- * selection boundary, not the whole context ring.
- *
- * Building this ONCE at full context resolution (rather than independently
- * per tile) guarantees every tile crops identical shared pixels in overlap
- * regions, eliminating a source of tile-to-tile seam mismatch. It also lets
- * `cropInpaintTileInput` reduce tile-input construction to a plain crop —
- * mirroring `buildTileInput` in the extend pipeline, which crops directly
- * from the shared running band canvas.
+ * Crisp source everywhere, then the global plan drawn at full context size
+ * with high-quality upsample only — no extra blur or mask feather — clipped
+ * to the selection. That is as close to the approved plan as we can feed
+ * the model while keeping the original context ring locked.
  */
 export async function buildGlobalInpaintComposite(
   sourceImageUrl: string,
   contextRect: { x: number; y: number; w: number; h: number },
   planImageUrl: string,
-  /** Context-pixel → plan-pixel scale factor from buildGlobalPlanInput. */
-  globalPlanScale: number,
-  /** Per-pixel diff mask from computeChangeMask. Changed pixels are opaque;
-   *  unchanged pixels are transparent. Null skips the plan layer entirely
-   *  (composite is pure crisp source). */
-  changeMask: HTMLCanvasElement | null,
+  selectionRect: { x: number; y: number; w: number; h: number },
 ): Promise<HTMLCanvasElement> {
   const [sourceImg, planImg] = await Promise.all([
     loadImageElement(sourceImageUrl),
     loadImageElement(planImageUrl),
   ])
 
-  const w = contextRect.w
-  const h = contextRect.h
+  const w = Math.max(1, Math.round(contextRect.w))
+  const h = Math.max(1, Math.round(contextRect.h))
+  const srcX = Math.round(contextRect.x)
+  const srcY = Math.round(contextRect.y)
 
   const composite = document.createElement('canvas')
   composite.width = w
   composite.height = h
   const cctx = composite.getContext('2d')
-  if (!cctx) return composite
-
-  // Step 1: crisp source base for the entire context region.
-  cctx.drawImage(sourceImg, contextRect.x, contextRect.y, w, h, 0, 0, w, h)
-
-  if (!changeMask) return composite
-
-  const planLayer = document.createElement('canvas')
-  planLayer.width = w
-  planLayer.height = h
-  const pctx = planLayer.getContext('2d')
-  if (!pctx) return composite
-
-  // Step 2: plan layer upscaled to full context resolution, with adaptive
-  // blur proportional to the upscale factor (context-pixel / plan-pixel).
-  const upscale = globalPlanScale > 0 ? 1 / globalPlanScale : 1
-  const blurPx = upscale > 1.25
-    ? Math.min(48, Math.max(8, Math.round(upscale * 1.5)))
-    : 0
-
-  pctx.imageSmoothingEnabled = true
-  pctx.imageSmoothingQuality = 'high'
-  if (blurPx > 0) pctx.filter = `blur(${blurPx}px)`
-  pctx.drawImage(planImg, 0, 0, w, h)
-  pctx.filter = 'none'
-
-  // Step 3: feathered mask — blur softens the diff boundary into a gradient
-  // and spreads it slightly past the exact edge on both sides.
-  const featherPx = Math.max(8, Math.round(Math.min(w, h) * 0.015))
-  const maskLayer = document.createElement('canvas')
-  maskLayer.width = w
-  maskLayer.height = h
-  const mctx = maskLayer.getContext('2d')
-  if (mctx) {
-    mctx.filter = `blur(${featherPx}px)`
-    mctx.drawImage(changeMask, 0, 0, w, h)
-    mctx.filter = 'none'
-
-    pctx.globalCompositeOperation = 'destination-in'
-    pctx.drawImage(maskLayer, 0, 0)
-    pctx.globalCompositeOperation = 'source-over'
+  if (!cctx) {
+    return composite
   }
 
-  // Step 4: composite the masked, softened plan layer over the crisp base.
-  cctx.drawImage(planLayer, 0, 0)
+  cctx.drawImage(sourceImg, srcX, srcY, w, h, 0, 0, w, h)
+
+  const selX = Math.round(selectionRect.x - contextRect.x)
+  const selY = Math.round(selectionRect.y - contextRect.y)
+  const selW = Math.max(1, Math.round(selectionRect.w))
+  const selH = Math.max(1, Math.round(selectionRect.h))
+
+  cctx.save()
+  cctx.beginPath()
+  cctx.rect(selX, selY, selW, selH)
+  cctx.clip()
+  cctx.imageSmoothingEnabled = true
+  cctx.imageSmoothingQuality = 'high'
+  cctx.drawImage(planImg, 0, 0, w, h)
+  cctx.restore()
 
   return composite
 }
@@ -6314,21 +6261,24 @@ export async function buildGlobalInpaintComposite(
  *
  * Mirrors `buildTileInput` in the extend pipeline: by the time a tile is
  * generated, the running canvas already contains the global composite (crisp
- * source + softened plan-in-mask) plus the sharpened results of any
- * already-processed neighbour tiles (per the scan-order feathering in
- * `planInpaintTiles`), so a plain crop gives the model real neighbour context
- * for free — no per-tile reconstruction of blur or masking is needed.
+ * source + hard plan in the selection) plus the sharpened results of any
+ * already-processed neighbour tiles, so a plain crop gives the model real
+ * neighbour context for free.
  */
 export function cropInpaintTileInput(
   runningCanvas: HTMLCanvasElement,
   tileSpec: { x: number; y: number; w: number; h: number },
 ): string {
+  const x = Math.round(tileSpec.x)
+  const y = Math.round(tileSpec.y)
+  const w = Math.max(1, Math.round(tileSpec.w))
+  const h = Math.max(1, Math.round(tileSpec.h))
   const tile = document.createElement('canvas')
-  tile.width = tileSpec.w
-  tile.height = tileSpec.h
+  tile.width = w
+  tile.height = h
   const ctx = tile.getContext('2d')
   if (!ctx) return ''
-  ctx.drawImage(runningCanvas, tileSpec.x, tileSpec.y, tileSpec.w, tileSpec.h, 0, 0, tileSpec.w, tileSpec.h)
+  ctx.drawImage(runningCanvas, x, y, w, h, 0, 0, w, h)
   return tile.toDataURL('image/jpeg', 0.92)
 }
 
@@ -6343,121 +6293,171 @@ function forceImageDataOpaque(imageData: ImageData): void {
   }
 }
 
+/** Max integer shift (px) when registering a refine result onto the plan. */
+const INPAINT_TILE_ALIGN_RADIUS = 24
+
+/**
+ * Mean squared RGB error between `result` shifted by `(dx, dy)` and
+ * `reference`. Samples every `step` pixel. Coordinates: `reference(x, y)`
+ * is compared to `result(x - dx, y - dy)` — the same convention as drawing
+ * the result at `(dx, dy)` on the destination.
+ */
+function scoreInpaintTileOffset(
+  result: ImageData,
+  reference: ImageData,
+  dx: number,
+  dy: number,
+  step: number,
+): number {
+  const w = reference.width
+  const h = reference.height
+  const a = result.data
+  const b = reference.data
+  let sum = 0
+  let n = 0
+  for (let y = 0; y < h; y += step) {
+    for (let x = 0; x < w; x += step) {
+      const sx = x - dx
+      const sy = y - dy
+      if (sx < 0 || sy < 0 || sx >= w || sy >= h) {
+        continue
+      }
+      const i = (y * w + x) * 4
+      const j = (sy * w + sx) * 4
+      const dr = a[j] - b[i]
+      const dg = a[j + 1] - b[i + 1]
+      const db = a[j + 2] - b[i + 2]
+      sum += dr * dr + dg * dg + db * db
+      n += 1
+    }
+  }
+  return n === 0 ? Number.POSITIVE_INFINITY : sum / n
+}
+
+/**
+ * Find the integer offset that registers a stretched refine result onto the
+ * current band crop (the plan). Coarse step-2 search, then a 1 px refine.
+ */
+function findInpaintTileAlignOffset(
+  result: ImageData,
+  reference: ImageData,
+  radius: number,
+): { x: number; y: number } {
+  let best = { x: 0, y: 0 }
+  let bestScore = scoreInpaintTileOffset(result, reference, 0, 0, 8)
+  for (let dy = -radius; dy <= radius; dy += 2) {
+    for (let dx = -radius; dx <= radius; dx += 2) {
+      if (dx === 0 && dy === 0) {
+        continue
+      }
+      const score = scoreInpaintTileOffset(result, reference, dx, dy, 8)
+      if (score < bestScore) {
+        bestScore = score
+        best = { x: dx, y: dy }
+      }
+    }
+  }
+  const cx = best.x
+  const cy = best.y
+  for (let dy = cy - 1; dy <= cy + 1; dy++) {
+    for (let dx = cx - 1; dx <= cx + 1; dx++) {
+      const score = scoreInpaintTileOffset(result, reference, dx, dy, 2)
+      if (score < bestScore) {
+        bestScore = score
+        best = { x: dx, y: dy }
+      }
+    }
+  }
+  return best
+}
+
 /**
  * Composite a tile result into the running inpaint canvas as a straight
- * overwrite of the selection intersection (`maskSubRect`). The context ring
- * stays original; the edited pixels are the model's RGB at full opacity —
- * no source-underlay, no feather, so the original cannot ghost through.
+ * overwrite of the selection intersection (`maskSubRect`) only.
+ *
+ * The model often returns a slightly shifted or differently sized frame.
+ * We stretch to the tile size, register against the current band crop
+ * (the plan), then write only the aligned selection — never the context
+ * ring, which would wipe the plan and overlapping neighbour tiles.
  */
 export async function compositeInpaintTileResult(
   inpaintCanvas: HTMLCanvasElement,
-  sourceImageUrl: string,
+  _sourceImageUrl: string,
   tileResultUrl: string,
   tileSpec: InpaintTileSpec,
-  contextRect: { x: number; y: number; w: number; h: number },
+  _contextRect: { x: number; y: number; w: number; h: number },
 ): Promise<void> {
-  const { x: tX, y: tY, w: tW, h: tH, maskSubRect } = tileSpec
-
-  const [tileResultImg, sourceImg] = await Promise.all([
-    loadImageElement(tileResultUrl),
-    loadImageElement(sourceImageUrl),
-  ])
-
-  const tileCanvas = document.createElement('canvas')
-  tileCanvas.width = tW
-  tileCanvas.height = tH
-  const tileCtx = tileCanvas.getContext('2d')
-
-  if (tileCtx) {
-    // Context ring: keep the original source pixels outside the selection.
-    tileCtx.drawImage(sourceImg, contextRect.x + tX, contextRect.y + tY, tW, tH, 0, 0, tW, tH)
-
-    if (maskSubRect) {
-      const msX = Math.max(0, Math.floor(maskSubRect.x))
-      const msY = Math.max(0, Math.floor(maskSubRect.y))
-      const msW = Math.max(1, Math.min(tW - msX, Math.ceil(maskSubRect.w)))
-      const msH = Math.max(1, Math.min(tH - msY, Math.ceil(maskSubRect.h)))
-
-      // Draw the AI tile into a scratch canvas, then replace the selection
-      // intersection with those RGB values at alpha 255 — never source-over
-      // onto the original, which left ghosts where the model was translucent.
-      const scratch = document.createElement('canvas')
-      scratch.width = tW
-      scratch.height = tH
-      const scratchCtx = scratch.getContext('2d')
-      if (scratchCtx) {
-        scratchCtx.drawImage(tileResultImg, 0, 0, tW, tH)
-        const opaqueEdit = scratchCtx.getImageData(msX, msY, msW, msH)
-        forceImageDataOpaque(opaqueEdit)
-        tileCtx.putImageData(opaqueEdit, msX, msY)
-      }
-    }
-
-    console.log(
-      '[imageProcessor] tileResult natural dimensions:',
-      tileResultImg.naturalWidth, '×', tileResultImg.naturalHeight,
-      '| tile target:', tW, '×', tH,
-    )
+  const maskSubRect = tileSpec.maskSubRect
+  if (!maskSubRect) {
+    return
   }
 
+  const destX = Math.round(tileSpec.x)
+  const destY = Math.round(tileSpec.y)
+  const tileW = Math.max(1, Math.round(tileSpec.w))
+  const tileH = Math.max(1, Math.round(tileSpec.h))
+
+  const tileResultImg = await loadImageElement(tileResultUrl)
   const bandCtx = inpaintCanvas.getContext('2d')
   if (!bandCtx) {
     console.warn('[imageProcessor] compositeInpaintTileResult: could not get 2d context for inpaintCanvas')
     return
   }
 
-  if (!maskSubRect) {
+  // Current band crop is the registration target (hard or soft plan).
+  const reference = document.createElement('canvas')
+  reference.width = tileW
+  reference.height = tileH
+  const refCtx = reference.getContext('2d')
+  if (!refCtx) {
     return
   }
+  refCtx.drawImage(inpaintCanvas, destX, destY, tileW, tileH, 0, 0, tileW, tileH)
 
-  bandCtx.drawImage(tileCanvas, 0, 0, tW, tH, tX, tY, tW, tH)
-
-  // ── Diagnostic: trace the edit through each stage at the selection centre ──
-  //   src        = original source pixel
-  //   result     = raw model output (fresh draw, no compositing)
-  //   tileCanvas = AI tile after opaque selection overwrite (pre-band)
-  //   band       = pixel actually written into the running canvas
-  // Interpretation:
-  //   tileCanvas ≈ src               → the feather step wiped the edit.
-  //   tileCanvas ≈ result, band ≈ src → the band crop-draw isn't landing.
-  //   band ≈ result                  → the edit is composited correctly.
-  type Rgba = [number, number, number, number]
-  const readPixel = (ctx: CanvasRenderingContext2D, x: number, y: number): Rgba => {
-    const d = ctx.getImageData(x, y, 1, 1).data
-    return [d[0], d[1], d[2], d[3]]
+  const stretched = document.createElement('canvas')
+  stretched.width = tileW
+  stretched.height = tileH
+  const stretchCtx = stretched.getContext('2d')
+  if (!stretchCtx) {
+    return
   }
-  const tileCx = Math.min(Math.floor(tW) - 1, Math.floor(maskSubRect.x + maskSubRect.w / 2))
-  const tileCy = Math.min(Math.floor(tH) - 1, Math.floor(maskSubRect.y + maskSubRect.h / 2))
-  const bandCx = Math.min(inpaintCanvas.width - 1, Math.floor(tX + maskSubRect.x + maskSubRect.w / 2))
-  const bandCy = Math.min(inpaintCanvas.height - 1, Math.floor(tY + maskSubRect.y + maskSubRect.h / 2))
+  stretchCtx.drawImage(tileResultImg, 0, 0, tileW, tileH)
 
-  const sample = (draw: (c: CanvasRenderingContext2D) => void): Rgba => {
-    const c = document.createElement('canvas')
-    c.width = Math.max(1, Math.floor(tW))
-    c.height = Math.max(1, Math.floor(tH))
-    const cc = c.getContext('2d')
-    if (!cc) {
-      return [0, 0, 0, 0]
-    }
-    draw(cc)
-    return readPixel(cc, tileCx, tileCy)
-  }
-  const srcPx: Rgba = sample((c) =>
-    c.drawImage(sourceImg, contextRect.x + tX, contextRect.y + tY, tW, tH, 0, 0, tW, tH),
+  const resultData = stretchCtx.getImageData(0, 0, tileW, tileH)
+  const referenceData = refCtx.getImageData(0, 0, tileW, tileH)
+  const offset = findInpaintTileAlignOffset(
+    resultData,
+    referenceData,
+    INPAINT_TILE_ALIGN_RADIUS,
   )
-  const resultPx: Rgba = sample((c) => c.drawImage(tileResultImg, 0, 0, tW, tH))
-  const tilePx: Rgba = tileCtx ? readPixel(tileCtx, tileCx, tileCy) : [-1, -1, -1, -1]
-  const bandPx: Rgba = readPixel(bandCtx, bandCx, bandCy)
 
-  const rgbaToStr = (px: Rgba): string => `[${px[0]}, ${px[1]}, ${px[2]}, ${px[3]}]`
+  // Shift the refine result onto the plan, then copy only the selection.
+  const aligned = document.createElement('canvas')
+  aligned.width = tileW
+  aligned.height = tileH
+  const alignedCtx = aligned.getContext('2d')
+  if (!alignedCtx) {
+    return
+  }
+  alignedCtx.drawImage(reference, 0, 0)
+  alignedCtx.drawImage(stretched, offset.x, offset.y)
+
+  const msX = Math.max(0, Math.round(maskSubRect.x))
+  const msY = Math.max(0, Math.round(maskSubRect.y))
+  const msW = Math.max(1, Math.min(tileW - msX, Math.round(maskSubRect.w)))
+  const msH = Math.max(1, Math.min(tileH - msY, Math.round(maskSubRect.h)))
+
+  const opaqueEdit = alignedCtx.getImageData(msX, msY, msW, msH)
+  forceImageDataOpaque(opaqueEdit)
+  bandCtx.putImageData(opaqueEdit, destX + msX, destY + msY)
+
   console.log(
     [
-      '[imageProcessor] edit trace (r,g,b,a):',
-      `src=${rgbaToStr(srcPx)}`,
-      `result=${rgbaToStr(resultPx)}`,
-      `tileCanvas=${rgbaToStr(tilePx)}`,
-      `band=${rgbaToStr(bandPx)}`,
-      `| tile(${tileCx},${tileCy}) band(${bandCx},${bandCy})`,
+      '[imageProcessor] inpaint tile align:',
+      `${tileResultImg.naturalWidth}×${tileResultImg.naturalHeight}`,
+      `→ ${tileW}×${tileH}`,
+      `offset (${offset.x},${offset.y})`,
+      `stamp (${destX + msX},${destY + msY}) ${msW}×${msH}`,
     ].join(' '),
   )
 }
@@ -6651,8 +6651,8 @@ export async function stampPlanIntoContextCanvas(
   // Original context as the fallback under the plan, then replace it.
   ctx.drawImage(
     sourceImg,
-    contextRect.x,
-    contextRect.y,
+    Math.round(contextRect.x),
+    Math.round(contextRect.y),
     destW,
     destH,
     0,

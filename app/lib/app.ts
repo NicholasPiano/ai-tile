@@ -356,7 +356,7 @@ export function nextFilledTileVersionIdx(slot: InpaintTileSlot, delta: 1 | -1): 
 export interface InpaintVariant {
   /**
    * Scale factor from context-perimeter pixels to global-plan image pixels.
-   * Computed by buildGlobalPlanInput and used by buildGlobalInpaintComposite.
+   * Computed by buildGlobalPlanInput (context-pixel → plan-pixel).
    */
   globalPlanScale: number
   /** LLM global plan result URL (low-res, from the 'plan' API call). */
