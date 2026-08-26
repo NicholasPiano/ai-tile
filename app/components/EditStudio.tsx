@@ -7,7 +7,6 @@ import {
   INPAINT_VARIANT_COUNT,
   MAX_AI_DIMENSION,
   createEmptyInpaintTileSlots,
-  createEmptyInpaintVariant,
   createEmptyInpaintVariants,
   nextFilledTileVersionIdx,
   selectedInpaintVariant,
@@ -1326,111 +1325,17 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   )
 
   /**
-   * Re-run ONLY the currently selected variant's plan. Other variants keep
-   * their plan, mask, canvas, and tiles. This variant's tiles are cleared
-   * because they were based on the old plan.
+   * Re-run all four plan options with the current description, same as
+   * the first Generate. Existing tiles are cleared because they belonged
+   * to the old plans.
    */
   const handleRerunPlan = useCallback(async (editPrompt: string) => {
     if (!inpaintState || !image) {
       return
     }
-    const variantIdx = inpaintState.selectedVariantIdx
-    const previousVariant = inpaintState.variants[variantIdx]
-    const previousCanvas = inpaintCanvasByVariantRef.current[variantIdx] ?? null
-    const previousBase = inpaintBaseCanvasByVariantRef.current[variantIdx] ?? null
-    const previousHard = inpaintHardCanvasByVariantRef.current[variantIdx] ?? null
-    const previousMask = changeMaskCanvasByVariantRef.current[variantIdx] ?? null
-    if (!previousVariant) {
-      return
-    }
-
-    const { region, referenceImages, lowResContextUrl, tilePlan } = inpaintState
     const nextEditPrompt = editPrompt.trim() || inpaintState.editPrompt
-    const { contextRect } = region
-    const tileCount = tilePlan?.tiles.length ?? 0
-
-    inpaintCanvasByVariantRef.current[variantIdx] = null
-    inpaintBaseCanvasByVariantRef.current[variantIdx] = null
-    inpaintHardCanvasByVariantRef.current[variantIdx] = null
-    changeMaskCanvasByVariantRef.current[variantIdx] = null
-    setInpaintState((prev) => {
-      if (!prev) {
-        return null
-      }
-      const variants = [...prev.variants]
-      variants[variantIdx] = createEmptyInpaintVariant()
-      return {
-        ...prev,
-        phase: 'planning',
-        editPrompt: nextEditPrompt,
-        error: null,
-        variants,
-        generatingTileIdx: null,
-      }
-    })
-
-    try {
-      const { dataUrl, scale } = await buildGlobalPlanInput(
-        image,
-        contextRect,
-        region.selectionRect,
-      )
-      const plan = await requestGlobalPlan({
-        dataUrl,
-        scale,
-        editPrompt: nextEditPrompt,
-        referenceImages,
-        apiKey,
-        model,
-      })
-      const built = await buildVariantFromPlan({
-        image,
-        contextRect,
-        selectionRect: region.selectionRect,
-        lowResContextUrl,
-        globalPlanUrl: plan.globalPlanUrl,
-        globalPlanScale: plan.globalPlanScale,
-        tileCount,
-      })
-
-      inpaintHardCanvasByVariantRef.current[variantIdx] = built.hardCanvas
-      inpaintCanvasByVariantRef.current[variantIdx] = cloneCanvas(built.hardCanvas)
-      inpaintBaseCanvasByVariantRef.current[variantIdx] = built.canvas
-      changeMaskCanvasByVariantRef.current[variantIdx] = built.changeMaskCanvas
-      setInpaintState((prev) => {
-        if (!prev) {
-          return null
-        }
-        const variants = [...prev.variants]
-        variants[variantIdx] = built.variant
-        return {
-          ...prev,
-          variants,
-          phase: prev.tilePlan ? 'tiling' : 'done',
-          generatingTileIdx: null,
-        }
-      })
-    } catch (e) {
-      inpaintCanvasByVariantRef.current[variantIdx] = previousCanvas
-      inpaintBaseCanvasByVariantRef.current[variantIdx] = previousBase
-      inpaintHardCanvasByVariantRef.current[variantIdx] = previousHard
-      changeMaskCanvasByVariantRef.current[variantIdx] = previousMask
-      setInpaintState((prev) => {
-        if (!prev) {
-          return null
-        }
-        const variants = [...prev.variants]
-        variants[variantIdx] = previousVariant
-        return {
-          ...prev,
-          variants,
-          phase: prev.tilePlan ? 'tiling' : 'done',
-          generatingTileIdx: null,
-          error: e instanceof Error ? e.message : 'Plan generation failed',
-        }
-      })
-    }
-  }, [inpaintState, image, apiKey, model])
+    await handleGenerate(nextEditPrompt, inpaintState.referenceImages)
+  }, [inpaintState, image, handleGenerate])
 
   // ── Callback: generate / re-run a single tile ──────────────────────────────
   // This is the ONLY path that produces tile pixels — tiles never run

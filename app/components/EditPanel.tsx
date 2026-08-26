@@ -21,9 +21,8 @@ export interface EditPanelProps {
   inpaintState: InpaintState
   onGenerate: (editPrompt: string, referenceImages: ReferenceImage[]) => void
   /**
-   * Re-run ONLY the selected variant's plan with the given description
-   * (new change mask, clears that variant's tiles). Other variants are
-   * left untouched.
+   * Re-run all four plan options with the given description (clears tiles),
+   * same pipeline as the first Generate.
    */
   onRerunPlan: (editPrompt: string) => void
   /** Generate or re-generate a single tile. */
@@ -480,7 +479,7 @@ export function EditPanel({
               className="btn btn-ghost w-full"
               disabled={isProcessing || !editPrompt.trim()}
               onClick={() => onRerunPlan(editPrompt)}
-              title="Re-generate only this variant's plan with this description (clears this variant's tiles)"
+              title="Re-generate all four plan options with this description (clears tiles)"
             >
               <Icons.Refresh size={13} />
               Re-run plan with this description
@@ -510,7 +509,7 @@ export function EditPanel({
                     style={{ padding: '2px 8px', height: 24 }}
                     onClick={() => onRerunPlan(editPrompt)}
                     disabled={isProcessing || !editPrompt.trim()}
-                    title="Re-generate only this variant's plan (clears this variant's tiles)"
+                    title="Re-generate all four plan options (clears tiles)"
                   >
                     <Icons.Refresh size={11} />
                     Re-run
