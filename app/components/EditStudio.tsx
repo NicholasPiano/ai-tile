@@ -3,12 +3,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   EDIT_STRIP_PX,
-  INPAINT_TILE_VARIANT_COUNT,
   INPAINT_VARIANT_COUNT,
   MAX_AI_DIMENSION,
   createEmptyInpaintTileSlots,
   createEmptyInpaintVariants,
-  nextFilledTileVersionIdx,
   selectedInpaintVariant,
   selectedTileResultUrl,
   tileSlotHasResult,
@@ -16,7 +14,6 @@ import {
   type InpaintState,
   type InpaintRegion,
   type InpaintTilePlan,
-  type InpaintTileSlot,
   type InpaintVariant,
   type ReferenceImage,
 } from '@/app/lib/app'
@@ -692,7 +689,7 @@ async function buildVariantFromPlan(args: {
 
 /**
  * Pixel-for-pixel copy of a canvas. Used to keep a pre-tile plan composite
- * so tile-version cycling can rebuild the stitch from a clean base.
+ * so a tile re-run can rebuild the stitch from a clean base.
  */
 function cloneCanvas(source: HTMLCanvasElement): HTMLCanvasElement {
   const copy = document.createElement('canvas')
@@ -729,8 +726,8 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     Array.from({ length: INPAINT_VARIANT_COUNT }, () => null),
   )
   /**
-   * Immutable hard plan overwrite per variant. Tile-version cycling
-   * rebuilds the Accept canvas from this plus selected tiles.
+   * Immutable hard plan overwrite per variant. Tile generate rebuilds
+   * the Accept canvas from this plus each tile's refine URL.
    */
   const inpaintHardCanvasByVariantRef = useRef<Array<HTMLCanvasElement | null>>(
     Array.from({ length: INPAINT_VARIANT_COUNT }, () => null),
@@ -1162,12 +1159,12 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
   /**
    * Rebuild a plan variant's Accept canvas from its hard plan stamp, then
-   * overwrite every tile's selected refine version in scan order.
+   * overwrite every tile's refine result in scan order.
    * Returns a full-image stitched preview URL, or null if the stamp is missing.
    */
   const rebuildVariantComposite = async (
     variantIdx: number,
-    tileSlots: InpaintTileSlot[],
+    tileSlots: Array<string | null>,
     tilePlan: InpaintTilePlan,
     sourceImage: string,
     contextRect: { x: number; y: number; w: number; h: number },
@@ -1392,29 +1389,24 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
           model,
         }
 
-        const versionUrls = await Promise.all(
-          Array.from({ length: INPAINT_TILE_VARIANT_COUNT }, async () => {
-            const tileRes = await fetch('/api/edit', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(requestBody),
-            })
-            const tileData = await tileRes.json() as { resultUrl?: string; error?: string }
-            if (!tileRes.ok || !tileData.resultUrl) {
-              throw new Error(tileData.error ?? 'Tile refinement failed')
-            }
-            return tileData.resultUrl
-          }),
-        )
-
-        const nextSlot: InpaintTileSlot = {
-          versions: versionUrls,
-          selectedIdx: 0,
+        /**
+         * One refine call. Extra samples are not useful here — the prompt
+         * tells the model to follow the selected plan.
+         */
+        const tileRes = await fetch('/api/edit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody),
+        })
+        const tileData = await tileRes.json() as { resultUrl?: string; error?: string }
+        if (!tileRes.ok || !tileData.resultUrl) {
+          throw new Error(tileData.error ?? 'Tile refinement failed')
         }
+
         const liveSlots =
           inpaintStateRef.current?.variants[variantIdx]?.tileResults ?? latestSlots
         const nextSlots = [...liveSlots]
-        nextSlots[idx] = nextSlot
+        nextSlots[idx] = tileData.resultUrl
 
         const stitchedPreviewUrl = await rebuildVariantComposite(
           variantIdx,
@@ -1474,66 +1466,6 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       await generateTile(idx)
     }
   }, [inpaintState, generateTile])
-
-  /**
-   * Cycle one tile's refine version (button-only). Rebuilds the running
-   * canvas and stitched preview from the plan base + every tile's current
-   * selection so the preview always matches the arrows.
-   */
-  const tileCycleLockRef = useRef(false)
-
-  const handleCycleTileVariant = useCallback(async (tileIdx: number, delta: 1 | -1) => {
-    if (!inpaintState || !image || !inpaintState.tilePlan) {
-      return
-    }
-    if (
-      tileCycleLockRef.current ||
-      inpaintState.generatingTileIdx !== null ||
-      inpaintState.phase === 'planning'
-    ) {
-      return
-    }
-    const variantIdx = inpaintState.selectedVariantIdx
-    const current = inpaintState.variants[variantIdx]
-    const slot = current?.tileResults[tileIdx]
-    if (!current || !slot || !tileSlotHasResult(slot)) {
-      return
-    }
-
-    const nextIdx = nextFilledTileVersionIdx(slot, delta)
-    if (nextIdx === slot.selectedIdx) {
-      return
-    }
-
-    const nextSlots = [...current.tileResults]
-    nextSlots[tileIdx] = { ...slot, selectedIdx: nextIdx }
-
-    tileCycleLockRef.current = true
-    try {
-      const stitchedPreviewUrl = await rebuildVariantComposite(
-        variantIdx,
-        nextSlots,
-        inpaintState.tilePlan,
-        image,
-        inpaintState.region.contextRect,
-      )
-
-      setInpaintState((prev) => {
-        if (!prev) {
-          return null
-        }
-        const variants = [...prev.variants]
-        const latest = variants[variantIdx]
-        if (!latest) {
-          return prev
-        }
-        variants[variantIdx] = { ...latest, tileResults: nextSlots, stitchedPreviewUrl }
-        return { ...prev, variants }
-      })
-    } finally {
-      tileCycleLockRef.current = false
-    }
-  }, [inpaintState, image])
 
   // ── Callback: re-run the whole pipeline (back to input phase) ──────────────
 
@@ -1843,7 +1775,6 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
             onRerunTile={(idx) => { void generateTile(idx) }}
             onGenerateAllTiles={() => { void handleGenerateAllTiles() }}
             onCycleVariant={handleCycleVariant}
-            onCycleTileVariant={(tileIdx, delta) => { void handleCycleTileVariant(tileIdx, delta) }}
             onRerun={handleRerun}
             onAccept={() => { void handleAccept() }}
             onClose={handleClose}

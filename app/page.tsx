@@ -12,9 +12,9 @@ import { TileStudio } from '@/app/components/TileStudio'
 import { TopBar } from '@/app/components/TopBar'
 import { ResultActions, VariantSelector } from '@/app/components/VariantSelector'
 import { Workspace, TilingState, TileCellDisplay } from '@/app/components/Workspace'
-import { Candidate, Direction, EXTENSION_PERCENT, LlmRequestDebug, MAX_AI_DIMENSION, MAX_PLAN_REGIONS, MAX_TILES_PER_EXTEND, Mode, PLAN_REGION_MAX_SCENE_DIM, PLAN_REGION_OVERLAP_TILES, PLAN_VARIANT_COUNT, REGIONAL_PLAN_TRIGGER_MULTIPLIER, ReferenceImage, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, TILE_OVERLAP_PX, createEmptyPlanVersions, timestampForFilename } from '@/app/lib/app'
+import { Candidate, Direction, EXTENSION_PERCENT, EXTEND_VARIANT_COUNT, LlmRequestDebug, MAX_AI_DIMENSION, MAX_PLAN_REGIONS, MAX_TILES_PER_EXTEND, Mode, PLAN_REGION_MAX_SCENE_DIM, PLAN_REGION_OVERLAP_TILES, PLAN_VARIANT_COUNT, REGIONAL_PLAN_TRIGGER_MULTIPLIER, ReferenceImage, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, TILE_OVERLAP_PX, createEmptyPlanVersions, timestampForFilename } from '@/app/lib/app'
 import { findStyleLabel } from '@/app/lib/artStyles'
-import { DEFAULT_MODEL, MODELS, getModelConfig, skipsArtDirectorReview } from '@/app/lib/models'
+import { DEFAULT_MODEL, MODELS, skipsArtDirectorReview } from '@/app/lib/models'
 import { LAYER_ORDER, LAYER_ROLES, LayerRole, PARALLAX_MAX_AUTO_STEPS, ParallaxLayer, WORKFLOW_ORDER, createDefaultLayers, getRecommendedLayerIndex, getWorkflowPrerequisite } from '@/app/lib/parallax'
 import { PROP_BATCH, PROP_BATCH_COLS, PROP_BATCH_H, PROP_BATCH_ROWS, PROP_BATCH_W, PROP_TILE_SIZE, PropItem, nextPropId, propAtlasLayout, resolvePropNames } from '@/app/lib/props'
 import { SPRITE_ANIMATIONS, SPRITE_FRAME_COUNT, SPRITE_FRAME_SIZE, SPRITE_GRID_COLS, SPRITE_GRID_ROWS, SPRITE_SHEET_H, SPRITE_SHEET_W, SPRITE_STRIP_H, SPRITE_STRIP_W, SpriteAnimType, SpriteFrame, SpriteSheet, createEmptySpriteSheet } from '@/app/lib/sprite'
@@ -100,13 +100,6 @@ export default function Home() {
     /** Per non-skipped tile: result data URL after API call, or null. */
     tilePreviews: (string | null)[]
     /**
-     * Four Phase-3 refine options per tile. `tilePreviews[i]` is the
-     * selected option.
-     */
-    tileResultVersions: Array<Array<string | null>>
-    /** Which of the four refine options is active. */
-    selectedTileResultIdx: number[]
-    /**
      * Per non-skipped tile: per-tile plan override slice (Phase 2 re-plan result).
      * null = derive slice from the global plan; non-null = use this override.
      */
@@ -138,6 +131,13 @@ export default function Home() {
     globalPlanningMap: string | null
     /** Filled low-res plan result covering the entire extension area, or null. */
     globalPlanResult: string | null
+    /**
+     * Four Phase-1 global plan options. `globalPlanResult` is the selected
+     * option (`versions[selectedGlobalPlanVariantIdx]`).
+     */
+    globalPlanVersions: Array<string | null>
+    /** Which of the four global-plan options is active. */
+    selectedGlobalPlanVariantIdx: number
     /**
      * Extension-zone crop of globalPlanResult — sized to match the band viewport.
      * Used as the tiling band background (no CSS offset math needed).
@@ -921,96 +921,87 @@ export default function Home() {
       }
 
       const isHorizontal = direction === 'left' || direction === 'right'
-      const modelCfg = getModelConfig(selectedModel)
+      const optionCount = Math.max(1, EXTEND_VARIANT_COUNT)
+      const attemptStart = Date.now()
+      const tickHandle = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - attemptStart) / 1000)
+        setProgressMsg(
+          optionCount > 1
+            ? `Generating ${optionCount} options · ${elapsed}s`
+            : `Generating · ${elapsed}s`,
+        )
+      }, 1000)
 
-      if (isHorizontal) {
-        const maxAttempts = Math.max(1, modelCfg.maxAttempts)
-        // Collect every candidate so the user can cycle through them and pick.
-        // We no longer early-break on a "good enough" score — the user said
-        // they want to see all 3 and decide themselves.
-        const candidates: Candidate[] = []
-
-        for (let attempt = 0; attempt < maxAttempts; attempt++) {
-          const attemptStart = Date.now()
-          // Tick a live elapsed-seconds counter inside the AI call so the UI
-          // doesn't feel frozen during long requests.
-          const tickHandle = setInterval(() => {
-            const elapsed = Math.floor((Date.now() - attemptStart) / 1000)
-            const label = maxAttempts > 1
-              ? `Variant ${attempt + 1}/${maxAttempts} · ${elapsed}s`
-              : `Generating · ${elapsed}s`
-            setProgressMsg(label)
-          }, 1000)
-
-          try {
-            const fullResult = await createFullContextExtension(
-              sourceImage,
-              direction,
-              EXTENSION_PERCENT
-            )
-            const imageUrl = await callExtendApi(fullResult.fullImageWithBlankArea, {
-              useFullContext: true,
-              extensionInfo: fullResult.extensionInfo,
-              attempt,
-            })
-            if (await isAiExtensionUnfilled(imageUrl, fullResult.extensionInfo)) {
-              continue
-            }
-            const blended = await applyFullContextResult(
-              imageUrl,
-              fullResult.extensionInfo,
-              sourceImage
-            )
-            const score = await measureSeamResidual(
-              blended,
-              fullResult.extensionInfo,
-              sourceImage
-            )
-            if (debugMode) {
-              // eslint-disable-next-line no-console
-              console.log(
-                `🔬 Variant ${attempt + 1} seam residual: ${score.toFixed(2)}`
-              )
-            }
-            candidates.push(await finalizeCandidate(blended, score, attempt + 1))
-          } finally {
-            clearInterval(tickHandle)
-          }
-        }
-
-        if (candidates.length === 0) {
-          throw new Error(
-            `AI failed to fill the extension area after ${maxAttempts} attempt${maxAttempts > 1 ? 's' : ''}. Try a different direction or model.`
-          )
-        }
-        // Sort best (lowest seam residual) first so the user lands on the
-        // cleanest blend by default but can cycle to alternatives.
-        candidates.sort((a, b) => a.score - b.score)
-        return candidates
-      } else {
-        const attemptStart = Date.now()
-        const tickHandle = setInterval(() => {
-          const elapsed = Math.floor((Date.now() - attemptStart) / 1000)
-          setProgressMsg(`Generating · ${elapsed}s`)
-        }, 1000)
-        try {
-          const result = await createChunkedExtension(
+      /**
+       * One independent extend sample. Horizontal uses full-context + seam
+       * scoring; vertical uses the chunked path (score 0 — pick visually).
+       */
+      const generateOneOption = async (attempt: number): Promise<Candidate | null> => {
+        if (isHorizontal) {
+          const fullResult = await createFullContextExtension(
             sourceImage,
             direction,
             EXTENSION_PERCENT,
-            40
           )
-          const imageUrl = await callExtendApi(result.chunkToExtend, {
-            chunkInfo: result.chunkInfo,
-            useFullContext: false,
+          const imageUrl = await callExtendApi(fullResult.fullImageWithBlankArea, {
+            useFullContext: true,
+            extensionInfo: fullResult.extensionInfo,
+            attempt,
           })
-          const stitched = await stitchExtendedChunk(sourceImage, imageUrl, result.chunkInfo, debugMode)
-          // Vertical path produces a single variant. Wrap it so the caller
-          // can treat horizontal + vertical results uniformly.
-          return [{ imageUrl: stitched, score: 0, attempt: 1 }]
-        } finally {
-          clearInterval(tickHandle)
+          if (await isAiExtensionUnfilled(imageUrl, fullResult.extensionInfo)) {
+            return null
+          }
+          const blended = await applyFullContextResult(
+            imageUrl,
+            fullResult.extensionInfo,
+            sourceImage,
+          )
+          const score = await measureSeamResidual(
+            blended,
+            fullResult.extensionInfo,
+            sourceImage,
+          )
+          if (debugMode) {
+            // eslint-disable-next-line no-console
+            console.log(`🔬 Variant ${attempt} seam residual: ${score.toFixed(2)}`)
+          }
+          return finalizeCandidate(blended, score, attempt)
         }
+
+        const result = await createChunkedExtension(
+          sourceImage,
+          direction,
+          EXTENSION_PERCENT,
+          40,
+        )
+        const imageUrl = await callExtendApi(result.chunkToExtend, {
+          chunkInfo: result.chunkInfo,
+          useFullContext: false,
+        })
+        const stitched = await stitchExtendedChunk(
+          sourceImage,
+          imageUrl,
+          result.chunkInfo,
+          debugMode,
+        )
+        return finalizeCandidate(stitched, 0, attempt)
+      }
+
+      try {
+        const rawResults = await Promise.all(
+          Array.from({ length: optionCount }, (_unused, idx) => generateOneOption(idx + 1)),
+        )
+        const candidates = rawResults.filter((item): item is Candidate => item !== null)
+        if (candidates.length === 0) {
+          throw new Error(
+            `AI failed to fill the extension area after ${optionCount} option${optionCount > 1 ? 's' : ''}. Try a different direction or model.`,
+          )
+        }
+        // Lowest seam residual first so the user lands on the cleanest blend.
+        candidates.sort((a, b) => a.score - b.score)
+        return candidates
+      } finally {
+        clearInterval(tickHandle)
       }
     },
     [currentImageDimensions, debugMode, apiKey, selectedModel, mode, sceneBrief]
@@ -1377,7 +1368,8 @@ export default function Home() {
 
       /**
        * One refine call, optional unfilled retry, then lock-paste context
-       * pixels so the option matches what Accept will keep.
+       * pixels so Accept keeps what the user sees. Extra samples are not
+       * useful here — the prompt tells the model to follow the plan.
        */
       const generateOneRefine = async (label: string): Promise<string> => {
         let raw = await normaliseTileResult(await callApi(tileCanvas, {
@@ -1401,12 +1393,7 @@ export default function Home() {
         )
       }
 
-      const resultVersions = await Promise.all(
-        Array.from({ length: PLAN_VARIANT_COUNT }, (_unused, optionIdx) =>
-          generateOneRefine(`Phase 3 — Refine tile ${nsIdx + 1} option ${optionIdx + 1}`),
-        ),
-      )
-      const raw = resultVersions[0]
+      const raw = await generateOneRefine(`Phase 3 — Refine tile ${nsIdx + 1}`)
       if (typeof raw !== 'string' || raw.length === 0) {
         throw new Error('Tile API returned no image')
       }
@@ -1415,17 +1402,11 @@ export default function Home() {
         if (!prev) return null
         const next = [...prev.tilePreviews]
         next[nsIdx] = raw
-        const nextVersions = [...prev.tileResultVersions]
-        nextVersions[nsIdx] = resultVersions
-        const nextSelected = [...prev.selectedTileResultIdx]
-        nextSelected[nsIdx] = 0
         const staleTileIds = new Set(prev.staleTileIds)
         staleTileIds.delete(nsIdx)
         const updated = {
           ...prev,
           tilePreviews: next,
-          tileResultVersions: nextVersions,
-          selectedTileResultIdx: nextSelected,
           staleTileIds,
           generatingTileIdx: null,
           generatingPlanOnly: false,
@@ -1598,19 +1579,11 @@ export default function Home() {
         if (!prev) return null
         const next = [...prev.tilePreviews]
         next[nsIdx] = assembled
-        const nextVersions = [...prev.tileResultVersions]
-        const assembledVersions = createEmptyPlanVersions()
-        assembledVersions[0] = assembled
-        nextVersions[nsIdx] = assembledVersions
-        const nextSelected = [...prev.selectedTileResultIdx]
-        nextSelected[nsIdx] = 0
         const staleTileIds = new Set(prev.staleTileIds)
         staleTileIds.delete(nsIdx)
         const updated = {
           ...prev,
           tilePreviews: next,
-          tileResultVersions: nextVersions,
-          selectedTileResultIdx: nextSelected,
           staleTileIds,
           acceptingPlanTileIdx: null,
         }
@@ -1642,8 +1615,8 @@ export default function Home() {
    * Phase 1 — Generate the global low-resolution plan for the entire extension.
    *
    * Builds a full-scene planning map (source image + grey extension area),
-   * sends it to the API with phase='plan', normalises the result, then crops
-   * one slice per tile and stores everything in plan state.
+   * sends PLAN_VARIANT_COUNT parallel phase='plan' calls, normalises each
+   * result, then crops one slice per tile from the selected option.
    *
    * Re-runnable at any time via "Re-run Global Plan". Resets per-tile overrides
    * so they stay consistent with the new plan.
@@ -1698,84 +1671,97 @@ export default function Home() {
         selectedModel,
       )
 
-      const response = await fetch('/api/extend', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          expandedCanvas: paddedPlan.paddedDataUrl,
-          direction,
-          extensionAmount: EXTENSION_PERCENT,
-          customPrompt: effectivePrompt,
-          artStyle: artStyle !== 'none' ? artStyle : undefined,
-          apiKey: apiKey || undefined,
-          model: selectedModel,
-          layerRole: plan.layerRole,
-          sceneBrief: mode === 'parallax' && sceneBrief.trim() ? sceneBrief.trim() : undefined,
-          phase: 'plan',
-          imageConfig: {
-            aspect_ratio: paddedPlan.layout.aspectRatio,
-            image_size: paddedPlan.imageSize,
-          },
-        }),
-      })
-      const data = await response.json() as {
-        imageUrl?: string
-        requestPrompt?: string
-        error?: string
-      }
-
-      const responseImage =
-        typeof data.imageUrl === 'string' && data.imageUrl.length > 0 ? data.imageUrl : null
-      let responseImageWidth: number | undefined
-      let responseImageHeight: number | undefined
-      if (responseImage) {
-        try {
-          const dims = await getImageDimensions(responseImage)
-          responseImageWidth = dims.width
-          responseImageHeight = dims.height
-        } catch {
-          // Dimensions optional for the debug panel.
+      /**
+       * One global-plan API call. Shared request body so the four options
+       * differ only by model sampling.
+       */
+      const requestOneGlobalPlan = async (): Promise<{
+        normalizedResult: string
+        debugSnap: LlmRequestDebug
+      }> => {
+        const response = await fetch('/api/extend', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            expandedCanvas: paddedPlan.paddedDataUrl,
+            direction,
+            extensionAmount: EXTENSION_PERCENT,
+            customPrompt: effectivePrompt,
+            artStyle: artStyle !== 'none' ? artStyle : undefined,
+            apiKey: apiKey || undefined,
+            model: selectedModel,
+            layerRole: plan.layerRole,
+            sceneBrief: mode === 'parallax' && sceneBrief.trim() ? sceneBrief.trim() : undefined,
+            phase: 'plan',
+            imageConfig: {
+              aspect_ratio: paddedPlan.layout.aspectRatio,
+              image_size: paddedPlan.imageSize,
+            },
+          }),
+        })
+        const data = await response.json() as {
+          imageUrl?: string
+          requestPrompt?: string
+          error?: string
         }
-      }
-      const lastGlobalPlanRequest: LlmRequestDebug = {
-        label: `Phase 1 — Global plan (${paddedPlan.layout.aspectRatio} bucket)`,
-        phase: 'plan',
-        imageDataUrl: paddedPlan.paddedDataUrl,
-        prompt:
-          typeof data.requestPrompt === 'string' && data.requestPrompt.length > 0
-            ? data.requestPrompt
-            : clientPromptFallback,
-        referenceImages: [],
-        responseImageDataUrl: responseImage,
-        responseImageWidth,
-        responseImageHeight,
-        imageWidth: paddedPlan.layout.paddedWidth,
-        imageHeight: paddedPlan.layout.paddedHeight,
-        capturedAt: Date.now(),
+
+        const responseImage =
+          typeof data.imageUrl === 'string' && data.imageUrl.length > 0 ? data.imageUrl : null
+        let responseImageWidth: number | undefined
+        let responseImageHeight: number | undefined
+        if (responseImage) {
+          try {
+            const dims = await getImageDimensions(responseImage)
+            responseImageWidth = dims.width
+            responseImageHeight = dims.height
+          } catch {
+            // Dimensions optional for the debug panel.
+          }
+        }
+        const debugSnap: LlmRequestDebug = {
+          label: `Phase 1 — Global plan (${paddedPlan.layout.aspectRatio} bucket)`,
+          phase: 'plan',
+          imageDataUrl: paddedPlan.paddedDataUrl,
+          prompt:
+            typeof data.requestPrompt === 'string' && data.requestPrompt.length > 0
+              ? data.requestPrompt
+              : clientPromptFallback,
+          referenceImages: [],
+          responseImageDataUrl: responseImage,
+          responseImageWidth,
+          responseImageHeight,
+          imageWidth: paddedPlan.layout.paddedWidth,
+          imageHeight: paddedPlan.layout.paddedHeight,
+          capturedAt: Date.now(),
+        }
+
+        if (!response.ok) {
+          const err = new Error(data.error || 'Global plan API call failed') as Error & { status?: number }
+          err.status = response.status
+          throw err
+        }
+        if (!responseImage) {
+          throw new Error('Global plan API returned no image')
+        }
+
+        // Unpad bucket → prototype size, then stretch-normalize as a safety net
+        // so crop coordinates stay registered to the source↔grey seam.
+        const unpaddedResult = await unpadImageFromAspectBucket(responseImage, paddedPlan.layout)
+        const normalizedResult = await normalizeTileImageToSize(unpaddedResult, mapWidth, mapHeight)
+        return { normalizedResult, debugSnap }
       }
 
-      if (!response.ok) {
-        setPendingTiledPlan((prev) =>
-          prev ? { ...prev, lastGlobalPlanRequest, isGlobalPlanGenerating: false } : null
-        )
-        const err = new Error(data.error || 'Global plan API call failed') as Error & { status?: number }
-        err.status = response.status
-        throw err
-      }
-
-      if (!responseImage) {
-        setPendingTiledPlan((prev) =>
-          prev ? { ...prev, lastGlobalPlanRequest, isGlobalPlanGenerating: false } : null
-        )
+      const optionResults = await Promise.all(
+        Array.from({ length: PLAN_VARIANT_COUNT }, () => requestOneGlobalPlan()),
+      )
+      const versions = optionResults.map((item) => item.normalizedResult)
+      const lastGlobalPlanRequest = optionResults[0]?.debugSnap
+      const normalizedResult = versions[0]
+      if (!normalizedResult || !lastGlobalPlanRequest) {
         throw new Error('Global plan API returned no image')
       }
 
-      // Unpad bucket → prototype size, then stretch-normalize as a safety net
-      // so crop coordinates stay registered to the source↔grey seam.
-      const unpaddedResult = await unpadImageFromAspectBucket(responseImage, paddedPlan.layout)
-      const normalizedResult = await normalizeTileImageToSize(unpaddedResult, mapWidth, mapHeight)
-
-      // Pre-crop each tile's slice from the global plan result.
+      // Pre-crop each tile's slice from the selected global plan result.
       const globalTilePlanSlices = await Promise.all(
         tileRegionsInMap.map((region) =>
           region.width === 0 || region.height === 0
@@ -1802,6 +1788,8 @@ export default function Home() {
           lastGlobalPlanRequest,
           globalPlanningMap: mapDataUrl,
           globalPlanResult: normalizedResult,
+          globalPlanVersions: versions,
+          selectedGlobalPlanVariantIdx: 0,
           globalPlanExtensionView,
           globalTileRegions: tileRegionsInMap,
           globalTilePlanSlices,
@@ -2188,6 +2176,76 @@ export default function Home() {
   }, [])
 
   /**
+   * Cycle the four Phase-1 global plan options and recrop every tile slice
+   * from the newly selected result. Clears per-tile re-plan overrides so
+   * they stay consistent with the new baseline.
+   */
+  const cycleGlobalPlanVariant = useCallback(async (delta: 1 | -1) => {
+    const current = pendingTiledPlanRef.current
+    if (!current || current.isRegionalPlan || current.isGlobalPlanGenerating) {
+      return
+    }
+    const versions = current.globalPlanVersions
+    const n = versions.length
+    if (n === 0) {
+      return
+    }
+    let nextIdx = (current.selectedGlobalPlanVariantIdx + delta + n) % n
+    for (let step = 0; step < n; step++) {
+      const url = versions[nextIdx]
+      if (typeof url === 'string' && url.length > 0) {
+        break
+      }
+      nextIdx = (nextIdx + delta + n) % n
+    }
+    const resultUrl = versions[nextIdx]
+    if (typeof resultUrl !== 'string' || resultUrl.length === 0) {
+      return
+    }
+    if (nextIdx === current.selectedGlobalPlanVariantIdx) {
+      return
+    }
+
+    const nextGlobalTilePlanSlices = await Promise.all(
+      current.globalTileRegions.map((region) =>
+        region.width === 0 || region.height === 0
+          ? Promise.resolve(null)
+          : cropPlanningResult(resultUrl, region),
+      ),
+    )
+    const nextStale = new Set(current.staleTileIds)
+    for (let nsIdx = 0; nsIdx < current.nonSkippedCount; nsIdx++) {
+      if (current.tilePreviews[nsIdx] || current.tileAccepted[nsIdx]) {
+        nextStale.add(nsIdx)
+      } else {
+        nextStale.delete(nsIdx)
+      }
+    }
+
+    const globalPlanExtensionView = await cropGlobalPlanExtensionView(
+      resultUrl,
+      current.globalPlanWidth,
+      current.globalPlanHeight,
+      current.direction,
+      current.imageWidth,
+      current.imageHeight,
+      current.extensionSize,
+    )
+
+    commitPendingTiledPlan((prev) => ({
+      ...prev,
+      globalPlanResult: resultUrl,
+      selectedGlobalPlanVariantIdx: nextIdx,
+      globalTilePlanSlices: nextGlobalTilePlanSlices,
+      globalPlanExtensionView,
+      staleTileIds: nextStale,
+      tilePlanningSlices: new Array<string | null>(prev.nonSkippedCount).fill(null),
+      tilePlanVersions: Array.from({ length: prev.nonSkippedCount }, () => createEmptyPlanVersions()),
+      selectedTilePlanVariantIdx: new Array<number>(prev.nonSkippedCount).fill(0),
+    }))
+  }, [])
+
+  /**
    * Cycle this tile's four Phase-2 plan options. Refine / accept-plan use
    * the selected slice.
    */
@@ -2221,44 +2279,6 @@ export default function Home() {
         ...prev,
         selectedTilePlanVariantIdx: nextSelected,
         tilePlanningSlices: nextSlices,
-      }
-    })
-  }, [])
-
-  /**
-   * Cycle this tile's four refine results. Accept / merge use the selected
-   * preview.
-   */
-  const cycleTileResultVariant = useCallback((nsIdx: number, delta: 1 | -1) => {
-    commitPendingTiledPlan((prev) => {
-      const versions = prev.tileResultVersions[nsIdx]
-      if (!versions) {
-        return prev
-      }
-      const n = versions.length
-      if (n === 0) {
-        return prev
-      }
-      let nextIdx = (prev.selectedTileResultIdx[nsIdx] + delta + n) % n
-      for (let step = 0; step < n; step++) {
-        const url = versions[nextIdx]
-        if (typeof url === 'string' && url.length > 0) {
-          break
-        }
-        nextIdx = (nextIdx + delta + n) % n
-      }
-      const selected = versions[nextIdx]
-      if (typeof selected !== 'string' || selected.length === 0) {
-        return prev
-      }
-      const nextSelected = [...prev.selectedTileResultIdx]
-      nextSelected[nsIdx] = nextIdx
-      const nextPreviews = [...prev.tilePreviews]
-      nextPreviews[nsIdx] = selected
-      return {
-        ...prev,
-        selectedTileResultIdx: nextSelected,
-        tilePreviews: nextPreviews,
       }
     })
   }, [])
@@ -2558,8 +2578,6 @@ export default function Home() {
       imageHeight: dims.height,
       tilePrompts: new Array<string>(nonSkippedCount).fill(''),
       tilePreviews: new Array<string | null>(nonSkippedCount).fill(null),
-      tileResultVersions: Array.from({ length: nonSkippedCount }, () => createEmptyPlanVersions()),
-      selectedTileResultIdx: new Array<number>(nonSkippedCount).fill(0),
       tilePlanningSlices: new Array<string | null>(nonSkippedCount).fill(null),
       tilePlanVersions: Array.from({ length: nonSkippedCount }, () => createEmptyPlanVersions()),
       selectedTilePlanVariantIdx: new Array<number>(nonSkippedCount).fill(0),
@@ -2570,6 +2588,8 @@ export default function Home() {
       acceptingPlanTileIdx: null,
       globalPlanningMap: null,
       globalPlanResult: null,
+      globalPlanVersions: createEmptyPlanVersions(),
+      selectedGlobalPlanVariantIdx: 0,
       globalPlanExtensionView: null,
       globalTileRegions: [],
       globalTilePlanSlices: new Array<string | null>(nonSkippedCount).fill(null),
@@ -2608,6 +2628,82 @@ export default function Home() {
     }
   }, [])
 
+  /**
+   * How many tiles in this plan actually need an API call. Single-tile
+   * extends use the simple 4-option path instead of the band UI.
+   */
+  const countActionableTiles = (plan: TiledExtensionPlan, direction: Direction): number => {
+    const isHorizontal = direction === 'left' || direction === 'right'
+    const minBlankPx = Math.round(TILE_OVERLAP_PX / 2)
+    let count = 0
+    for (const tile of plan.tiles) {
+      const blankProgress = isHorizontal ? tile.blankRegion.width : tile.blankRegion.height
+      if (blankProgress >= minBlankPx) {
+        count += 1
+      }
+    }
+    return count
+  }
+
+  /**
+   * Start an extension. One-tile bands use runExtend (4 pickable options).
+   * Multi-tile bands open the tiled planner (4 global-plan options, 1 refine).
+   */
+  const beginExtension = async (
+    sourceImage: string,
+    direction: Direction,
+    layerRole: LayerRole | undefined,
+    dims: { width: number; height: number },
+  ) => {
+    let tilePlan: TiledExtensionPlan
+    try {
+      tilePlan = planExtensionTiles({
+        direction,
+        imageWidth: dims.width,
+        imageHeight: dims.height,
+        extensionPercent: EXTENSION_PERCENT,
+        maxDimension: MAX_AI_DIMENSION,
+        tileOverlapPx: TILE_OVERLAP_PX,
+        maxTiles: MAX_TILES_PER_EXTEND,
+      })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to plan tiled extension')
+      setActiveDirection(null)
+      return
+    }
+
+    if (countActionableTiles(tilePlan, direction) <= 1) {
+      setLoading(true)
+      setExtendedCandidates([])
+      setCandidateDims([])
+      setSelectedCandidateIdx(0)
+      try {
+        const candidates = await runExtend(
+          direction,
+          sourceImage,
+          customPrompt,
+          artStyle,
+          layerRole,
+        )
+        adoptCandidates(candidates)
+      } catch (err) {
+        const e = err as Error & { status?: number }
+        setError(e.message || 'Failed to extend image')
+        if (e.status === 401) {
+          setApiKeyRequired(true)
+          setShowApiKeyModal(true)
+        }
+      } finally {
+        setLoading(false)
+        setActiveDirection(null)
+        setProgressMsg(null)
+      }
+      return
+    }
+
+    await startTiledPlan(sourceImage, direction, layerRole, dims)
+  }
+
   const handleExtend = async (direction: Direction) => {
     if (loading) return
     if (!ensureCanGenerate()) return
@@ -2620,7 +2716,7 @@ export default function Home() {
     setImageBeforeExtension(sourceImage)
     setLastExtensionParams({ direction, customPrompt, artStyle, layerRole })
 
-    await startTiledPlan(sourceImage, direction, layerRole, currentImageDimensions)
+    await beginExtension(sourceImage, direction, layerRole, currentImageDimensions)
   }
 
   const handleRegenerate = async () => {
@@ -2631,11 +2727,11 @@ export default function Home() {
     const { direction, layerRole } = lastExtensionParams
     setError(null)
     setActiveDirection(direction)
-    // Re-enter the tiled extend flow from the pre-extension image (not the
-    // accepted result) so the plan baseline is unchanged.
+    // Re-enter from the pre-extension image (not the accepted result) so
+    // the plan baseline / simple-extend source is unchanged.
     setLastExtensionParams({ direction, customPrompt, artStyle, layerRole })
 
-    await startTiledPlan(imageBeforeExtension, direction, layerRole, currentImageDimensions)
+    await beginExtension(imageBeforeExtension, direction, layerRole, currentImageDimensions)
   }
 
   const cycleVariant = (delta: 1 | -1) => {
@@ -5504,8 +5600,20 @@ export default function Home() {
         }
         return
       }
-      // Arrow keys no longer trigger extends — use the edge handles instead.
-      // (Keeps arrows free for other controls, e.g. tile shimmy.)
+      // Cycle Phase-1 global plan options when the band is up and no modal owns the arrows.
+      if (
+        pendingTiledPlan &&
+        !pendingTiledPlan.isRegionalPlan &&
+        !pendingTiledPlan.isGlobalPlanGenerating
+      ) {
+        const filledPlans = pendingTiledPlan.globalPlanVersions.filter(
+          (url) => typeof url === 'string' && url.length > 0,
+        ).length
+        if (filledPlans > 1 && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+          e.preventDefault()
+          void cycleGlobalPlanVariant(e.key === 'ArrowLeft' ? -1 : 1)
+        }
+      }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -5522,6 +5630,7 @@ export default function Home() {
     activeLayer,
     activeTileModalIdx,
     activeRegionModalIdx,
+    pendingTiledPlan,
   ])
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -5781,6 +5890,10 @@ export default function Home() {
                   globalPlanResult: pendingTiledPlan.globalPlanResult,
                   globalPlanExtensionView: pendingTiledPlan.globalPlanExtensionView,
                   isGlobalPlanGenerating: pendingTiledPlan.isGlobalPlanGenerating,
+                  globalPlanOptionCount: pendingTiledPlan.globalPlanVersions.filter(
+                    (url) => typeof url === 'string' && url.length > 0,
+                  ).length,
+                  globalPlanOptionIdx: pendingTiledPlan.selectedGlobalPlanVariantIdx,
                   regions: pendingTiledPlan.regionGrouping?.regions.map((r) => ({
                     index: r.index,
                     bandX: r.bandRect.x,
@@ -5803,6 +5916,11 @@ export default function Home() {
           onRerunGlobalPlan={
             pendingTiledPlan && !pendingTiledPlan.isRegionalPlan
               ? () => void generateGlobalPlan(pendingTiledPlan.direction)
+              : undefined
+          }
+          onCycleGlobalPlan={
+            pendingTiledPlan && !pendingTiledPlan.isRegionalPlan
+              ? (delta) => { void cycleGlobalPlanVariant(delta) }
               : undefined
           }
           onGenerateAllTiles={
@@ -5937,9 +6055,6 @@ export default function Home() {
             planOptionCount={(plan.tilePlanVersions[nsIdx] ?? []).filter((url) => typeof url === 'string' && url.length > 0).length}
             planOptionIdx={plan.selectedTilePlanVariantIdx[nsIdx] ?? 0}
             onCyclePlanOption={(delta) => cycleTilePlanVariant(nsIdx, delta)}
-            resultOptionCount={(plan.tileResultVersions[nsIdx] ?? []).filter((url) => typeof url === 'string' && url.length > 0).length}
-            resultOptionIdx={plan.selectedTileResultIdx[nsIdx] ?? 0}
-            onCycleResultOption={(delta) => cycleTileResultVariant(nsIdx, delta)}
           />
         )
       })()}

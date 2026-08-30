@@ -22,10 +22,10 @@ import { MODELS, maskKey } from '@/app/lib/models'
 import { Direction, LlmRequestDebug, MAX_AI_DIMENSION, PLAN_VARIANT_COUNT, ReferenceImage } from '@/app/lib/app'
 
 /**
- * Compact 1 / 4 cycler for region and tile plan options. Arrow keys in the
- * host modal call the same callbacks.
+ * Compact 1 / 4 cycler for region, tile, and global plan options. Arrow
+ * keys in the host modal (or workspace) call the same callbacks.
  */
-function PlanOptionCycler({
+export function PlanOptionCycler({
   index,
   total,
   disabled,
@@ -1538,12 +1538,6 @@ export interface TileExtensionModalProps {
   planOptionIdx?: number
   /** Cycle Phase-2 plan options (arrow keys in the modal). */
   onCyclePlanOption?: (delta: 1 | -1) => void
-  /** How many Phase-3 refine options exist for this tile (0 if none yet). */
-  resultOptionCount?: number
-  /** Selected Phase-3 refine option index. */
-  resultOptionIdx?: number
-  /** Cycle refine options (arrow keys once a result exists). */
-  onCycleResultOption?: (delta: 1 | -1) => void
 }
 
 export function TileExtensionModal({
@@ -1583,9 +1577,6 @@ export function TileExtensionModal({
   planOptionCount = 0,
   planOptionIdx = 0,
   onCyclePlanOption,
-  resultOptionCount = 0,
-  resultOptionIdx = 0,
-  onCycleResultOption,
 }: TileExtensionModalProps) {
   const [inputImageUrl, setInputImageUrl] = useState<string | null>(null)
   const [resultDimensions, setResultDimensions] = useState<{ width: number; height: number } | null>(null)
@@ -1708,11 +1699,6 @@ export function TileExtensionModal({
       if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
         return
       }
-      if (onCycleResultOption && resultOptionCount > 1 && preview !== null && !isGenerating) {
-        e.preventDefault()
-        onCycleResultOption(e.key === 'ArrowLeft' ? -1 : 1)
-        return
-      }
       if (!onCyclePlanOption || planOptionCount <= 1 || preview !== null || isGenerating) {
         return
       }
@@ -1721,7 +1707,7 @@ export function TileExtensionModal({
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [open, isGenerating, isAcceptingPlan, onClose, onCyclePlanOption, planOptionCount, preview, onCycleResultOption, resultOptionCount])
+  }, [open, isGenerating, isAcceptingPlan, onClose, onCyclePlanOption, planOptionCount, preview])
 
   // Keyboard shimmy nudge — Arrow keys = ±1px, Shift+Arrow = ±5px (unbounded).
   // Skipped while the shimmy control isn't actionable (no result yet, tile
@@ -1734,15 +1720,6 @@ export function TileExtensionModal({
       if (
         target &&
         (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable)
-      ) {
-        return
-      }
-      // Plain ← → cycle refine options when four results exist. Hold Shift
-      // (or use ↑ ↓) to shimmy.
-      if (
-        resultOptionCount > 1 &&
-        !e.shiftKey &&
-        (e.key === 'ArrowLeft' || e.key === 'ArrowRight')
       ) {
         return
       }
@@ -1765,7 +1742,7 @@ export function TileExtensionModal({
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [open, preview, isNextPending, isGenerating, isAcceptingPlan, resultOptionCount])
+  }, [open, preview, isNextPending, isGenerating, isAcceptingPlan])
 
   if (!open) return null
 
@@ -2167,33 +2144,21 @@ export function TileExtensionModal({
 
               return (
                 <div>
-                  {(planOptionCount > 1 || resultOptionCount > 1) && (
+                  {planOptionCount > 1 && onCyclePlanOption ? (
                     <div className="mb-2 flex gap-4">
                       <div className="flex flex-1 justify-center">
-                        {planOptionCount > 1 && onCyclePlanOption ? (
-                          <PlanOptionCycler
-                            index={planOptionIdx}
-                            total={PLAN_VARIANT_COUNT}
-                            disabled={isGenerating || isAcceptingPlan}
-                            onPrev={() => onCyclePlanOption(-1)}
-                            onNext={() => onCyclePlanOption(1)}
-                          />
-                        ) : null}
+                        <PlanOptionCycler
+                          index={planOptionIdx}
+                          total={PLAN_VARIANT_COUNT}
+                          disabled={isGenerating || isAcceptingPlan}
+                          onPrev={() => onCyclePlanOption(-1)}
+                          onNext={() => onCyclePlanOption(1)}
+                        />
                       </div>
-                      <div className="flex flex-1 justify-center">
-                        {resultOptionCount > 1 && onCycleResultOption ? (
-                          <PlanOptionCycler
-                            index={resultOptionIdx}
-                            total={PLAN_VARIANT_COUNT}
-                            disabled={isGenerating || isAcceptingPlan}
-                            onPrev={() => onCycleResultOption(-1)}
-                            onNext={() => onCycleResultOption(1)}
-                          />
-                        ) : null}
-                      </div>
+                      <div className="flex-1" aria-hidden />
                       {hasPreview ? <div className="flex-1" aria-hidden /> : null}
                     </div>
-                  )}
+                  ) : null}
                 <div className="flex gap-4">
                   {/* Cell 1 — Tile Plan (high-res composite sent to the model) */}
                   <div className="flex-1 min-w-0">

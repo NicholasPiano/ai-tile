@@ -2,8 +2,9 @@
 
 import { useState } from 'react'
 import { Icons } from '@/app/components/icons'
+import { PlanOptionCycler } from '@/app/components/Modals'
 import { StatusPill } from '@/app/components/TopBar'
-import { Direction } from '@/app/lib/app'
+import { Direction, PLAN_VARIANT_COUNT } from '@/app/lib/app'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared tile-display types
@@ -65,6 +66,10 @@ export interface TilingState {
   globalPlanExtensionView?: string | null
   /** True while Phase 1 (global plan) is being generated. */
   isGlobalPlanGenerating?: boolean
+  /** How many Phase-1 global plan options exist (0 if none yet). */
+  globalPlanOptionCount?: number
+  /** Selected Phase-1 global plan option index. */
+  globalPlanOptionIdx?: number
   /**
    * Region-layer cells for a regionally-planned (very large) extension.
    * Undefined/empty when the extension uses a single whole-scene plan —
@@ -420,6 +425,9 @@ function TilingEdgeControl({
   onCancel,
   onRerunGlobalPlan,
   isGlobalPlanGenerating,
+  globalPlanOptionCount,
+  globalPlanOptionIdx,
+  onCycleGlobalPlan,
   onGenerateAll,
   isAutoGenerating,
   onStopAutoGenerate,
@@ -433,6 +441,12 @@ function TilingEdgeControl({
   onCancel: () => void
   onRerunGlobalPlan?: () => void
   isGlobalPlanGenerating?: boolean
+  /** How many Phase-1 global plan options exist (0 if none yet). */
+  globalPlanOptionCount?: number
+  /** Selected Phase-1 global plan option index. */
+  globalPlanOptionIdx?: number
+  /** Cycle Phase-1 global plan options (also bound to ← → on the workspace). */
+  onCycleGlobalPlan?: (delta: 1 | -1) => void
   /** Kick off automatic sequential generation for the active layer. */
   onGenerateAll?: () => void
   /** True while the "Generate all" loop is running. */
@@ -521,6 +535,16 @@ function TilingEdgeControl({
           }
         </button>
       )}
+
+      {globalPlanOptionCount !== undefined && globalPlanOptionCount > 1 && onCycleGlobalPlan ? (
+        <PlanOptionCycler
+          index={globalPlanOptionIdx ?? 0}
+          total={PLAN_VARIANT_COUNT}
+          disabled={!!isGlobalPlanGenerating || !!isAutoGenerating}
+          onPrev={() => onCycleGlobalPlan(-1)}
+          onNext={() => onCycleGlobalPlan(1)}
+        />
+      ) : null}
 
       {/* Generate all — on the Regions layer this plans remaining regions
           only; on the Tiles layer it generates remaining tiles. */}
@@ -652,6 +676,7 @@ export function Workspace({
   onRegionClick,
   onTileCancel,
   onRerunGlobalPlan,
+  onCycleGlobalPlan,
   onGenerateAllTiles,
   onGenerateAllRegions,
   isAutoGeneratingTiles,
@@ -681,6 +706,8 @@ export function Workspace({
   onTileCancel?: () => void
   /** Re-run Phase 1 (global plan) for the entire extension. */
   onRerunGlobalPlan?: () => void
+  /** Cycle Phase-1 global plan options. */
+  onCycleGlobalPlan?: (delta: 1 | -1) => void
   /** Sequentially generate + auto-accept every remaining tile (Tiles layer). */
   onGenerateAllTiles?: () => void
   /** Sequentially plan every remaining region and stop (Regions layer). */
@@ -837,6 +864,9 @@ export function Workspace({
               onCancel={onTileCancel ?? (() => undefined)}
               onRerunGlobalPlan={onRerunGlobalPlan}
               isGlobalPlanGenerating={tilingState.isGlobalPlanGenerating}
+              globalPlanOptionCount={tilingState.globalPlanOptionCount}
+              globalPlanOptionIdx={tilingState.globalPlanOptionIdx}
+              onCycleGlobalPlan={onCycleGlobalPlan}
               onGenerateAll={
                 regionsLayerSelected ? onGenerateAllRegions : onGenerateAllTiles
               }

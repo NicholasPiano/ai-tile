@@ -3,13 +3,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { Icons } from '@/app/components/icons'
 import {
-  INPAINT_TILE_VARIANT_COUNT,
   INPAINT_VARIANT_COUNT,
   selectedInpaintVariant,
   selectedTileResultUrl,
   tileSlotHasResult,
   type InpaintState,
-  type InpaintTileSlot,
   type ReferenceImage,
 } from '@/app/lib/app'
 
@@ -31,8 +29,6 @@ export interface EditPanelProps {
   onGenerateAllTiles: () => void
   /** Cycle the visible plan / mask / tile stack (wraps at both ends). */
   onCycleVariant: (delta: 1 | -1) => void
-  /** Cycle one tile's refine version (buttons only — no keyboard). */
-  onCycleTileVariant: (tileIdx: number, delta: 1 | -1) => void
   onRerun: () => void
   onAccept: () => void
   onClose: () => void
@@ -214,18 +210,14 @@ function TileGrid({
   generatingTileIdx,
   changeMaskOverlayUrl,
   onRerunTile,
-  onCycleTileVariant,
-  cycleDisabled,
 }: {
   tilePlan: NonNullable<InpaintState['tilePlan']>
-  tileResults: InpaintTileSlot[]
+  tileResults: Array<string | null>
   generatingTileIdx: number | null
   /** Blue-highlight overlay from computeChangeMaskVisuals — used as a pending
    *  tile preview so the user can see where changes fall before generating. */
   changeMaskOverlayUrl: string | null
   onRerunTile: (idx: number) => void
-  onCycleTileVariant: (tileIdx: number, delta: 1 | -1) => void
-  cycleDisabled: boolean
 }) {
   const maskedTiles = tilePlan.tiles
     .map((tile, idx) => ({ tile, idx }))
@@ -243,12 +235,8 @@ function TileGrid({
       <div className="grid gap-1.5" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(80px, 1fr))' }}>
         {maskedTiles.map(({ tile, idx }) => {
           const isGenerating = generatingTileIdx === idx
-          const slot = tileResults[idx]
-          const resultUrl = selectedTileResultUrl(slot)
-          const isDone = tileSlotHasResult(slot)
-          const versionLabel = slot
-            ? `${slot.selectedIdx + 1} / ${INPAINT_TILE_VARIANT_COUNT}`
-            : `1 / ${INPAINT_TILE_VARIANT_COUNT}`
+          const resultUrl = selectedTileResultUrl(tileResults[idx])
+          const isDone = tileSlotHasResult(tileResults[idx])
 
           return (
             <div key={idx} className="flex flex-col gap-1">
@@ -292,46 +280,13 @@ function TileGrid({
                     style={{ background: isDone ? 'rgba(0,0,0,0.55)' : 'rgba(0,0,0,0.35)' }}
                     onClick={() => onRerunTile(idx)}
                     disabled={anyBusy}
-                    title={isDone ? `Re-run tile ${idx + 1} (4 versions)` : `Generate tile ${idx + 1} (4 versions)`}
+                    title={isDone ? `Re-run tile ${idx + 1}` : `Generate tile ${idx + 1}`}
                     aria-label={isDone ? `Re-run tile ${idx + 1}` : `Generate tile ${idx + 1}`}
                   >
                     <Icons.Play size={14} />
                   </button>
                 )}
               </div>
-
-              {isDone && (
-                <div
-                  className="flex items-center justify-center gap-0.5"
-                  role="group"
-                  aria-label={`Tile ${idx + 1} versions`}
-                >
-                  <button
-                    className="icon-btn h-5 w-5"
-                    disabled={cycleDisabled}
-                    onClick={() => onCycleTileVariant(idx, -1)}
-                    aria-label={`Previous version of tile ${idx + 1}`}
-                    title="Previous tile version"
-                  >
-                    <Icons.ArrowLeft size={11} />
-                  </button>
-                  <span
-                    className="min-w-[2.25rem] text-center font-mono text-[10px] tabular-nums"
-                    style={{ color: 'var(--text-secondary)' }}
-                  >
-                    {versionLabel}
-                  </span>
-                  <button
-                    className="icon-btn h-5 w-5"
-                    disabled={cycleDisabled}
-                    onClick={() => onCycleTileVariant(idx, 1)}
-                    aria-label={`Next version of tile ${idx + 1}`}
-                    title="Next tile version"
-                  >
-                    <Icons.ArrowRight size={11} />
-                  </button>
-                </div>
-              )}
             </div>
           )
         })}
@@ -361,7 +316,6 @@ export function EditPanel({
   onRerunTile,
   onGenerateAllTiles,
   onCycleVariant,
-  onCycleTileVariant,
   onRerun,
   onAccept,
   onClose,
@@ -557,7 +511,7 @@ export function EditPanel({
               {isGenerating ? (
                 <div className="flex items-center gap-2 text-[12px]" style={{ color: 'var(--text-muted)' }}>
                   <Spinner />
-                  <span>{`Generating 4 versions of tile ${(generatingTileIdx ?? 0) + 1}…`}</span>
+                  <span>{`Generating tile ${(generatingTileIdx ?? 0) + 1}…`}</span>
                 </div>
               ) : (
                 <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
@@ -580,8 +534,6 @@ export function EditPanel({
                 generatingTileIdx={generatingTileIdx}
                 changeMaskOverlayUrl={changeMaskOverlayUrl}
                 onRerunTile={onRerunTile}
-                onCycleTileVariant={onCycleTileVariant}
-                cycleDisabled={isProcessing}
               />
             </div>
           </>

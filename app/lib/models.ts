@@ -4,12 +4,6 @@ export type ModelOption = {
   value: string
   label: string
   hint?: string
-  /**
-   * Max best-of-N attempts for horizontal extensions on this model.
-   * Slow models (GPT-5.4-image-2 takes ~4 min/call) get 1 to avoid
-   * multi-minute blind waits; fast models get 3 for seam-quality picking.
-   */
-  maxAttempts: number
   /** Rough single-call expected duration, shown to the user as guidance. */
   approxSecondsPerCall: number
 }
@@ -20,28 +14,24 @@ export const MODELS: ModelOption[] = [
     value: 'openai/gpt-5.4-image-2',
     label: 'GPT-5.4 Image 2',
     hint: 'OpenAI · high fidelity · slower',
-    maxAttempts: 1,
     approxSecondsPerCall: 240,
   },
   {
     value: 'google/gemini-3-pro-image-preview',
     label: 'Gemini 3 Pro Image',
     hint: 'Nano Banana Pro · highest fidelity',
-    maxAttempts: 1,
     approxSecondsPerCall: 75,
   },
   {
     value: 'google/gemini-3.1-flash-image-preview',
     label: 'Gemini 3 Flash Image',
     hint: 'Nano Banana 2 · fast · default',
-    maxAttempts: 3,
     approxSecondsPerCall: 18,
   },
   {
     value: 'google/gemini-2.5-flash-image',
     label: 'Gemini 2.5 Flash Image',
     hint: 'Nano Banana · stable',
-    maxAttempts: 3,
     approxSecondsPerCall: 15,
   },
 ]

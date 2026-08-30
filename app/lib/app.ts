@@ -3,11 +3,10 @@
 export type Direction = 'up' | 'down' | 'left' | 'right'
 
 /**
- * One generated extension result. For horizontal extensions we produce up to
- * `maxAttempts` candidates, sort them by seam quality (lowest residual first),
- * and let the user cycle through them before accepting. Vertical extensions
- * produce a single candidate (the chunked path is deterministic enough that
- * multiple tries rarely help).
+ * One generated extension result. Simple (single-tile) extends produce
+ * {@link EXTEND_VARIANT_COUNT} candidates in parallel. Horizontal results
+ * are sorted by seam quality (lowest residual first); the user cycles
+ * before accepting.
  */
 
 export type Candidate = {
@@ -265,53 +264,37 @@ export interface InpaintTilePlan {
 /** How many independent plan variants Generate produces. */
 export const INPAINT_VARIANT_COUNT = 4
 
-/** How many options a region plan or per-tile re-plan produces. */
+/**
+ * How many options a global plan, region plan, or per-tile re-plan produces.
+ * Refine passes stay at one result — they are instructed to follow the plan.
+ */
 export const PLAN_VARIANT_COUNT = 4
 
 /**
- * Empty option list for one region or tile-plan slot.
+ * How many candidates a simple (non-tiled) horizontal or vertical extend
+ * generates in parallel so the user can pick.
+ */
+export const EXTEND_VARIANT_COUNT = 4
+
+/**
+ * Empty option list for one region, global-plan, or tile-plan slot.
  */
 export function createEmptyPlanVersions(): Array<string | null> {
   return Array.from({ length: PLAN_VARIANT_COUNT }, () => null)
 }
 
-/** How many refine versions each tile produces with the same settings. */
-export const INPAINT_TILE_VARIANT_COUNT = 4
-
 /**
- * Four refine results for one tile, plus which version is stamped into the
- * running composite / stitched preview.
+ * One empty refine URL per tile in the shared grid. Refine is a single
+ * follow-the-plan pass, so each slot is one URL (or null before generate).
  */
-export interface InpaintTileSlot {
-  versions: Array<string | null>
-  selectedIdx: number
+export function createEmptyInpaintTileSlots(tileCount: number): Array<string | null> {
+  return Array.from({ length: tileCount }, () => null)
 }
 
 /**
- * Empty per-tile slot used before that tile has been generated.
+ * The refine URL for a tile, or null if none yet.
  */
-export function createEmptyInpaintTileSlot(): InpaintTileSlot {
-  return {
-    versions: Array.from({ length: INPAINT_TILE_VARIANT_COUNT }, () => null),
-    selectedIdx: 0,
-  }
-}
-
-/**
- * One empty slot per tile in the shared grid.
- */
-export function createEmptyInpaintTileSlots(tileCount: number): InpaintTileSlot[] {
-  return Array.from({ length: tileCount }, () => createEmptyInpaintTileSlot())
-}
-
-/**
- * The refine URL currently selected for a tile slot, or null if none yet.
- */
-export function selectedTileResultUrl(slot: InpaintTileSlot | undefined): string | null {
-  if (!slot) {
-    return null
-  }
-  const url = slot.versions[slot.selectedIdx]
+export function selectedTileResultUrl(url: string | null | undefined): string | null {
   if (typeof url !== 'string' || url.length === 0) {
     return null
   }
@@ -319,33 +302,10 @@ export function selectedTileResultUrl(slot: InpaintTileSlot | undefined): string
 }
 
 /**
- * True when this tile has at least one refine result to show / cycle.
+ * True when this tile has a refine result to show.
  */
-export function tileSlotHasResult(slot: InpaintTileSlot | undefined): boolean {
-  if (!slot) {
-    return false
-  }
-  return slot.versions.some((url) => typeof url === 'string' && url.length > 0)
-}
-
-/**
- * Next filled version index in the given direction, wrapping. Returns the
- * current index when the slot has no results.
- */
-export function nextFilledTileVersionIdx(slot: InpaintTileSlot, delta: 1 | -1): number {
-  const n = slot.versions.length
-  if (n === 0) {
-    return slot.selectedIdx
-  }
-  let idx = slot.selectedIdx
-  for (let step = 0; step < n; step++) {
-    idx = (idx + delta + n) % n
-    const url = slot.versions[idx]
-    if (typeof url === 'string' && url.length > 0) {
-      return idx
-    }
-  }
-  return slot.selectedIdx
+export function tileSlotHasResult(url: string | null | undefined): boolean {
+  return selectedTileResultUrl(url) !== null
 }
 
 /**
@@ -371,12 +331,12 @@ export interface InpaintVariant {
    * Display only — never sent to the API.
    */
   changeMaskOverlayUrl: string | null
-  /** Per-tile refine slots (four versions each) for this plan variant. */
-  tileResults: InpaintTileSlot[]
+  /** Per-tile refine URLs (one follow-the-plan result each) for this plan variant. */
+  tileResults: Array<string | null>
   /**
    * Full-image merge of this variant's running inpaint canvas stamped into
    * the source. Set as soon as the plan composite exists (before tiles);
-   * rebuilt whenever a tile version is generated or selected.
+   * rebuilt whenever a tile is generated.
    */
   stitchedPreviewUrl: string | null
 }
