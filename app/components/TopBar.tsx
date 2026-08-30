@@ -30,13 +30,20 @@ export function TopBar({
   setMode,
   onNewImage,
   onShowSettings,
+  showGrid = false,
+  onToggleGrid,
 }: {
   hasImage: boolean
   mode: Mode
   setMode: (m: Mode) => void
   onNewImage: () => void
   onShowSettings: () => void
+  /** Whether the 1000×1000 reference grid is on (extend + edit only). */
+  showGrid?: boolean
+  onToggleGrid?: () => void
 }) {
+  const canToggleGrid = hasImage && (mode === 'extender' || mode === 'edit')
+
   return (
     <header
       className="relative z-20 flex h-14 shrink-0 items-center justify-between border-b px-4 sm:px-6"
@@ -45,6 +52,27 @@ export function TopBar({
       <Logo />
       <ModeToggle mode={mode} setMode={setMode} />
       <div className="flex items-center gap-1.5">
+        {canToggleGrid && onToggleGrid ? (
+          <button
+            type="button"
+            onClick={onToggleGrid}
+            className="btn btn-ghost"
+            aria-pressed={showGrid}
+            title={
+              showGrid
+                ? 'Hide reference grid (Save will not include it)'
+                : 'Show 1000×1000 reference grid (Save will include it)'
+            }
+            style={
+              showGrid
+                ? { color: 'var(--accent)', borderColor: 'var(--accent-border)' }
+                : undefined
+            }
+          >
+            <Icons.Grid size={15} />
+            Grid
+          </button>
+        ) : null}
         {hasImage && (
           <button onClick={onNewImage} className="btn btn-ghost">
             <Icons.Plus size={15} />

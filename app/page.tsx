@@ -12,7 +12,8 @@ import { TileStudio } from '@/app/components/TileStudio'
 import { TopBar } from '@/app/components/TopBar'
 import { ResultActions, VariantSelector } from '@/app/components/VariantSelector'
 import { Workspace, TilingState, TileCellDisplay } from '@/app/components/Workspace'
-import { Candidate, Direction, EXTENSION_PERCENT, EXTEND_VARIANT_COUNT, LlmRequestDebug, MAX_AI_DIMENSION, MAX_PLAN_REGIONS, MAX_TILES_PER_EXTEND, Mode, PLAN_REGION_MAX_SCENE_DIM, PLAN_REGION_OVERLAP_TILES, PLAN_VARIANT_COUNT, REGIONAL_PLAN_TRIGGER_MULTIPLIER, ReferenceImage, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, TILE_OVERLAP_PX, createEmptyPlanVersions, timestampForFilename } from '@/app/lib/app'
+import { Candidate, Direction, EXTENSION_PERCENT, EXTEND_VARIANT_COUNT, LlmRequestDebug, MAX_AI_DIMENSION, MAX_PLAN_REGIONS, MAX_TILES_PER_EXTEND, Mode, PLAN_REGION_MAX_SCENE_DIM, PLAN_REGION_OVERLAP_TILES, PLAN_VARIANT_COUNT, REGIONAL_PLAN_TRIGGER_MULTIPLIER, ReferenceImage, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, STORAGE_SHOW_GRID, TILE_OVERLAP_PX, createEmptyPlanVersions, timestampForFilename } from '@/app/lib/app'
+import { bakeReferenceGrid } from '@/app/lib/referenceGrid'
 import { findStyleLabel } from '@/app/lib/artStyles'
 import { DEFAULT_MODEL, MODELS, skipsArtDirectorReview } from '@/app/lib/models'
 import { LAYER_ORDER, LAYER_ROLES, LayerRole, PARALLAX_MAX_AUTO_STEPS, ParallaxLayer, WORKFLOW_ORDER, createDefaultLayers, getRecommendedLayerIndex, getWorkflowPrerequisite } from '@/app/lib/parallax'
@@ -73,6 +74,8 @@ export default function Home() {
   const [customPrompt, setCustomPrompt] = useState('')
   const [artStyle, setArtStyle] = useState('none')
   const [debugMode, setDebugMode] = useState(false)
+  /** 1000×1000 reference grid overlay + Save bake (extend + edit). */
+  const [showGrid, setShowGrid] = useState(false)
 
   // ── Tiled extension plan ────────────────────────────────────────────────────
   /**
@@ -457,7 +460,11 @@ export default function Home() {
       const k = localStorage.getItem(STORAGE_KEY) || ''
       const m = localStorage.getItem(STORAGE_MODEL) || ''
       const savedMode = localStorage.getItem(STORAGE_MODE) || ''
+      const savedGrid = localStorage.getItem(STORAGE_SHOW_GRID) || ''
       setApiKey(k)
+      if (savedGrid === '1' || savedGrid === 'true') {
+        setShowGrid(true)
+      }
       if (m && MODELS.some((mm) => mm.value === m)) {
         setSelectedModel(m)
       }
@@ -506,6 +513,13 @@ export default function Home() {
       localStorage.setItem(STORAGE_MODEL, selectedModel)
     } catch {}
   }, [selectedModel, hydrated])
+
+  useEffect(() => {
+    if (!hydrated) return
+    try {
+      localStorage.setItem(STORAGE_SHOW_GRID, showGrid ? '1' : '0')
+    } catch {}
+  }, [showGrid, hydrated])
 
   const handleSaveApiKey = (key: string) => {
     setApiKey(key)
@@ -2790,12 +2804,22 @@ export default function Home() {
 
   /**
    * Download the completed extension as PNG. Filename mirrors Edit Save:
-   * `extended_YYYY-MM-DD_HH-MM-SS.png`.
+   * `extended_YYYY-MM-DD_HH-MM-SS.png`. When the reference grid is on,
+   * bake it onto a copy — the working image is unchanged.
    */
-  const handleDownload = () => {
+  const handleDownload = async () => {
     if (!selectedImage) return
+    let href = selectedImage
+    if (showGrid) {
+      try {
+        href = await bakeReferenceGrid(selectedImage)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to overlay grid on download')
+        return
+      }
+    }
     const link = document.createElement('a')
-    link.href = selectedImage
+    link.href = href
     link.download = `extended_${timestampForFilename()}.png`
     document.body.appendChild(link)
     link.click()
@@ -5722,6 +5746,8 @@ export default function Home() {
         setMode={setMode}
         onNewImage={handleNewImage}
         onShowSettings={() => setShowSettings(true)}
+        showGrid={showGrid}
+        onToggleGrid={() => setShowGrid((prev) => !prev)}
       />
 
       {isProps ? (
@@ -5836,6 +5862,7 @@ export default function Home() {
             onDropFile={handleFile}
             apiKey={apiKey}
             model={selectedModel}
+            showGrid={showGrid}
             onAccept={(newImageUrl) => {
               console.log('[page] EditStudio onAccept called — setting selectedImage', {
                 urlLength: newImageUrl.length,
@@ -5933,6 +5960,7 @@ export default function Home() {
           }
           isAutoGeneratingTiles={isAutoGeneratingTiles}
           onStopAutoGenerateTiles={stopAutoGenerateTiles}
+          showGrid={showGrid}
         />
       )}
 

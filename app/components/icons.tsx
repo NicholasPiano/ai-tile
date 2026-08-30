@@ -199,6 +199,13 @@ export const Icons = {
       <path d="M21 15l-5-5L5 21" />
     </>
   ),
+  /** 3×3 map grid — reference overlay toggle. */
+  Grid: svg(
+    <>
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <path d="M3 9h18M3 15h18M9 3v18M15 3v18" />
+    </>
+  ),
   /** Pencil — used for the Edit / inpaint mode tab. */
   Pencil: svg(
     <>

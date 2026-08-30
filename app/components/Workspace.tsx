@@ -3,6 +3,7 @@
 import { useState } from 'react'
 import { Icons } from '@/app/components/icons'
 import { PlanOptionCycler } from '@/app/components/Modals'
+import { ReferenceGridOverlay } from '@/app/components/ReferenceGridOverlay'
 import { StatusPill } from '@/app/components/TopBar'
 import { Direction, PLAN_VARIANT_COUNT } from '@/app/lib/app'
 
@@ -681,6 +682,7 @@ export function Workspace({
   onGenerateAllRegions,
   isAutoGeneratingTiles,
   onStopAutoGenerateTiles,
+  showGrid = false,
 }: {
   image: string
   dimensions: { width: number; height: number } | null
@@ -716,6 +718,8 @@ export function Workspace({
   isAutoGeneratingTiles?: boolean
   /** Stop the "Generate all" loop after the current step finishes. */
   onStopAutoGenerateTiles?: () => void
+  /** Paint the 1000×1000 reference grid over the image (and tiling band). */
+  showGrid?: boolean
 }) {
   const isTiling = !!tilingState
   const hasRegions = !!tilingState?.regions && tilingState.regions.length > 0
@@ -784,6 +788,17 @@ export function Workspace({
       } as Record<Direction, React.CSSProperties>)[tilingState.direction]
     : {}
 
+  const gridWidth = tilingState
+    ? isVertical
+      ? tilingState.imageWidth
+      : tilingState.imageWidth + tilingState.extensionSize
+    : dimensions?.width ?? 0
+  const gridHeight = tilingState
+    ? isVertical
+      ? tilingState.imageHeight + tilingState.extensionSize
+      : tilingState.imageHeight
+    : dimensions?.height ?? 0
+
   return (
     <div className="relative flex flex-1 flex-col items-center justify-center px-6 pb-6 pt-2">
       {/* ── Image frame (with optional tiling band) ──────────────────────── */}
@@ -839,7 +854,14 @@ export function Workspace({
             }`}
             draggable={false}
           />
+          {!isTiling && showGrid && gridWidth > 0 && gridHeight > 0 ? (
+            <ReferenceGridOverlay width={gridWidth} height={gridHeight} />
+          ) : null}
         </div>
+
+        {isTiling && showGrid && gridWidth > 0 && gridHeight > 0 ? (
+          <ReferenceGridOverlay width={gridWidth} height={gridHeight} />
+        ) : null}
 
         {/* Inline tile band (tiling mode) */}
         {tilingState && (

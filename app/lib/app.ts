@@ -191,6 +191,9 @@ export type LlmRequestDebug = {
 
 export const STORAGE_MODE = 'extender:mode'
 
+/** Whether the 1000×1000 reference grid overlay is visible / baked on Save. */
+export const STORAGE_SHOW_GRID = 'extender:show_grid'
+
 /**
  * Build a filesystem-safe timestamp for download filenames
  * (e.g. `2026-07-13_14-11-05`). Shared by Edit Save and Extend Download.

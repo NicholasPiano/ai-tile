@@ -19,6 +19,8 @@ import {
 } from '@/app/lib/app'
 import { EditPanel } from '@/app/components/EditPanel'
 import { Icons } from '@/app/components/icons'
+import { ReferenceGridOverlay } from '@/app/components/ReferenceGridOverlay'
+import { bakeReferenceGrid } from '@/app/lib/referenceGrid'
 import {
   buildLowResContextCrop,
   buildGlobalPlanInput,
@@ -555,6 +557,8 @@ export interface EditStudioProps {
   apiKey: string
   model: string
   onAccept: (newImageUrl: string) => void
+  /** Paint the 1000×1000 reference grid over the photo. */
+  showGrid?: boolean
 }
 
 /**
@@ -702,7 +706,7 @@ function cloneCanvas(source: HTMLCanvasElement): HTMLCanvasElement {
   return copy
 }
 
-export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, model, onAccept }: EditStudioProps) {
+export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, model, onAccept, showGrid = false }: EditStudioProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const viewportRef = useRef<HTMLDivElement>(null)
   const isDraggingRef = useRef(false)
@@ -755,6 +759,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   const [view, setView] = useState<ViewTransform>({ zoom: 1, panX: 0, panY: 0 })
   const [spaceDown, setSpaceDown] = useState(false)
   const [isPanning, setIsPanning] = useState(false)
+  const [exportError, setExportError] = useState<string | null>(null)
 
   spaceDownRef.current = spaceDown
 
@@ -1589,6 +1594,32 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     setDrag(null)
   }, [])
 
+  /**
+   * Download the current edit source as PNG. When the reference grid is on,
+   * bake it onto a copy — the working image is unchanged.
+   */
+  const handleSaveImage = useCallback(async () => {
+    if (!image) {
+      return
+    }
+    setExportError(null)
+    let href = image
+    if (showGrid) {
+      try {
+        href = await bakeReferenceGrid(image)
+      } catch (err) {
+        setExportError(err instanceof Error ? err.message : 'Failed to overlay grid')
+        return
+      }
+    }
+    const link = document.createElement('a')
+    link.href = href
+    link.download = `edited_${timestampForFilename()}.png`
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+  }, [image, showGrid])
+
   // Cycle variants with ← → when the description field is not focused.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -1697,6 +1728,10 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
                 }}
               />
 
+              {showGrid ? (
+                <ReferenceGridOverlay width={dimensions.width} height={dimensions.height} />
+              ) : null}
+
               <canvas
                 ref={canvasRef}
                 onMouseDown={handleMouseDown}
@@ -1741,14 +1776,8 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
               <button
                 className="btn btn-ghost text-[12px]"
                 style={{ padding: '2px 10px', height: 28 }}
-                onClick={() => {
-                  const link = document.createElement('a')
-                  link.href = image
-                  link.download = `edited_${timestampForFilename()}.png`
-                  document.body.appendChild(link)
-                  link.click()
-                  document.body.removeChild(link)
-                }}
+                title={exportError ?? (showGrid ? 'Download PNG with reference grid' : 'Download PNG')}
+                onClick={() => { void handleSaveImage() }}
               >
                 <Icons.Download size={12} />
                 Save
@@ -1802,6 +1831,11 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
               <p className="mt-1 text-[12px]" style={{ color: 'var(--text-muted)' }}>
                 Click and drag on the image to select the area you want to edit.
               </p>
+              {exportError ? (
+                <p className="mt-2 text-[12px]" style={{ color: 'var(--danger)' }}>
+                  {exportError}
+                </p>
+              ) : null}
             </div>
           </div>
         )}
