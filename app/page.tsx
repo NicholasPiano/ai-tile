@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { CommandBar } from '@/app/components/CommandBar'
+import { CropStudio } from '@/app/components/CropStudio'
 import { EditStudio } from '@/app/components/EditStudio'
 import { EmptyState } from '@/app/components/EmptyState'
 import { ApiKeyModal, ErrorToast, GenerateModal, LlmRequestInspector, RegionPlanModal, SettingsDrawer, TileExtensionModal, Toggle } from '@/app/components/Modals'
@@ -471,6 +472,8 @@ export default function Home() {
       if (
         savedMode === 'parallax' ||
         savedMode === 'extender' ||
+        savedMode === 'edit' ||
+        savedMode === 'crop' ||
         savedMode === 'tile' ||
         savedMode === 'sprite' ||
         savedMode === 'props'
@@ -5606,6 +5609,9 @@ export default function Home() {
       if (activeTileModalIdx !== null || activeRegionModalIdx !== null) {
         return
       }
+      if (mode === 'edit' || mode === 'crop') {
+        return
+      }
       // In parallax mode the active "image" is the active layer; in extender
       // mode it's the global selectedImage.
       const sourceAvailable =
@@ -5667,6 +5673,7 @@ export default function Home() {
   const variantCount = extendedCandidates.length
 
   const isEdit = mode === 'edit'
+  const isCrop = mode === 'crop'
   const isParallax = mode === 'parallax'
   const isTile = mode === 'tile'
   const isSprite = mode === 'sprite'
@@ -5725,7 +5732,7 @@ export default function Home() {
   return (
     <main
       className={
-        isEdit
+        isEdit || isCrop
           ? 'relative flex h-screen flex-col overflow-hidden'
           : 'relative flex min-h-screen flex-col'
       }
@@ -5874,6 +5881,28 @@ export default function Home() {
             }}
           />
         </div>
+      ) : isCrop ? (
+        <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
+          <CropStudio
+            image={selectedImage}
+            dimensions={currentImageDimensions}
+            onPickFile={() => fileInputRef.current?.click()}
+            onDropFile={handleFile}
+            showGrid={showGrid}
+            onApply={(imageUrl, dimensions) => {
+              setSelectedImage(imageUrl)
+              setCurrentImageDimensions(dimensions)
+              setExtendedCandidates([])
+              setCandidateDims([])
+              setSelectedCandidateIdx(0)
+              setHasCompletedExtension(false)
+              setImageBeforeExtension(null)
+              setLastExtensionParams(null)
+              setActiveDirection(null)
+              setPendingTiledPlan(null)
+            }}
+          />
+        </div>
       ) : !displayImage ? (
         <EmptyState
           mode={mode}
@@ -5966,12 +5995,13 @@ export default function Home() {
 
       {/* Command bar: extender mode shows it once an image exists; parallax
           mode shows it whenever the active layer has an image so users can
-          tweak the prompt while iterating. Tile, Props, and Sprite modes have
-          their own action bars built into the studio. */}
+          tweak the prompt while iterating. Edit, Crop, Tile, Props, and
+          Sprite modes have their own action bars built into the studio. */}
       {!isTile &&
         !isSprite &&
         !isProps &&
         !isEdit &&
+        !isCrop &&
         ((isParallax && !!activeLayer?.imageUrl) ||
           (!isParallax && !!selectedImage)) &&
         !isResult &&

@@ -127,7 +127,7 @@ export const STORAGE_MODEL = 'extender:model'
 // ─────────────────────────────────────────────────────────────────────────────
 
 
-export type Mode = 'extender' | 'edit' | 'parallax' | 'tile' | 'sprite' | 'props'
+export type Mode = 'extender' | 'edit' | 'crop' | 'parallax' | 'tile' | 'sprite' | 'props'
 
 /**
  * Minimum strip of original image pixels that surrounds every edit selection.
