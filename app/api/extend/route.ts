@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { buildExtendPrompt, buildGlobalPlanningPrompt, buildRegionalPlanningPrompt } from '@/app/lib/extendPrompt'
+import { buildExtendPrompt, buildExtendTileRefinePrompt, buildGlobalPlanningPrompt, buildRegionalPlanningPrompt } from '@/app/lib/extendPrompt'
 import { ReferenceImage } from '@/app/lib/app'
 
 // Default model when the client doesn't specify one.
@@ -184,11 +184,37 @@ export async function POST(request: NextRequest) {
         sceneBrief: sceneBrief ?? null,
         referenceImages: referenceImages?.map((r) => ({ description: r.description })),
       })
+    } else if (hasBakedPlanning && chunkInfo && typeof chunkInfo === 'object') {
+      // Phase 3 free add-detail refine — plan is inspiration; no refs, no
+      // outpainting continuity appendices.
+      const info = chunkInfo as {
+        direction?: string
+        originalWidth?: number
+        originalHeight?: number
+        chunkWidth?: number
+        chunkHeight?: number
+        extensionSize?: number
+        tileIndex?: number
+        tileCount?: number
+      }
+      prompt = buildExtendTileRefinePrompt({
+        direction: direction as 'up' | 'down' | 'left' | 'right',
+        chunkInfo: {
+          direction: (info.direction as 'up' | 'down' | 'left' | 'right') ?? (direction as 'up' | 'down' | 'left' | 'right'),
+          originalWidth: typeof info.originalWidth === 'number' ? info.originalWidth : 0,
+          originalHeight: typeof info.originalHeight === 'number' ? info.originalHeight : 0,
+          chunkWidth: typeof info.chunkWidth === 'number' ? info.chunkWidth : 0,
+          chunkHeight: typeof info.chunkHeight === 'number' ? info.chunkHeight : 0,
+          extensionSize: typeof info.extensionSize === 'number' ? info.extensionSize : 0,
+          tileIndex: typeof info.tileIndex === 'number' ? info.tileIndex : undefined,
+          tileCount: typeof info.tileCount === 'number' ? info.tileCount : undefined,
+        },
+        customPrompt: customPrompt ?? null,
+        layerRole: layerRole ?? null,
+        sceneBrief: sceneBrief ?? null,
+      })
     } else {
-      // Phase 2 (default): full extend prompt.
-      // When bakedPlanning is true the canvas already has the low-res planning
-      // preview composited into the extension area — the prompt frames the task
-      // as high-res rendering rather than free-form extension into grey space.
+      // Single-phase / grey-fill extend (no baked plan).
       prompt = buildExtendPrompt({
         direction: direction as 'up' | 'down' | 'left' | 'right',
         chunkInfo: (chunkInfo as Parameters<typeof buildExtendPrompt>[0]['chunkInfo']) ?? null,
@@ -200,7 +226,7 @@ export async function POST(request: NextRequest) {
         sceneBrief: sceneBrief ?? null,
         attempt,
         referenceImages: referenceImages?.map((r) => ({ description: r.description })),
-        hasBakedPlanning,
+        hasBakedPlanning: false,
       })
     }
 
@@ -214,11 +240,13 @@ export async function POST(request: NextRequest) {
       { type: 'image_url', image_url: { url: expandedCanvas } },
     ]
 
-    // IMAGE 2+ (refine) or IMAGE 2+ (plan) — user-supplied reference images.
-    // No separate planning guide image: when bakedPlanning is true the planning
-    // preview is already composited into IMAGE 1.
-    for (const ref of referenceImages ?? []) {
-      content.push({ type: 'image_url', image_url: { url: ref.dataUrl } })
+    // Reference images: plan calls and grey-fill extend may include them.
+    // Free add-detail refine withholds refs so the tile is not pulled back
+    // toward a global style brief (same as Edit refine).
+    if (!hasBakedPlanning) {
+      for (const ref of referenceImages ?? []) {
+        content.push({ type: 'image_url', image_url: { url: ref.dataUrl } })
+      }
     }
 
     content.push({ type: 'text', text: prompt })
@@ -234,7 +262,7 @@ export async function POST(request: NextRequest) {
       temperature: phase === 'plan'
         ? 0.3
         : hasBakedPlanning
-        ? (attempt === 0 ? 0.45 : attempt === 1 ? 0.55 : 0.65)
+        ? 0.5
         : (attempt === 0 ? 0.3 : attempt === 1 ? 0.5 : 0.7),
     }
 

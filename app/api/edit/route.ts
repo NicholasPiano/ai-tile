@@ -184,7 +184,7 @@ export async function POST(request: NextRequest) {
       }
 
       content.push({ type: 'text', text: prompt })
-      temperature = phase === 'plan' ? 0.4 : 0.3
+      temperature = phase === 'plan' ? 0.4 : 0.5
     }
 
     const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {

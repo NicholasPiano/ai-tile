@@ -269,9 +269,13 @@ export const INPAINT_VARIANT_COUNT = 4
 
 /**
  * How many options a global plan, region plan, or per-tile re-plan produces.
- * Refine passes stay at one result — they are instructed to follow the plan.
  */
 export const PLAN_VARIANT_COUNT = 4
+
+/**
+ * How many free add-detail refine samples each Edit / Extend tile produces.
+ */
+export const TILE_REFINE_VARIANT_COUNT = 4
 
 /**
  * How many candidates a simple (non-tiled) horizontal or vertical extend
@@ -287,17 +291,53 @@ export function createEmptyPlanVersions(): Array<string | null> {
 }
 
 /**
- * One empty refine URL per tile in the shared grid. Refine is a single
- * follow-the-plan pass, so each slot is one URL (or null before generate).
+ * Empty refine-version list for one tile (four null slots).
  */
-export function createEmptyInpaintTileSlots(tileCount: number): Array<string | null> {
-  return Array.from({ length: tileCount }, () => null)
+export function createEmptyTileRefineVersions(): Array<string | null> {
+  return Array.from({ length: TILE_REFINE_VARIANT_COUNT }, () => null)
 }
 
 /**
- * The refine URL for a tile, or null if none yet.
+ * One tile's refine results: up to {@link TILE_REFINE_VARIANT_COUNT} samples
+ * plus which one is stamped into the Accept canvas.
  */
-export function selectedTileResultUrl(url: string | null | undefined): string | null {
+export interface InpaintTileSlot {
+  versions: Array<string | null>
+  selectedIdx: number
+}
+
+/**
+ * One empty refine slot (four null versions, selection at 0).
+ */
+export function createEmptyInpaintTileSlot(): InpaintTileSlot {
+  return {
+    versions: createEmptyTileRefineVersions(),
+    selectedIdx: 0,
+  }
+}
+
+/**
+ * Empty refine slots for every tile in the shared grid.
+ */
+export function createEmptyInpaintTileSlots(tileCount: number): InpaintTileSlot[] {
+  return Array.from({ length: tileCount }, () => createEmptyInpaintTileSlot())
+}
+
+/**
+ * The selected refine URL for a tile slot, or null if none yet.
+ */
+export function selectedTileResultUrl(
+  slot: InpaintTileSlot | string | null | undefined,
+): string | null {
+  if (slot === null || slot === undefined) {
+    return null
+  }
+  // Legacy plain-URL shape (should not appear after migration).
+  if (typeof slot === 'string') {
+    return slot.length > 0 ? slot : null
+  }
+  const idx = Math.max(0, Math.min(slot.selectedIdx, slot.versions.length - 1))
+  const url = slot.versions[idx]
   if (typeof url !== 'string' || url.length === 0) {
     return null
   }
@@ -305,10 +345,30 @@ export function selectedTileResultUrl(url: string | null | undefined): string | 
 }
 
 /**
- * True when this tile has a refine result to show.
+ * True when this tile has at least one refine result to show / cycle.
  */
-export function tileSlotHasResult(url: string | null | undefined): boolean {
-  return selectedTileResultUrl(url) !== null
+export function tileSlotHasResult(
+  slot: InpaintTileSlot | string | null | undefined,
+): boolean {
+  if (slot === null || slot === undefined) {
+    return false
+  }
+  if (typeof slot === 'string') {
+    return slot.length > 0
+  }
+  return slot.versions.some((url) => typeof url === 'string' && url.length > 0)
+}
+
+/**
+ * How many filled refine versions a slot has (for the 1/N cycler).
+ */
+export function tileSlotVersionCount(
+  slot: InpaintTileSlot | null | undefined,
+): number {
+  if (!slot) {
+    return 0
+  }
+  return slot.versions.filter((url) => typeof url === 'string' && url.length > 0).length
 }
 
 /**
@@ -334,12 +394,12 @@ export interface InpaintVariant {
    * Display only — never sent to the API.
    */
   changeMaskOverlayUrl: string | null
-  /** Per-tile refine URLs (one follow-the-plan result each) for this plan variant. */
-  tileResults: Array<string | null>
+  /** Per-tile refine slots (four free add-detail versions each) for this plan variant. */
+  tileResults: InpaintTileSlot[]
   /**
    * Full-image merge of this variant's running inpaint canvas stamped into
    * the source. Set as soon as the plan composite exists (before tiles);
-   * rebuilt whenever a tile is generated.
+   * rebuilt whenever a tile is generated or a refine option is cycled.
    */
   stitchedPreviewUrl: string | null
 }

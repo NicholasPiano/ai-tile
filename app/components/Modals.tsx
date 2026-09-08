@@ -3,7 +3,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { Icons } from '@/app/components/icons'
 import { ART_STYLE_GROUPS } from '@/app/lib/artStyles'
-import { buildExtendPrompt, buildGlobalPlanningPrompt, buildRegionalPlanningPrompt, combineExtendPrompts } from '@/app/lib/extendPrompt'
+import { buildExtendPrompt, buildExtendTileRefinePrompt, buildGlobalPlanningPrompt, buildRegionalPlanningPrompt, combineExtendPrompts } from '@/app/lib/extendPrompt'
 import {
   buildRegionalPlanningMap,
   buildTileChunkInfo,
@@ -1538,6 +1538,12 @@ export interface TileExtensionModalProps {
   planOptionIdx?: number
   /** Cycle Phase-2 plan options (arrow keys in the modal). */
   onCyclePlanOption?: (delta: 1 | -1) => void
+  /** How many Phase-3 refine options exist for this tile (0 if none yet). */
+  refineOptionCount?: number
+  /** Selected Phase-3 refine option index. */
+  refineOptionIdx?: number
+  /** Cycle refine options (button-only). */
+  onCycleRefineOption?: (delta: 1 | -1) => void
 }
 
 export function TileExtensionModal({
@@ -1577,6 +1583,9 @@ export function TileExtensionModal({
   planOptionCount = 0,
   planOptionIdx = 0,
   onCyclePlanOption,
+  refineOptionCount = 0,
+  refineOptionIdx = 0,
+  onCycleRefineOption,
 }: TileExtensionModalProps) {
   const [inputImageUrl, setInputImageUrl] = useState<string | null>(null)
   const [resultDimensions, setResultDimensions] = useState<{ width: number; height: number } | null>(null)
@@ -1624,7 +1633,7 @@ export function TileExtensionModal({
     }
   }, [open, bandCanvas, tileSpec])
 
-  // Build the tile-slice composite: INPUT with a lightly softened planning
+  // Build the tile-slice composite: INPUT with a hard planning
   // guide in the blank region (same treatment as the API composite).
   useEffect(() => {
     if (!inputImageUrl || !planningSlice) {
@@ -1756,23 +1765,31 @@ export function TileExtensionModal({
   const trimmedTilePrompt = tilePrompt.trim() || undefined
   // Global first, then per-tile override when both are set. Phase 3 (refine)
   // in two-phase mode only includes direction when an explicit tile override
-  // exists — otherwise it stays a faithful high-res render of the plan.
+  // exists — otherwise it is a free add-detail pass inspired by the plan.
   const planningEffectivePrompt = combineExtendPrompts(globalPrompt, tilePrompt)
   const refineEffectivePrompt = showTwoPhase
     ? (trimmedTilePrompt ? combineExtendPrompts(globalPrompt, tilePrompt) : undefined)
     : combineExtendPrompts(globalPrompt, tilePrompt)
 
-  const assembledPrompt = buildExtendPrompt({
-    direction,
-    chunkInfo,
-    useFullContext: false,
-    customPrompt: refineEffectivePrompt ?? null,
-    artStyle: artStyle !== 'none' ? artStyle : null,
-    layerRole: layerRole ?? null,
-    sceneBrief: sceneBrief ?? null,
-    referenceImages: populatedRefs.map((r) => ({ description: r.description })),
-    hasBakedPlanning: showTwoPhase,
-  })
+  const assembledPrompt = showTwoPhase
+    ? buildExtendTileRefinePrompt({
+        direction,
+        chunkInfo,
+        customPrompt: refineEffectivePrompt ?? null,
+        layerRole: layerRole ?? null,
+        sceneBrief: sceneBrief ?? null,
+      })
+    : buildExtendPrompt({
+        direction,
+        chunkInfo,
+        useFullContext: false,
+        customPrompt: refineEffectivePrompt ?? null,
+        artStyle: artStyle !== 'none' ? artStyle : null,
+        layerRole: layerRole ?? null,
+        sceneBrief: sceneBrief ?? null,
+        referenceImages: populatedRefs.map((r) => ({ description: r.description })),
+        hasBakedPlanning: false,
+      })
 
   const planningPromptText = showTwoPhase
     ? buildGlobalPlanningPrompt({
@@ -2150,13 +2167,39 @@ export function TileExtensionModal({
                         <PlanOptionCycler
                           index={planOptionIdx}
                           total={PLAN_VARIANT_COUNT}
-                          disabled={isGenerating || isAcceptingPlan}
+                          disabled={isGenerating || isAcceptingPlan || hasPreview}
                           onPrev={() => onCyclePlanOption(-1)}
                           onNext={() => onCyclePlanOption(1)}
                         />
                       </div>
                       <div className="flex-1" aria-hidden />
-                      {hasPreview ? <div className="flex-1" aria-hidden /> : null}
+                      {hasPreview && refineOptionCount > 1 && onCycleRefineOption ? (
+                        <div className="flex flex-1 justify-center">
+                          <PlanOptionCycler
+                            index={refineOptionIdx}
+                            total={refineOptionCount}
+                            disabled={isGenerating || isAcceptingPlan || !isNextPending}
+                            onPrev={() => onCycleRefineOption(-1)}
+                            onNext={() => onCycleRefineOption(1)}
+                          />
+                        </div>
+                      ) : hasPreview ? (
+                        <div className="flex-1" aria-hidden />
+                      ) : null}
+                    </div>
+                  ) : hasPreview && refineOptionCount > 1 && onCycleRefineOption ? (
+                    <div className="mb-2 flex gap-4">
+                      <div className="flex-1" aria-hidden />
+                      <div className="flex-1" aria-hidden />
+                      <div className="flex flex-1 justify-center">
+                        <PlanOptionCycler
+                          index={refineOptionIdx}
+                          total={refineOptionCount}
+                          disabled={isGenerating || isAcceptingPlan || !isNextPending}
+                          onPrev={() => onCycleRefineOption(-1)}
+                          onNext={() => onCycleRefineOption(1)}
+                        />
+                      </div>
                     </div>
                   ) : null}
                 <div className="flex gap-4">

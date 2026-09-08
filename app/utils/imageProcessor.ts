@@ -2091,27 +2091,17 @@ export function buildTileInput(
 }
 
 /**
- * Draw a lightly softened planning guide into the tile blank region.
+ * Draw a hard (sharp) planning guide into the tile blank region.
  *
  * Plan slices live at map scale (only downscaled to fit `MAX_AI_DIMENSION`).
- * Upscaling them sharp can leave pixel-grid structure the model copies; a
- * light blur proportional to the upscale factor softens that without wiping
- * the plan detail Phase 3 needs for guided super-resolution.
+ * High-quality upsample with no extra blur — matches Edit's hard plan stamp
+ * so the model sees the plan as clear inspiration rather than pre-blurred mush.
  */
-export function drawSoftenedPlanningGuide(
+export function drawHardPlanningGuide(
   ctx: CanvasRenderingContext2D,
   sliceImg: HTMLImageElement,
   blankRegion: { x: number; y: number; width: number; height: number },
 ): void {
-  const scale = Math.max(
-    blankRegion.width / Math.max(1, sliceImg.naturalWidth),
-    blankRegion.height / Math.max(1, sliceImg.naturalHeight),
-  )
-  // Lighter than the old curve (was scale×1.5, floor 8, cap 48).
-  const blurPx = scale > 1.5
-    ? Math.min(16, Math.max(3, Math.round(scale * 0.5)))
-    : 0
-
   const guide = document.createElement('canvas')
   guide.width = blankRegion.width
   guide.height = blankRegion.height
@@ -2129,13 +2119,20 @@ export function drawSoftenedPlanningGuide(
 
   gctx.imageSmoothingEnabled = true
   gctx.imageSmoothingQuality = 'high'
-  if (blurPx > 0) {
-    gctx.filter = `blur(${blurPx}px)`
-  }
   gctx.drawImage(sliceImg, 0, 0, blankRegion.width, blankRegion.height)
-  gctx.filter = 'none'
-
   ctx.drawImage(guide, blankRegion.x, blankRegion.y)
+}
+
+/**
+ * @deprecated Use {@link drawHardPlanningGuide}. Kept as an alias so any
+ * leftover call sites keep compiling during the soft→hard migration.
+ */
+export function drawSoftenedPlanningGuide(
+  ctx: CanvasRenderingContext2D,
+  sliceImg: HTMLImageElement,
+  blankRegion: { x: number; y: number; width: number; height: number },
+): void {
+  drawHardPlanningGuide(ctx, sliceImg, blankRegion)
 }
 
 /** Axis-aligned rect in tile-local pixel coordinates. */
@@ -2236,7 +2233,7 @@ function restoreAcceptedNeighbourOverlaps(
  * Composite a tile input image with a planning guide in the blank region.
  *
  * Used by the TileExtensionModal preview so the user sees the same plan
- * placement that Phase 3 refine receives (light soften on upsample).
+ * placement that Phase 3 refine receives (hard upsample, no extra blur).
  *
  * Pass `allTileSpecs` + `tileAccepted` and a live `bandCanvas` so that
  * accepted-neighbour overlaps can be restored with high-res pixels after the
@@ -2261,7 +2258,7 @@ export function compositeTileInputWithPlanning(
         return planningSlice
       }
       ctx.drawImage(inputImg, 0, 0)
-      drawSoftenedPlanningGuide(ctx, sliceImg, blankRegion)
+      drawHardPlanningGuide(ctx, sliceImg, blankRegion)
       // Restore high-res pixels from accepted neighbours that overlap the blank region.
       if (bandCanvas && allTileSpecs && tileAccepted) {
         restoreAcceptedNeighbourOverlaps(ctx, bandCanvas, tileSpec, allTileSpecs, tileAccepted)
@@ -2276,8 +2273,8 @@ export function compositeTileInputWithPlanning(
  *
  * Layout:
  *   - High-res context strip from the band canvas (preserved exactly).
- *   - Low-res plan guide lightly softened into the blank region (layout +
- *     colour preserved; only previously downscaled to fit the API limit).
+ *   - Low-res plan guide hard-stamped into the blank region (layout +
+ *     colour preserved; high-quality upsample only — no extra blur).
  *   - High-res pixels from accepted neighbour tiles restored on top of the
  *     plan guide wherever they overlap the current tile's blank region
  *     (e.g. the tile directly above in the same column).
@@ -2309,9 +2306,9 @@ export function buildTileSliceComposite(
 
     const sliceImg = new Image()
     sliceImg.onload = () => {
-      // Step 2: lightly softened plan guide over the full blank region
+      // Step 2: hard plan guide over the full blank region
       // (overwrites any accepted-neighbour pixels inside blankRegion).
-      drawSoftenedPlanningGuide(ctx, sliceImg, blankRegion)
+      drawHardPlanningGuide(ctx, sliceImg, blankRegion)
 
       // Step 3: restore accepted-neighbour overlaps with high-res pixels so
       // the model sees real content where it is already available.
