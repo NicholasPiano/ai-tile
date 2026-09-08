@@ -85,6 +85,19 @@ export interface BuildRegionalPlanningPromptParams {
 }
 
 /**
+ * Params for the Phase 3 free add-detail refine prompt (baked plan in IMAGE 1).
+ * Deliberately omits reference images, art-style, and outpainting continuity —
+ * those fight a free detail pass.
+ */
+export interface BuildExtendTileRefinePromptParams {
+  direction: 'up' | 'down' | 'left' | 'right'
+  chunkInfo: PromptChunkInfo
+  customPrompt?: string | null
+  layerRole?: string | null
+  sceneBrief?: string | null
+}
+
+/**
  * Merge the CommandBar global prompt with a tile/region-specific override.
  * Global comes first; specific appends when both are set. Either alone is fine.
  */
@@ -432,6 +445,108 @@ KEY INSTRUCTIONS:
   // Suppress unused `attempt` lint warning — kept for future temperature-based
   // adjustments (same pattern the route uses).
   void attempt
+
+  return prompt
+}
+
+// ── Phase-3 free add-detail refine prompt ──────────────────────────────────
+
+/**
+ * Prompt for Phase 3 tile refine when IMAGE 1 already has the low-res plan
+ * baked into the extension area. Free add-detail pass: plan is inspiration,
+ * existing high-res pixels are the only hard lock.
+ */
+export function buildExtendTileRefinePrompt(
+  params: BuildExtendTileRefinePromptParams,
+): string {
+  const { direction, chunkInfo, customPrompt, layerRole, sceneBrief } = params
+
+  const directionDescriptions: Record<string, string> = {
+    up: 'top',
+    down: 'bottom',
+    left: 'left side',
+    right: 'right side',
+  }
+  const dirDesc = directionDescriptions[direction]
+  const isHorizDir = direction === 'left' || direction === 'right'
+  const contextPx = isHorizDir ? chunkInfo.chunkWidth : chunkInfo.chunkHeight
+  const extPx = chunkInfo.extensionSize
+  const contextSide =
+    direction === 'down' ? 'top'
+    : direction === 'up' ? 'bottom'
+    : direction === 'right' ? 'left'
+    : 'right'
+
+  const chunkW =
+    direction === 'left' || direction === 'right'
+      ? chunkInfo.chunkWidth + chunkInfo.extensionSize
+      : chunkInfo.originalWidth
+  const chunkH =
+    direction === 'up' || direction === 'down'
+      ? chunkInfo.chunkHeight + chunkInfo.extensionSize
+      : chunkInfo.originalHeight
+
+  let prompt = `You are an expert photo detail-enhancement artist performing a FREE ADD-DETAIL pass on a ${isHorizDir ? 'vertical' : 'horizontal'} strip.
+
+PIXEL LAYOUT OF THIS IMAGE:
+- ${contextSide.toUpperCase()} ${contextPx}px → HIGH-RESOLUTION existing scene content (and any already-finished neighbour pixels). Preserve these pixels EXACTLY — pixel-perfect, no changes whatsoever. They are your quality target and the only hard lock.
+- ${dirDesc.toUpperCase()} ${extPx}px → LOW-RESOLUTION COMPOSITION PLAN of a suggested continuation (upscaled in place). Treat it as INSPIRATION only — a suggested layout and subject matter, NOT a photograph to trace and NOT a composition lock.
+
+YOUR JOB:
+1. Preserve EVERY pixel in the ${contextSide} ${contextPx}px high-resolution area exactly as-is.
+2. Redraw the ${dirDesc} ${extPx}px plan area at full native resolution as a richly detailed, finished patch that could have been part of the original image.
+3. You MAY change objects, add features the plan never showed, and take a different compositional read if that produces a richer result.
+4. Do NOT reproduce the plan's soft, posterized, or blob-like forms as sharper versions of themselves — that is a FAILURE.
+5. Make the boundary between the high-resolution and detailed areas completely invisible — match texture, lighting, colour, perspective, scale, and detail level at the seam.
+
+QUALITY AUTHORITY:
+- The high-resolution ${contextSide} context strip sets HOW detailed and sharp the result must look.
+- The plan is optional inspiration for WHAT might be there — invent the detail and features a finished image would have here.
+- Success looks like a continuous scene at continuous quality, not a sharpened upsample of the plan.`
+
+  const trimmed = typeof customPrompt === 'string' ? customPrompt.trim() : ''
+  if (trimmed.length > 0) {
+    prompt += `\n\nUSER DIRECTION for what to enrich in the ${dirDesc} extension area: "${trimmed}". Apply this as creative direction for the detail pass.`
+  } else {
+    prompt += `\n\nNo extra user direction — simply add native-resolution detail inspired by the plan.`
+  }
+
+  const KEY_COLOR_HEX = '#FF00FF'
+  if (typeof layerRole === 'string') {
+    if (layerRole === 'sky') {
+      prompt += `\n\nPARALLAX LAYER — SKY / BACK (must tile horizontally):
+- This image is the back-most opaque layer of a parallax scene. The new area must continue the same sky / atmosphere / very-distant horizon only — do NOT introduce mid-ground or foreground elements. Keep the result fully opaque, no transparency, no magenta.
+- HORIZONTALLY UNIFORM TONE is required for tileability:
+  • The sky tone (color, brightness, saturation) must be IDENTICAL at every X position, including the new area you fill — no left-to-right gradient, no warm-to-cool drift, no one-side-darker-than-the-other.
+  • Any gradient must run TOP-TO-BOTTOM ONLY. If the existing image already has a top-to-bottom gradient, copy that exact gradient column-for-column into the new area; every horizontal row at the same Y must end up the same color across the whole result.
+  • Do NOT introduce a sun, moon, sunbeams, sunrise/sunset glow, gradient backlighting, vignettes, or any directional light source. If the existing image contains any such directional lighting, blend it OUT in the new area so the result becomes horizontally uniform.
+  • Cloud distribution should be roughly even across X — do not concentrate clouds on one side of the new area.`
+    } else if (layerRole === 'far' || layerRole === 'mid' || layerRole === 'near') {
+      const roleDesc =
+        layerRole === 'far'
+          ? 'far-distant silhouettes only (distant mountains, faint horizon line)'
+          : layerRole === 'mid'
+          ? 'mid-distance scene elements only (mid-size trees, buildings, terrain features)'
+          : 'near foreground elements only (near grass, foreground bushes, rocks, near tree trunks)'
+      prompt += `\n\nPARALLAX LAYER — ${layerRole.toUpperCase()} (alpha-keyed):
+- This image is a parallax layer where everything OUTSIDE the actual scene elements is a perfectly flat solid pure magenta color exactly ${KEY_COLOR_HEX} (R=255, G=0, B=255). That magenta will be removed by the client and replaced with transparency.
+- In the new area you fill, render ONLY ${roleDesc}. Everywhere else in the new area MUST also be the same flat solid ${KEY_COLOR_HEX} magenta — no other background colors, no sky, no other layers' content.
+- Continue the existing elements naturally into the new area. Element silhouettes should be crisp against the magenta to minimize halos.
+- Do NOT change the magenta background color in any region — it must stay pure ${KEY_COLOR_HEX} everywhere outside the elements, both in the existing area and in the new area.`
+    }
+  }
+
+  if (typeof sceneBrief === 'string' && sceneBrief.trim()) {
+    prompt += `\n\nSHARED SCENE DIRECTION — maintain this art direction in the detailed area (palette, lighting, mood, style). Do not drift from it:\n${sceneBrief.trim()}`
+  }
+
+  prompt += `\n\nOUTPUT DIMENSIONS: Return the complete image at exactly ${chunkW}x${chunkH} pixels — the same dimensions as the input. Detail the extension-area plan to full native fidelity matching the high-resolution context strip. Do NOT return a different size or aspect ratio.`
+
+  if (typeof chunkInfo.tileIndex === 'number' && typeof chunkInfo.tileCount === 'number') {
+    prompt += `\n\nTILE CONTEXT: This is tile ${chunkInfo.tileIndex + 1} of ${chunkInfo.tileCount} in a larger extension. Any high-resolution edge shows content from an already-finished neighbour tile — continue the scene seamlessly across every such edge. Do NOT repeat or mirror content from neighbouring tiles.`
+  }
+
+  prompt += `\n\nFINAL OUTPUT: Return the complete strip with the ${dirDesc} area richly detailed and the ${contextSide} context strip pixel-perfect. The seam must be invisible.`
 
   return prompt
 }

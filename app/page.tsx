@@ -12,7 +12,7 @@ import { TileStudio } from '@/app/components/TileStudio'
 import { TopBar } from '@/app/components/TopBar'
 import { ResultActions, VariantSelector } from '@/app/components/VariantSelector'
 import { Workspace, TilingState, TileCellDisplay } from '@/app/components/Workspace'
-import { Candidate, Direction, EXTENSION_PERCENT, EXTEND_VARIANT_COUNT, LlmRequestDebug, MAX_AI_DIMENSION, MAX_PLAN_REGIONS, MAX_TILES_PER_EXTEND, Mode, PLAN_REGION_MAX_SCENE_DIM, PLAN_REGION_OVERLAP_TILES, PLAN_VARIANT_COUNT, REGIONAL_PLAN_TRIGGER_MULTIPLIER, ReferenceImage, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, STORAGE_SHOW_GRID, TILE_OVERLAP_PX, createEmptyPlanVersions, timestampForFilename } from '@/app/lib/app'
+import { Candidate, Direction, EXTENSION_PERCENT, EXTEND_VARIANT_COUNT, LlmRequestDebug, MAX_AI_DIMENSION, MAX_PLAN_REGIONS, MAX_TILES_PER_EXTEND, Mode, PLAN_REGION_MAX_SCENE_DIM, PLAN_REGION_OVERLAP_TILES, PLAN_VARIANT_COUNT, REGIONAL_PLAN_TRIGGER_MULTIPLIER, ReferenceImage, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL, STORAGE_SHOW_GRID, TILE_OVERLAP_PX, TILE_REFINE_VARIANT_COUNT, createEmptyPlanVersions, createEmptyTileRefineVersions, timestampForFilename } from '@/app/lib/app'
 import { bakeReferenceGrid } from '@/app/lib/referenceGrid'
 import { findStyleLabel } from '@/app/lib/artStyles'
 import { DEFAULT_MODEL, MODELS, skipsArtDirectorReview } from '@/app/lib/models'
@@ -20,7 +20,7 @@ import { LAYER_ORDER, LAYER_ROLES, LayerRole, PARALLAX_MAX_AUTO_STEPS, ParallaxL
 import { PROP_BATCH, PROP_BATCH_COLS, PROP_BATCH_H, PROP_BATCH_ROWS, PROP_BATCH_W, PROP_TILE_SIZE, PropItem, nextPropId, propAtlasLayout, resolvePropNames } from '@/app/lib/props'
 import { SPRITE_ANIMATIONS, SPRITE_FRAME_COUNT, SPRITE_FRAME_SIZE, SPRITE_GRID_COLS, SPRITE_GRID_ROWS, SPRITE_SHEET_H, SPRITE_SHEET_W, SPRITE_STRIP_H, SPRITE_STRIP_W, SpriteAnimType, SpriteFrame, SpriteSheet, createEmptySpriteSheet } from '@/app/lib/sprite'
 import { BODY_PLANS, BodyPlan, isAirborneAnim } from '@/app/lib/bodyPlans'
-import { buildExtendPrompt, buildGlobalPlanningPrompt, buildRegionalPlanningPrompt, combineExtendPrompts } from '@/app/lib/extendPrompt'
+import { buildExtendPrompt, buildExtendTileRefinePrompt, buildGlobalPlanningPrompt, buildRegionalPlanningPrompt, combineExtendPrompts } from '@/app/lib/extendPrompt'
 import { CORNER_GRAFTS, ENABLE_CORNER_RECONCILE, TILESET_ATLAS_EXTRUDE_PX, TILESET_BY_ROLE, TILESET_COLS, TILESET_PADDED_SHEET_H, TILESET_PADDED_SHEET_W, TILESET_PADDED_STRIDE, TILESET_ROWS, TILESET_SHEET_H, TILESET_SHEET_W, TILESET_SLOTS, TILESET_TILE_SIZE, TILE_TEMPLATE_CELL, TILE_TEMPLATE_COLS, TILE_TEMPLATE_H, TILE_TEMPLATE_MASK, TILE_TEMPLATE_ROWS, TILE_TEMPLATE_SAMPLES, TILE_TEMPLATE_W, TileSetRole, TileSetSlot, alignAiOutputToTemplate, applyFeatheredRoleMask, buildTileSheetGuideDataUrl, createEmptyTileSet, rebuildCornerTile, reconcileAllCorners, templateRoleForCell } from '@/app/lib/tileset'
 import { alignSpriteFramesToBaseline, applyFullContextResult, assembleTileFromPlanningSlice, buildGlobalPlanningMap, buildPerTilePlanningMap, buildRegionalExtensionView, buildRegionalPlanningMap, buildTileChunkInfo, buildTileInput, buildTileSliceComposite, buildTilePlanningMap, centerSpriteFramesHorizontally, ChunkInfo, chromaKeyToAlpha, compositeTileResult, computeRegionMapLayout, createChunkedExtension, createFullContextExtension, cropGlobalPlanExtensionView, cropPlanningResult, defaultTileSeamMix, ExtensionTileSpec, getImageDimensions, groupTilesIntoPlanRegions, harmonizeHorizontalSeams, initBandCanvas, isolatePrimarySpriteComponent, isAiExtensionUnfilled, isTileResultUnfilled, lockPasteTileKnownPixels, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, mapTileRectIntoRegionLayout, measureSeamResidual, normalizeSpriteFrameScale, normalizeTileImageToSize, padPlanCanvasToModelBucket, PlanRegionGrouping, PlanTileRegion, planExtensionTiles, PriorRegionResult, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk, TiledExtensionPlan, TileShimmyOffset, unpadImageFromAspectBucket } from '@/app/utils/imageProcessor'
 import { SubjectBounds, drawPoseGuideSheet, measureSubjectBounds } from '@/app/utils/poseRig'
@@ -102,6 +102,13 @@ export default function Home() {
     tilePrompts: string[]
     /** Per non-skipped tile: result data URL after API call, or null. */
     tilePreviews: (string | null)[]
+    /**
+     * Four Phase-3 refine options per tile. `tilePreviews[i]` is the
+     * selected option when any version is filled.
+     */
+    tileRefineVersions: Array<Array<string | null>>
+    /** Which of the four refine options is active. */
+    selectedTileRefineVariantIdx: number[]
     /**
      * Per non-skipped tile: per-tile plan override slice (Phase 2 re-plan result).
      * null = derive slice from the global plan; non-null = use this override.
@@ -1360,21 +1367,30 @@ export default function Home() {
           )
         : buildTileInput(canvas, tileSpec)
 
-      const refineClientPrompt = buildExtendPrompt({
-        direction,
-        chunkInfo,
-        useFullContext: false,
-        customPrompt: refinePrompt ?? null,
-        artStyle: artStyle !== 'none' ? artStyle : null,
-        layerRole: layerRole ?? null,
-        sceneBrief: mode === 'parallax' && sceneBrief.trim() ? sceneBrief.trim() : null,
-        referenceImages: populatedRefs.map((r) => ({ description: r.description })),
-        hasBakedPlanning: !!planningGuide,
-      })
+      const refineClientPrompt = planningGuide
+        ? buildExtendTileRefinePrompt({
+            direction,
+            chunkInfo,
+            customPrompt: refinePrompt ?? null,
+            layerRole: layerRole ?? null,
+            sceneBrief: mode === 'parallax' && sceneBrief.trim() ? sceneBrief.trim() : null,
+          })
+        : buildExtendPrompt({
+            direction,
+            chunkInfo,
+            useFullContext: false,
+            customPrompt: refinePrompt ?? null,
+            artStyle: artStyle !== 'none' ? artStyle : null,
+            layerRole: layerRole ?? null,
+            sceneBrief: mode === 'parallax' && sceneBrief.trim() ? sceneBrief.trim() : null,
+            referenceImages: populatedRefs.map((r) => ({ description: r.description })),
+            hasBakedPlanning: false,
+          })
       const refineCallOpts = {
         phase: 'refine' as const,
         bakedPlanning: !!planningGuide,
-        populatedRefs,
+        // Free add-detail refine withholds refs (API also strips them when baked).
+        populatedRefs: planningGuide ? [] as typeof populatedRefs : populatedRefs,
         effectivePrompt: refinePrompt,
         clientPromptFallback: refineClientPrompt,
         debugLabel: `Phase 3 — Refine tile ${nsIdx + 1}`,
@@ -1382,8 +1398,7 @@ export default function Home() {
 
       /**
        * One refine call, optional unfilled retry, then lock-paste context
-       * pixels so Accept keeps what the user sees. Extra samples are not
-       * useful here — the prompt tells the model to follow the plan.
+       * pixels so Accept keeps what the user sees.
        */
       const generateOneRefine = async (label: string): Promise<string> => {
         let raw = await normaliseTileResult(await callApi(tileCanvas, {
@@ -1407,20 +1422,35 @@ export default function Home() {
         )
       }
 
-      const raw = await generateOneRefine(`Phase 3 — Refine tile ${nsIdx + 1}`)
-      if (typeof raw !== 'string' || raw.length === 0) {
+      // Four parallel free add-detail samples so the user can pick.
+      const optionResults = await Promise.all(
+        Array.from({ length: TILE_REFINE_VARIANT_COUNT }, (_, optionIdx) =>
+          generateOneRefine(`Phase 3 — Refine tile ${nsIdx + 1} option ${optionIdx + 1}`),
+        ),
+      )
+      if (optionResults.some((url) => typeof url !== 'string' || url.length === 0)) {
+        throw new Error('Tile API returned no image')
+      }
+      const selectedUrl = optionResults[0]
+      if (typeof selectedUrl !== 'string' || selectedUrl.length === 0) {
         throw new Error('Tile API returned no image')
       }
 
       setPendingTiledPlan((prev) => {
         if (!prev) return null
         const next = [...prev.tilePreviews]
-        next[nsIdx] = raw
+        next[nsIdx] = selectedUrl
+        const nextVersions = [...prev.tileRefineVersions]
+        nextVersions[nsIdx] = optionResults
+        const nextSelected = [...prev.selectedTileRefineVariantIdx]
+        nextSelected[nsIdx] = 0
         const staleTileIds = new Set(prev.staleTileIds)
         staleTileIds.delete(nsIdx)
         const updated = {
           ...prev,
           tilePreviews: next,
+          tileRefineVersions: nextVersions,
+          selectedTileRefineVariantIdx: nextSelected,
           staleTileIds,
           generatingTileIdx: null,
           generatingPlanOnly: false,
@@ -1593,11 +1623,17 @@ export default function Home() {
         if (!prev) return null
         const next = [...prev.tilePreviews]
         next[nsIdx] = assembled
+        const nextVersions = [...prev.tileRefineVersions]
+        nextVersions[nsIdx] = [assembled, null, null, null]
+        const nextSelected = [...prev.selectedTileRefineVariantIdx]
+        nextSelected[nsIdx] = 0
         const staleTileIds = new Set(prev.staleTileIds)
         staleTileIds.delete(nsIdx)
         const updated = {
           ...prev,
           tilePreviews: next,
+          tileRefineVersions: nextVersions,
+          selectedTileRefineVariantIdx: nextSelected,
           staleTileIds,
           acceptingPlanTileIdx: null,
         }
@@ -2297,6 +2333,47 @@ export default function Home() {
     })
   }, [])
 
+  /**
+   * Cycle this tile's four Phase-3 refine options. Accept / merge use the
+   * selected preview. Disabled after accept (pixels already locked in band).
+   */
+  const cycleTileRefineVariant = useCallback((nsIdx: number, delta: 1 | -1) => {
+    commitPendingTiledPlan((prev) => {
+      if (prev.tileAccepted[nsIdx]) {
+        return prev
+      }
+      const versions = prev.tileRefineVersions[nsIdx]
+      if (!versions) {
+        return prev
+      }
+      const n = versions.length
+      if (n === 0) {
+        return prev
+      }
+      let nextIdx = (prev.selectedTileRefineVariantIdx[nsIdx] + delta + n) % n
+      for (let step = 0; step < n; step++) {
+        const url = versions[nextIdx]
+        if (typeof url === 'string' && url.length > 0) {
+          break
+        }
+        nextIdx = (nextIdx + delta + n) % n
+      }
+      const selected = versions[nextIdx]
+      if (typeof selected !== 'string' || selected.length === 0) {
+        return prev
+      }
+      const nextSelected = [...prev.selectedTileRefineVariantIdx]
+      nextSelected[nsIdx] = nextIdx
+      const nextPreviews = [...prev.tilePreviews]
+      nextPreviews[nsIdx] = selected
+      return {
+        ...prev,
+        selectedTileRefineVariantIdx: nextSelected,
+        tilePreviews: nextPreviews,
+      }
+    })
+  }, [])
+
   // Keep the ref in sync so startTiledPlan (zero-dep useCallback) can call it.
   useEffect(() => {
     generateGlobalPlanRef.current = generateGlobalPlan
@@ -2592,6 +2669,8 @@ export default function Home() {
       imageHeight: dims.height,
       tilePrompts: new Array<string>(nonSkippedCount).fill(''),
       tilePreviews: new Array<string | null>(nonSkippedCount).fill(null),
+      tileRefineVersions: Array.from({ length: nonSkippedCount }, () => createEmptyTileRefineVersions()),
+      selectedTileRefineVariantIdx: new Array<number>(nonSkippedCount).fill(0),
       tilePlanningSlices: new Array<string | null>(nonSkippedCount).fill(null),
       tilePlanVersions: Array.from({ length: nonSkippedCount }, () => createEmptyPlanVersions()),
       selectedTilePlanVariantIdx: new Array<number>(nonSkippedCount).fill(0),
@@ -6083,6 +6162,9 @@ export default function Home() {
             planOptionCount={(plan.tilePlanVersions[nsIdx] ?? []).filter((url) => typeof url === 'string' && url.length > 0).length}
             planOptionIdx={plan.selectedTilePlanVariantIdx[nsIdx] ?? 0}
             onCyclePlanOption={(delta) => cycleTilePlanVariant(nsIdx, delta)}
+            refineOptionCount={(plan.tileRefineVersions[nsIdx] ?? []).filter((url) => typeof url === 'string' && url.length > 0).length}
+            refineOptionIdx={plan.selectedTileRefineVariantIdx[nsIdx] ?? 0}
+            onCycleRefineOption={(delta) => cycleTileRefineVariant(nsIdx, delta)}
           />
         )
       })()}

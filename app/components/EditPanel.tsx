@@ -2,12 +2,15 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { Icons } from '@/app/components/icons'
+import { PlanOptionCycler } from '@/app/components/Modals'
 import {
   INPAINT_VARIANT_COUNT,
   selectedInpaintVariant,
   selectedTileResultUrl,
   tileSlotHasResult,
+  tileSlotVersionCount,
   type InpaintState,
+  type InpaintTileSlot,
   type ReferenceImage,
 } from '@/app/lib/app'
 
@@ -29,6 +32,8 @@ export interface EditPanelProps {
   onGenerateAllTiles: () => void
   /** Cycle the visible plan / mask / tile stack (wraps at both ends). */
   onCycleVariant: (delta: 1 | -1) => void
+  /** Cycle one tile's refine version (buttons only — no keyboard). */
+  onCycleTileRefine: (tileIdx: number, delta: 1 | -1) => void
   onRerun: () => void
   onAccept: () => void
   onClose: () => void
@@ -210,14 +215,16 @@ function TileGrid({
   generatingTileIdx,
   changeMaskOverlayUrl,
   onRerunTile,
+  onCycleTileRefine,
 }: {
   tilePlan: NonNullable<InpaintState['tilePlan']>
-  tileResults: Array<string | null>
+  tileResults: InpaintTileSlot[]
   generatingTileIdx: number | null
   /** Blue-highlight overlay from computeChangeMaskVisuals — used as a pending
    *  tile preview so the user can see where changes fall before generating. */
   changeMaskOverlayUrl: string | null
   onRerunTile: (idx: number) => void
+  onCycleTileRefine: (tileIdx: number, delta: 1 | -1) => void
 }) {
   const maskedTiles = tilePlan.tiles
     .map((tile, idx) => ({ tile, idx }))
@@ -235,8 +242,11 @@ function TileGrid({
       <div className="grid gap-1.5" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(80px, 1fr))' }}>
         {maskedTiles.map(({ tile, idx }) => {
           const isGenerating = generatingTileIdx === idx
-          const resultUrl = selectedTileResultUrl(tileResults[idx])
-          const isDone = tileSlotHasResult(tileResults[idx])
+          const slot = tileResults[idx]
+          const resultUrl = selectedTileResultUrl(slot)
+          const isDone = tileSlotHasResult(slot)
+          const versionCount = tileSlotVersionCount(slot)
+          const selectedIdx = slot?.selectedIdx ?? 0
 
           return (
             <div key={idx} className="flex flex-col gap-1">
@@ -287,6 +297,17 @@ function TileGrid({
                   </button>
                 )}
               </div>
+              {isDone && versionCount > 1 && (
+                <div className="flex justify-center">
+                  <PlanOptionCycler
+                    index={selectedIdx}
+                    total={versionCount}
+                    disabled={anyBusy}
+                    onPrev={() => onCycleTileRefine(idx, -1)}
+                    onNext={() => onCycleTileRefine(idx, 1)}
+                  />
+                </div>
+              )}
             </div>
           )
         })}
@@ -316,6 +337,7 @@ export function EditPanel({
   onRerunTile,
   onGenerateAllTiles,
   onCycleVariant,
+  onCycleTileRefine,
   onRerun,
   onAccept,
   onClose,
@@ -534,6 +556,7 @@ export function EditPanel({
                 generatingTileIdx={generatingTileIdx}
                 changeMaskOverlayUrl={changeMaskOverlayUrl}
                 onRerunTile={onRerunTile}
+                onCycleTileRefine={onCycleTileRefine}
               />
             </div>
           </>

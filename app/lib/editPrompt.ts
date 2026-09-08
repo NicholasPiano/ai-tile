@@ -81,7 +81,7 @@ export function buildMaskExtractionPrompt(): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Stage 3 — per-tile high-resolution refinement
+// Stage 3 — per-tile free add-detail refinement
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Position of one tile within the larger inpaint tile grid. */
@@ -93,48 +93,61 @@ export interface TilePositionContext {
 }
 
 /**
- * Prompt for per-tile high-resolution refinement.
+ * Prompt for per-tile free add-detail refinement.
  *
  * The model receives a single image: the approved global plan, upscaled
  * into the selection with no extra blur, and crisp original (or already
- * refined neighbour) pixels outside that selection. This is a detail pass,
- * not a second inpaint — composition is already decided.
+ * refined neighbour) pixels outside that selection. The plan is inspiration
+ * only — the hard lock is the crisp ring. Invent native-resolution detail
+ * and features a finished image would have here.
  */
 export function buildTileRefinementPrompt(
   editDescription: string,
   tilePosition?: TilePositionContext,
 ): string {
+  const trimmed = editDescription.trim()
   const lines = [
-    'You are an expert photo detail-enhancement tool performing a super-resolution pass.',
+    'You are an expert photo detail-enhancement artist performing a FREE ADD-DETAIL pass.',
     '',
     'You have been given an image. Part of it is a LOWER-RESOLUTION COMPOSITION PLAN',
-    'of already-decided content (upscaled in place, not blurred). Everything else is',
+    '(upscaled in place) — treat it as INSPIRATION only: a suggested layout and subject',
+    'matter, NOT a photograph to trace and NOT a composition lock. Everything else is',
     'CRISP original or already-refined pixels — leave those pixels exactly unchanged.',
     '',
-    'YOUR ONLY JOB: redraw the planned area at full resolution as a faithful, detailed',
-    'version of that exact plan — same shapes, same colours, same layout — now sharp',
-    'and richly detailed, blending seamlessly with the crisp surroundings.',
-    'This is NOT a request to invent new content.',
+    'YOUR JOB: redraw the planned area at full native resolution as a richly detailed,',
+    'finished patch that could have been part of the original image. You MAY change',
+    'objects, add features the plan never showed, and take a different compositional',
+    'read if that produces a richer result. Do NOT reproduce the plan\'s soft,',
+    'posterized, or blob-like forms as sharper versions of themselves — that is a FAILURE.',
     '',
     'TASK:',
     '1. Find the planned (lower-resolution) area.',
-    '2. Redraw it at full native detail without changing composition.',
-    '3. Leave every crisp pixel unchanged.',
+    '2. Paint it at full native detail, inventing the texture, materials, edges, and',
+    '   features a finished image would have here, inspired by (not copying) the plan.',
+    '3. Leave every crisp pixel outside that area unchanged.',
     '',
     'The crisp pixels define the rendering style — match their texture, lighting,',
-    'colour, and level of detail exactly in the redrawn area.',
+    'colour, perspective, scale, and level of detail exactly at the seam. The boundary',
+    'must be invisible.',
     '',
     'Do NOT copy or shift content from the crisp area into the planned area.',
-    'Do NOT add objects, shapes, or scene elements that are not already in the plan,',
-    'even if they would fit the description below.',
-    '',
-    `For loose context only, this tile is a small crop from a larger edit whose`,
-    `overall goal was: "${editDescription}". This tile may show only a tiny,`,
-    'unremarkable fragment of that larger edit (e.g. plain sky, a patch of texture,',
-    'or empty background) — if so, that is correct and expected. Use the',
-    'description only to resolve genuine ambiguity in the plan; never as',
-    'a reason to depict the full instruction within this one tile.',
   ]
+
+  if (trimmed.length > 0) {
+    lines.push(
+      '',
+      `USER DIRECTION for what to enrich in this area: "${trimmed}".`,
+      'Apply this as creative direction for the detail pass. This tile may show only a',
+      'tiny fragment of a larger edit (e.g. plain sky, a patch of texture, or empty',
+      'background) — if so, enrich that fragment; do not force the full instruction',
+      'into this one tile.',
+    )
+  } else {
+    lines.push(
+      '',
+      'No extra user direction — simply add native-resolution detail inspired by the plan.',
+    )
+  }
 
   if (tilePosition && tilePosition.total > 1) {
     lines.push(

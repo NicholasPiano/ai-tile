@@ -5,6 +5,7 @@ import {
   EDIT_STRIP_PX,
   INPAINT_VARIANT_COUNT,
   MAX_AI_DIMENSION,
+  TILE_REFINE_VARIANT_COUNT,
   createEmptyInpaintTileSlots,
   createEmptyInpaintVariants,
   selectedInpaintVariant,
@@ -14,6 +15,7 @@ import {
   type InpaintState,
   type InpaintRegion,
   type InpaintTilePlan,
+  type InpaintTileSlot,
   type InpaintVariant,
   type ReferenceImage,
 } from '@/app/lib/app'
@@ -1169,7 +1171,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
    */
   const rebuildVariantComposite = async (
     variantIdx: number,
-    tileSlots: Array<string | null>,
+    tileSlots: InpaintTileSlot[],
     tilePlan: InpaintTilePlan,
     sourceImage: string,
     contextRect: { x: number; y: number; w: number; h: number },
@@ -1395,23 +1397,30 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
         }
 
         /**
-         * One refine call. Extra samples are not useful here — the prompt
-         * tells the model to follow the selected plan.
+         * Four parallel free add-detail refine calls so the user can pick.
          */
-        const tileRes = await fetch('/api/edit', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(requestBody),
-        })
-        const tileData = await tileRes.json() as { resultUrl?: string; error?: string }
-        if (!tileRes.ok || !tileData.resultUrl) {
-          throw new Error(tileData.error ?? 'Tile refinement failed')
-        }
+        const optionResults = await Promise.all(
+          Array.from({ length: TILE_REFINE_VARIANT_COUNT }, async () => {
+            const tileRes = await fetch('/api/edit', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(requestBody),
+            })
+            const tileData = await tileRes.json() as { resultUrl?: string; error?: string }
+            if (!tileRes.ok || !tileData.resultUrl) {
+              throw new Error(tileData.error ?? 'Tile refinement failed')
+            }
+            return tileData.resultUrl
+          }),
+        )
 
         const liveSlots =
           inpaintStateRef.current?.variants[variantIdx]?.tileResults ?? latestSlots
         const nextSlots = [...liveSlots]
-        nextSlots[idx] = tileData.resultUrl
+        nextSlots[idx] = {
+          versions: optionResults,
+          selectedIdx: 0,
+        }
 
         const stitchedPreviewUrl = await rebuildVariantComposite(
           variantIdx,
@@ -1452,6 +1461,69 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       }
     },
     [image, apiKey, model],
+  )
+
+  /**
+   * Cycle one tile's refine version (buttons only). Rebuilds the running
+   * Accept canvas from the hard plan stamp + selected versions.
+   */
+  const handleCycleTileRefine = useCallback(
+    (tileIdx: number, delta: 1 | -1) => {
+      const state = inpaintStateRef.current
+      if (!state || !image || !state.tilePlan || state.generatingTileIdx !== null) {
+        return
+      }
+      const variantIdx = state.selectedVariantIdx
+      const selected = state.variants[variantIdx]
+      if (!selected) {
+        return
+      }
+      const slot = selected.tileResults[tileIdx]
+      if (!slot) {
+        return
+      }
+      const filled = slot.versions
+        .map((url, i) => ({ url, i }))
+        .filter((entry) => typeof entry.url === 'string' && entry.url.length > 0)
+      if (filled.length <= 1) {
+        return
+      }
+      const currentPos = filled.findIndex((entry) => entry.i === slot.selectedIdx)
+      const start = currentPos >= 0 ? currentPos : 0
+      const nextPos = (start + delta + filled.length) % filled.length
+      const nextFilled = filled[nextPos]
+      if (!nextFilled) {
+        return
+      }
+
+      const nextSlots = [...selected.tileResults]
+      nextSlots[tileIdx] = { ...slot, selectedIdx: nextFilled.i }
+
+      void (async () => {
+        const stitchedPreviewUrl = await rebuildVariantComposite(
+          variantIdx,
+          nextSlots,
+          state.tilePlan as InpaintTilePlan,
+          image,
+          state.region.contextRect,
+        )
+        setInpaintState((prev) => {
+          if (!prev) {
+            return null
+          }
+          const variants = [...prev.variants]
+          const current = variants[variantIdx]
+          if (!current) {
+            return prev
+          }
+          variants[variantIdx] = { ...current, tileResults: nextSlots, stitchedPreviewUrl }
+          const updated = { ...prev, variants }
+          inpaintStateRef.current = updated
+          return updated
+        })
+      })()
+    },
+    [image],
   )
 
   // ── Callback: generate every masked tile that hasn't been generated yet ─────
@@ -1804,6 +1876,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
             onRerunTile={(idx) => { void generateTile(idx) }}
             onGenerateAllTiles={() => { void handleGenerateAllTiles() }}
             onCycleVariant={handleCycleVariant}
+            onCycleTileRefine={handleCycleTileRefine}
             onRerun={handleRerun}
             onAccept={() => { void handleAccept() }}
             onClose={handleClose}
