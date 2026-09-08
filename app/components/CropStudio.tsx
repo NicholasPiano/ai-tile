@@ -13,6 +13,7 @@ import {
   cropImageToRect,
   isFullImageCrop,
   parseAspectRatio,
+  parseCustomAspectPair,
   simplifiedAspectParts,
   snapCropToGrid,
   type AspectPreset,
@@ -357,6 +358,12 @@ export function CropStudio({
   const spaceDownRef = useRef(false)
   const isPanningRef = useRef(false)
   const panLastRef = useRef<{ x: number; y: number } | null>(null)
+  /**
+   * Crop frozen when Custom (or any aspect lock) starts / after a drag.
+   * Custom field keystrokes reshape from this base so typing 1→10→1000
+   * does not compound on a destroyed selection.
+   */
+  const aspectBaseCropRef = useRef<CropRect | null>(null)
 
   const [view, setView] = useState<ViewTransform>({ zoom: 1, panX: 0, panY: 0 })
   const [spaceDown, setSpaceDown] = useState(false)
@@ -388,9 +395,12 @@ export function CropStudio({
   useEffect(() => {
     if (!dimensions) {
       setCrop(null)
+      aspectBaseCropRef.current = null
       return
     }
-    setCrop({ x: 0, y: 0, w: dimensions.width, h: dimensions.height })
+    const full = { x: 0, y: 0, w: dimensions.width, h: dimensions.height }
+    setCrop(full)
+    aspectBaseCropRef.current = full
     setAspect('free')
     setError(null)
   }, [dimensions?.width, dimensions?.height, image])
@@ -525,13 +535,23 @@ export function CropStudio({
   const customAspect = customAspectInput(customAspectW, customAspectH)
 
   /**
-   * Fit the current crop to `ratio` without changing the aspect preset.
+   * Snapshot the rect that later custom-field edits reshape from.
    */
-  const applyRatio = (ratio: number | null) => {
-    if (!crop || !dimensions || !ratio) {
+  const captureAspectBase = (rect: CropRect | null) => {
+    aspectBaseCropRef.current = rect
+      ? { x: rect.x, y: rect.y, w: rect.w, h: rect.h }
+      : null
+  }
+
+  /**
+   * Fit `base` (or the frozen aspect base) to `ratio`, then write the crop.
+   */
+  const applyRatioToBase = (ratio: number | null, base?: CropRect | null) => {
+    const source = base ?? aspectBaseCropRef.current
+    if (!source || !dimensions || !ratio) {
       return
     }
-    let fitted = applyAspectToCrop(crop, ratio, dimensions.width, dimensions.height)
+    let fitted = applyAspectToCrop(source, ratio, dimensions.width, dimensions.height)
     if (snapGrid) {
       fitted = snapCropToGrid(fitted, dimensions.width, dimensions.height)
       fitted = applyAspectToCrop(fitted, ratio, dimensions.width, dimensions.height)
@@ -547,15 +567,22 @@ export function CropStudio({
       setCustomAspectH(parts.h)
       nextCustom = customAspectInput(parts.w, parts.h)
     }
+    if (crop) {
+      captureAspectBase(crop)
+    }
     setAspect(next)
     if (!dimensions) {
       return
     }
-    applyRatio(aspectRatioForPreset(next, dimensions.width, dimensions.height, nextCustom))
+    applyRatioToBase(
+      aspectRatioForPreset(next, dimensions.width, dimensions.height, nextCustom),
+      aspectBaseCropRef.current,
+    )
   }
 
   /**
-   * Update the custom fields and, when Custom is active, refit the crop.
+   * Update the custom fields. Live-reshape only when BOTH width and height
+   * are valid — always from the frozen base crop, never the live crop.
    */
   const updateCustomAspect = (nextW: string, nextH: string) => {
     setCustomAspectW(nextW)
@@ -563,16 +590,40 @@ export function CropStudio({
     if (aspect !== 'custom' || !dimensions) {
       return
     }
-    const nextCustom = customAspectInput(nextW, nextH)
-    applyRatio(aspectRatioForPreset('custom', dimensions.width, dimensions.height, nextCustom))
+    const pair = parseCustomAspectPair(nextW, nextH)
+    if (pair === null) {
+      return
+    }
+    applyRatioToBase(pair)
+  }
+
+  /**
+   * Commit custom fields on blur: pair if both filled, else a lone decimal
+   * (e.g. `1.85`) from the frozen base.
+   */
+  const commitCustomAspectFields = () => {
+    if (aspect !== 'custom' || !dimensions) {
+      return
+    }
+    const pair = parseCustomAspectPair(customAspectW, customAspectH)
+    if (pair !== null) {
+      applyRatioToBase(pair)
+      return
+    }
+    const lone = parseAspectRatio(customAspectInput(customAspectW, customAspectH))
+    if (lone !== null) {
+      applyRatioToBase(lone)
+    }
   }
 
   const resetCrop = () => {
     if (!dimensions) {
       return
     }
+    const full = { x: 0, y: 0, w: dimensions.width, h: dimensions.height }
     setAspect('free')
-    setCrop({ x: 0, y: 0, w: dimensions.width, h: dimensions.height })
+    setCrop(full)
+    captureAspectBase(full)
     setError(null)
   }
 
@@ -652,8 +703,11 @@ export function CropStudio({
     if (drag && crop) {
       if (drag.kind === 'draw' && (crop.w < MIN_DRAW_PX || crop.h < MIN_DRAW_PX)) {
         setCrop(drag.previous)
+        captureAspectBase(drag.previous)
       } else {
-        setCrop(finishRect(crop))
+        const finished = finishRect(crop)
+        setCrop(finished)
+        captureAspectBase(finished)
       }
     }
     setDrag(null)
@@ -941,6 +995,7 @@ export function CropStudio({
                     placeholder="21"
                     value={customAspectW}
                     onChange={(e) => updateCustomAspect(e.target.value, customAspectH)}
+                    onBlur={commitCustomAspectFields}
                     className="w-16 rounded-[var(--radius-sm)] px-2 py-1 font-mono text-[12px]"
                     style={{
                       background: 'var(--surface)',
@@ -958,6 +1013,7 @@ export function CropStudio({
                     placeholder="9"
                     value={customAspectH}
                     onChange={(e) => updateCustomAspect(customAspectW, e.target.value)}
+                    onBlur={commitCustomAspectFields}
                     className="w-16 rounded-[var(--radius-sm)] px-2 py-1 font-mono text-[12px]"
                     style={{
                       background: 'var(--surface)',
@@ -977,7 +1033,7 @@ export function CropStudio({
                 </p>
               ) : aspect === 'custom' ? (
                 <p className="mt-1.5 text-[11px]" style={{ color: 'var(--text-muted)' }}>
-                  Enter width and height — 21:9, 1.85:1, or a single decimal.
+                  Enter both width and height (e.g. 21:9). A single decimal applies on blur.
                 </p>
               ) : null}
             </div>

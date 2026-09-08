@@ -61,7 +61,8 @@ export function parseAspectRatio(input: string): number | null {
 
 /**
  * Build the parse string for the custom width/height fields.
- * A lone width is treated as a decimal ratio (e.g. `1.85`).
+ * A lone width is treated as a decimal ratio (e.g. `1.85`) — only for
+ * blur/commit; live typing should use {@link parseCustomAspectPair}.
  */
 export function customAspectInput(width: string, height: string): string {
   const w = width.trim()
@@ -70,6 +71,20 @@ export function customAspectInput(width: string, height: string): string {
     return `${w}:${h}`
   }
   return w
+}
+
+/**
+ * Live-typing parse: only returns a ratio when BOTH custom fields are
+ * non-empty positive numbers. A single field mid-edit (e.g. typing `1000`)
+ * must not reshape the crop.
+ */
+export function parseCustomAspectPair(width: string, height: string): number | null {
+  const w = width.trim()
+  const h = height.trim()
+  if (!w || !h) {
+    return null
+  }
+  return parseAspectRatio(`${w}:${h}`)
 }
 
 /** Greatest common divisor for reducing integer aspect pairs. */
@@ -161,7 +176,11 @@ export function isFullImageCrop(
 }
 
 /**
- * Fit a rect to `ratio` (width/height), keeping its center, then clamp.
+ * Reshape a rect to `ratio` (width/height) while preserving its area and
+ * center, then clamp into the image. One axis expands and the other
+ * contracts so the change stays continuous with the existing selection.
+ * If the area-preserving size cannot fit in the image, scale down to the
+ * largest aspect-correct box that does (still centered).
  */
 export function applyAspectToCrop(
   rect: CropRect,
@@ -174,14 +193,13 @@ export function applyAspectToCrop(
   }
   const cx = rect.x + rect.w / 2
   const cy = rect.y + rect.h / 2
-  let w = rect.w
-  let h = w / ratio
-  if (h > imageHeight) {
-    h = imageHeight
-    w = h * ratio
-  }
-  if (w > imageWidth) {
-    w = imageWidth
+  const area = Math.max(1, rect.w) * Math.max(1, rect.h)
+  let w = Math.sqrt(area * ratio)
+  let h = Math.sqrt(area / ratio)
+  // Largest aspect-correct box that fits in the image.
+  const maxW = Math.min(imageWidth, imageHeight * ratio)
+  if (w > maxW) {
+    w = maxW
     h = w / ratio
   }
   return clampCropRect(
