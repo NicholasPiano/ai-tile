@@ -199,6 +199,13 @@ export const Icons = {
       <path d="M21 15l-5-5L5 21" />
     </>
   ),
+  /** Crop frame — two opposing corners. */
+  Crop: svg(
+    <>
+      <path d="M6 3v14a1 1 0 0 0 1 1h14" />
+      <path d="M3 6h14a1 1 0 0 1 1 1v14" />
+    </>
+  ),
   /** 3×3 map grid — reference overlay toggle. */
   Grid: svg(
     <>

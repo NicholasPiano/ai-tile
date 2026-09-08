@@ -38,11 +38,12 @@ export function TopBar({
   setMode: (m: Mode) => void
   onNewImage: () => void
   onShowSettings: () => void
-  /** Whether the 1000×1000 reference grid is on (extend + edit only). */
+  /** Whether the 1000×1000 reference grid is on (extend, edit, and crop). */
   showGrid?: boolean
   onToggleGrid?: () => void
 }) {
-  const canToggleGrid = hasImage && (mode === 'extender' || mode === 'edit')
+  const canToggleGrid =
+    hasImage && (mode === 'extender' || mode === 'edit' || mode === 'crop')
 
   return (
     <header
@@ -109,6 +110,7 @@ export function ModeToggle({
   const tabs: { value: Mode; label: string; Icon: React.FC<IconProps>; hint: string }[] = [
     { value: 'extender', label: 'Extender', Icon: Icons.CornerFrame, hint: 'Outpaint any image' },
     { value: 'edit', label: 'Edit', Icon: Icons.Pencil, hint: 'Fix / inpaint a region' },
+    { value: 'crop', label: 'Crop', Icon: Icons.Crop, hint: 'Trim the working image' },
     { value: 'parallax', label: 'Parallax', Icon: Icons.Mountain, hint: 'Sidescroller backgrounds' },
     { value: 'tile', label: 'Tiles', Icon: Icons.Layers, hint: 'Seamless tile textures' },
     { value: 'props', label: 'Props', Icon: Icons.Sprout, hint: 'Scatter decorations' },
