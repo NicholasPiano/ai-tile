@@ -344,6 +344,7 @@ export function EditPanel({
 }: EditPanelProps) {
   const {
     phase,
+    region,
     lowResPreviewUrl,
     lowResContextUrl,
     tilePlan,
@@ -357,6 +358,11 @@ export function EditPanel({
   const changeMaskUrl = selectedVariant?.changeMaskUrl ?? null
   const changeMaskOverlayUrl = selectedVariant?.changeMaskOverlayUrl ?? null
   const tileResults = selectedVariant?.tileResults ?? []
+
+  const selectionW = Math.round(region.selectionRect.w)
+  const selectionH = Math.round(region.selectionRect.h)
+  const contextW = Math.round(region.contextRect.w)
+  const contextH = Math.round(region.contextRect.h)
 
   // ── Local form state ──────────────────────────────────────────────────────
   // Initialise from the state so that re-run resets to the previous values.
@@ -414,6 +420,13 @@ export function EditPanel({
                 <Spinner />
               </div>
             )}
+          <div
+            className="flex flex-col gap-0.5 font-mono text-[11px] tabular-nums"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            <span>{`Selection ${selectionW} × ${selectionH} px`}</span>
+            <span>{`Context ${contextW} × ${contextH} px`}</span>
+          </div>
         </div>
 
         <SectionDivider />
