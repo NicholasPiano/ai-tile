@@ -949,10 +949,35 @@ export function Workspace({
         {isResult && resultMessage && (
           <StatusPill status="ok" message={resultMessage} />
         )}
-        {isTiling && tilingState.generatingTileIdx !== null && progressMessage && (
-          <StatusPill status="working" message={progressMessage} />
+        {loading && (
+          <StatusPill
+            status="working"
+            message={
+              progressMessage ||
+              (activeDirection ? `Extending ${activeDirection}…` : 'Working…')
+            }
+          />
         )}
-        {isTiling && tilingState.nextPendingTileIdx !== null && tilingState.generatingTileIdx === null && (
+        {isTiling &&
+          !loading &&
+          (tilingState.isGlobalPlanGenerating ||
+            tilingState.generatingTileIdx !== null ||
+            !!progressMessage) && (
+          <StatusPill
+            status="working"
+            message={
+              progressMessage ||
+              (tilingState.isGlobalPlanGenerating
+                ? 'Planning scene…'
+                : 'Working…')
+            }
+          />
+        )}
+        {isTiling &&
+          tilingState.nextPendingTileIdx !== null &&
+          tilingState.generatingTileIdx === null &&
+          !tilingState.isGlobalPlanGenerating &&
+          !progressMessage && (
           <span className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
             Click tile {tilingState.nextPendingTileIdx + 1} to generate
           </span>

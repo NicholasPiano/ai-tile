@@ -111,11 +111,11 @@ function clientToImageCoord(
 }
 
 /**
- * Convert a MouseEvent's client coordinates into image-pixel coordinates,
+ * Convert a pointer event's client coordinates into image-pixel coordinates,
  * accounting for object-contain letterboxing inside the overlay canvas.
  */
 function toImageCoord(
-  e: React.MouseEvent<HTMLCanvasElement>,
+  e: React.PointerEvent<HTMLCanvasElement>,
   canvas: HTMLCanvasElement,
   imgW: number,
   imgH: number,
@@ -969,68 +969,89 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     }).catch(() => {})
   }, [drag, image, dimensions])
 
-  // ── Mouse handlers ─────────────────────────────────────────────────────────
+  // ── Pointer handlers ───────────────────────────────────────────────────────
 
-  const handleMouseDown = useCallback(
-    (e: React.MouseEvent<HTMLCanvasElement>) => {
-      if (!dimensions) return
+  /**
+   * Start a selection drag and capture the pointer so leaving the image
+   * (viewport chrome, sidebar, window) does not end the gesture.
+   */
+  const handlePointerDown = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      if (!dimensions) {
+        return
+      }
       const canvas = canvasRef.current
-      if (!canvas) return
-      if (inpaintState) return
+      if (!canvas) {
+        return
+      }
+      if (inpaintState) {
+        return
+      }
       // Space or middle-mouse is pan — let the viewport handler take it.
       if (spaceDownRef.current || e.button === 1) {
         return
       }
       e.preventDefault()
       isDraggingRef.current = true
+      canvas.setPointerCapture(e.pointerId)
       const pt = toImageCoord(e, canvas, dimensions.width, dimensions.height)
       setDrag({ start: pt, current: pt, committed: false })
     },
     [dimensions, inpaintState],
   )
 
-  const handleMouseMove = useCallback(
-    (e: React.MouseEvent<HTMLCanvasElement>) => {
-      if (!isDraggingRef.current || !dimensions) return
+  /**
+   * Resize the in-progress selection. Capture keeps this firing after the
+   * cursor leaves the canvas; image coords stay clamped to the photo.
+   */
+  const handlePointerMove = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      if (!isDraggingRef.current || !dimensions) {
+        return
+      }
       const canvas = canvasRef.current
-      if (!canvas) return
+      if (!canvas) {
+        return
+      }
       const pt = toImageCoord(e, canvas, dimensions.width, dimensions.height)
       setDrag((prev) => (prev ? { ...prev, current: pt } : null))
     },
     [dimensions],
   )
 
-  const handleMouseUp = useCallback(
-    (e: React.MouseEvent<HTMLCanvasElement>) => {
-      if (!isDraggingRef.current || !dimensions) return
+  /**
+   * Commit or discard the selection. Called on release and on cancel so a
+   * drag cannot stay open after the pointer is gone.
+   */
+  const finishSelectionDrag = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      if (!isDraggingRef.current || !dimensions) {
+        return
+      }
       isDraggingRef.current = false
       const canvas = canvasRef.current
-      if (!canvas) return
+      if (canvas && canvas.hasPointerCapture(e.pointerId)) {
+        canvas.releasePointerCapture(e.pointerId)
+      }
+      if (!canvas) {
+        return
+      }
       const pt = toImageCoord(e, canvas, dimensions.width, dimensions.height)
       const imageBounds: ImageRect = { x: 0, y: 0, w: dimensions.width, h: dimensions.height }
 
       setDrag((prev) => {
-        if (!prev) return null
+        if (!prev) {
+          return null
+        }
         const sel = selectionFromDrag({ ...prev, current: pt }, imageBounds)
-        if (sel.w < 8 || sel.h < 8) return null
+        if (sel.w < 8 || sel.h < 8) {
+          return null
+        }
         return committedDragFromSelection({ ...prev, current: pt }, sel)
       })
     },
     [dimensions],
   )
-
-  const handleMouseLeave = useCallback(() => {
-    if (isDraggingRef.current) {
-      isDraggingRef.current = false
-      setDrag((prev) => {
-        if (!prev || !dimensions) return null
-        const imageBounds: ImageRect = { x: 0, y: 0, w: dimensions.width, h: dimensions.height }
-        const sel = selectionFromDrag(prev, imageBounds)
-        if (sel.w < 8 || sel.h < 8) return null
-        return committedDragFromSelection(prev, sel)
-      })
-    }
-  }, [dimensions])
 
   /**
    * Pan the image inside the frame. Used for space/middle-mouse while
@@ -1734,10 +1755,10 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
               <canvas
                 ref={canvasRef}
-                onMouseDown={handleMouseDown}
-                onMouseMove={handleMouseMove}
-                onMouseUp={handleMouseUp}
-                onMouseLeave={handleMouseLeave}
+                onPointerDown={handlePointerDown}
+                onPointerMove={handlePointerMove}
+                onPointerUp={finishSelectionDrag}
+                onPointerCancel={finishSelectionDrag}
                 style={{
                   position: 'absolute',
                   inset: 0,
