@@ -972,6 +972,7 @@ export function CropStudio({
                       key={preset.value}
                       type="button"
                       className="btn btn-ghost text-[11px]"
+                      title={preset.title}
                       style={{
                         padding: '2px 8px',
                         height: 26,

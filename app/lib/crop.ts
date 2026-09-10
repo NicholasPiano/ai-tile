@@ -18,8 +18,10 @@ export type AspectPreset =
   | '4:3'
   | '3:2'
   | '2:3'
+  /** Intended book size (same numeric ratio as 3:2). */
+  | '54:36'
 
-export const ASPECT_PRESETS: { value: AspectPreset; label: string }[] = [
+export const ASPECT_PRESETS: { value: AspectPreset; label: string; title?: string }[] = [
   { value: 'free', label: 'Free' },
   { value: 'original', label: 'Original' },
   { value: 'custom', label: 'Custom' },
@@ -29,6 +31,7 @@ export const ASPECT_PRESETS: { value: AspectPreset; label: string }[] = [
   { value: '4:3', label: '4:3' },
   { value: '3:2', label: '3:2' },
   { value: '2:3', label: '2:3' },
+  { value: '54:36', label: '54×36', title: 'Intended book size' },
 ]
 
 /**
