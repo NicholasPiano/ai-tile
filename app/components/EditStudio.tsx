@@ -57,6 +57,20 @@ type DragState = {
   committed: boolean
 }
 
+/** Ignore click-without-drag so a miss does not keep a 1×1 selection. */
+const MIN_DRAW_PX = 8
+
+/** CSS-pixel slop for click-to-deselect on the letterbox around the image. */
+const DESELECT_CLICK_PX = 8
+
+/**
+ * True once the session has left the pre-generate input phase. A generated
+ * (or in-flight) plan must not be discarded by a stray click.
+ */
+function editSessionLocked(inpaintState: InpaintState | null): boolean {
+  return inpaintState !== null && inpaintState.phase !== 'input'
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Coordinate helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -475,9 +489,11 @@ function renderOverlay(
     return
   }
 
-  // Prefer the committed region; fall back to the in-progress drag.
+  // Live redraw replaces the committed box; otherwise prefer the region.
   const currentSelect =
-    inpaintState?.region.selectionRect ?? selectionFromDrag(drag, imageBounds)
+    !drag.committed
+      ? selectionFromDrag(drag, imageBounds)
+      : (inpaintState?.region.selectionRect ?? selectionFromDrag(drag, imageBounds))
 
   if (currentSelect.w < 2 || currentSelect.h < 2) {
     return
@@ -715,6 +731,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   const isPanningRef = useRef(false)
   const panLastRef = useRef<{ x: number; y: number } | null>(null)
   const spaceDownRef = useRef(false)
+  const pendingDeselectRef = useRef<{ x: number; y: number } | null>(null)
   const viewportSizeRef = useRef<ViewportSize>({ w: 0, h: 0 })
   const viewReadyRef = useRef(false)
   /**
@@ -744,6 +761,8 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   )
 
   const [drag, setDrag] = useState<DragState | null>(null)
+  const dragRef = useRef<DragState | null>(null)
+  dragRef.current = drag
   const [inpaintState, setInpaintState] = useState<InpaintState | null>(null)
   /**
    * Latest inpaint state for sequential tile generate. `generateTile` must
@@ -976,6 +995,8 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   /**
    * Start a selection drag and capture the pointer so leaving the image
    * (viewport chrome, sidebar, window) does not end the gesture.
+   * Allowed before generate and while still in the input phase so a
+   * click can clear, or a drag can replace, the current area.
    */
   const handlePointerDown = useCallback(
     (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -986,7 +1007,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       if (!canvas) {
         return
       }
-      if (inpaintState) {
+      if (editSessionLocked(inpaintState)) {
         return
       }
       // Space or middle-mouse is pan — let the viewport handler take it.
@@ -997,7 +1018,9 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       isDraggingRef.current = true
       canvas.setPointerCapture(e.pointerId)
       const pt = toImageCoord(e, canvas, dimensions.width, dimensions.height)
-      setDrag({ start: pt, current: pt, committed: false })
+      const nextDrag: DragState = { start: pt, current: pt, committed: false }
+      dragRef.current = nextDrag
+      setDrag(nextDrag)
     },
     [dimensions, inpaintState],
   )
@@ -1023,7 +1046,8 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
   /**
    * Commit or discard the selection. Called on release and on cancel so a
-   * drag cannot stay open after the pointer is gone.
+   * drag cannot stay open after the pointer is gone. A click (movement
+   * below {@link MIN_DRAW_PX}) clears a pre-generate selection.
    */
   const finishSelectionDrag = useCallback(
     (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -1040,37 +1064,57 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       }
       const pt = toImageCoord(e, canvas, dimensions.width, dimensions.height)
       const imageBounds: ImageRect = { x: 0, y: 0, w: dimensions.width, h: dimensions.height }
-
-      setDrag((prev) => {
-        if (!prev) {
-          return null
-        }
-        const sel = selectionFromDrag({ ...prev, current: pt }, imageBounds)
-        if (sel.w < 8 || sel.h < 8) {
-          return null
-        }
-        return committedDragFromSelection({ ...prev, current: pt }, sel)
-      })
+      const prev = dragRef.current
+      if (!prev) {
+        return
+      }
+      const next = { ...prev, current: pt }
+      const sel = selectionFromDrag(next, imageBounds)
+      // Click (or a miss shorter than MIN_DRAW_PX): drop the area when
+      // nothing has been generated yet.
+      if (sel.w < MIN_DRAW_PX || sel.h < MIN_DRAW_PX) {
+        dragRef.current = null
+        setDrag(null)
+        setInpaintState(null)
+        return
+      }
+      // New rectangle replaces a pre-generate session so the init effect
+      // rebuilds InpaintState for the new region.
+      if (inpaintState && inpaintState.phase === 'input') {
+        setInpaintState(null)
+      }
+      const committed = committedDragFromSelection(next, sel)
+      dragRef.current = committed
+      setDrag(committed)
     },
-    [dimensions],
+    [dimensions, inpaintState],
   )
 
   /**
-   * Pan the image inside the frame. Used for space/middle-mouse while
-   * selecting, and for any drag after a selection exists.
+   * Pan the image inside the frame. Space/middle-mouse while selecting;
+   * any drag after a plan has been generated (session is locked).
    */
   const handleViewportPointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
       const wantPan =
-        spaceDownRef.current || e.button === 1 || inpaintState !== null
-      if (!wantPan || isDraggingRef.current) {
+        spaceDownRef.current || e.button === 1 || editSessionLocked(inpaintState)
+      if (wantPan && !isDraggingRef.current) {
+        e.preventDefault()
+        isPanningRef.current = true
+        panLastRef.current = { x: e.clientX, y: e.clientY }
+        setIsPanning(true)
+        e.currentTarget.setPointerCapture(e.pointerId)
         return
       }
-      e.preventDefault()
-      isPanningRef.current = true
-      panLastRef.current = { x: e.clientX, y: e.clientY }
-      setIsPanning(true)
-      e.currentTarget.setPointerCapture(e.pointerId)
+      // Letterbox click — canvas already owns image-space gestures.
+      if (
+        inpaintState !== null &&
+        inpaintState.phase === 'input' &&
+        e.button === 0 &&
+        !isDraggingRef.current
+      ) {
+        pendingDeselectRef.current = { x: e.clientX, y: e.clientY }
+      }
     },
     [inpaintState],
   )
@@ -1095,11 +1139,25 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     [dimensions],
   )
 
-  const handleViewportPointerUp = useCallback(() => {
-    isPanningRef.current = false
-    panLastRef.current = null
-    setIsPanning(false)
-  }, [])
+  const handleViewportPointerUp = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      const pending = pendingDeselectRef.current
+      pendingDeselectRef.current = null
+      if (pending && inpaintState !== null && inpaintState.phase === 'input') {
+        const dx = e.clientX - pending.x
+        const dy = e.clientY - pending.y
+        if (Math.hypot(dx, dy) < DESELECT_CLICK_PX) {
+          dragRef.current = null
+          setInpaintState(null)
+          setDrag(null)
+        }
+      }
+      isPanningRef.current = false
+      panLastRef.current = null
+      setIsPanning(false)
+    },
+    [inpaintState],
+  )
 
   /**
    * Step zoom from the viewport center (toolbar + / −).
@@ -1683,6 +1741,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
 
   const handleClose = useCallback(() => {
     clearVariantCanvases()
+    dragRef.current = null
     setInpaintState(null)
     setDrag(null)
   }, [])
@@ -1757,16 +1816,17 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
   const contentW = dimensions.width * view.zoom
   const contentH = dimensions.height * view.zoom
   const zoomPct = Math.round(view.zoom * 100)
+  const sessionLocked = editSessionLocked(inpaintState)
   const viewportCursor = isPanning
     ? 'grabbing'
-    : spaceDown || inpaintState
+    : spaceDown || sessionLocked
       ? 'grab'
       : 'default'
   const canvasCursor = spaceDown || isPanning
     ? isPanning
       ? 'grabbing'
       : 'grab'
-    : inpaintState || isProcessing
+    : sessionLocked || isProcessing
       ? 'default'
       : 'crosshair'
 
@@ -1838,7 +1898,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
                   height: contentH,
                   cursor: canvasCursor,
                   touchAction: 'none',
-                  pointerEvents: inpaintState || isProcessing ? 'none' : 'auto',
+                  pointerEvents: sessionLocked || isProcessing ? 'none' : 'auto',
                 }}
               />
             </div>
@@ -1987,6 +2047,11 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
             Release to confirm selection
           </span>
         )}
+        {inpaintState?.phase === 'input' && drag?.committed ? (
+          <span className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
+            Click to deselect · Drag to redraw · Space-drag to pan
+          </span>
+        ) : null}
         {!drag?.committed && !inpaintState && (
           <span className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
             Two-finger drag to pan · Pinch or +/− to zoom
