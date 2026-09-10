@@ -616,7 +616,7 @@ function drawLassoOverlay(
   ctx.fill()
 
   ctx.strokeStyle = 'rgba(255,255,255,1)'
-  ctx.lineWidth = 6 * cssToBuf
+  ctx.lineWidth = 2 * cssToBuf
   ctx.stroke()
   ctx.restore()
 
@@ -635,7 +635,7 @@ function drawLassoOverlay(
   haloCtx.strokeStyle = '#ffffff'
   traceBuf(haloCtx)
   haloCtx.fill()
-  haloCtx.lineWidth = bufRadius * 2 + 6 * cssToBuf
+  haloCtx.lineWidth = bufRadius * 2 + 2 * cssToBuf
   haloCtx.stroke()
   haloCtx.globalCompositeOperation = 'destination-out'
   traceBuf(haloCtx)
@@ -729,14 +729,14 @@ function renderOverlay(
   drawImageRect(ctx, currentStrip, layout, bufW, bufH, {
     strokeStyle: 'rgba(255,255,255,1)',
     fillStyle: 'rgba(60,140,255,0.18)',
-    lineWidth: 6,
+    lineWidth: 2,
   })
   drawImageLabel(ctx, currentStrip, layout, bufW, bufH, 'Context')
 
   drawImageRect(ctx, currentSelect, layout, bufW, bufH, {
     strokeStyle: 'rgba(255,255,255,1)',
     fillStyle: 'rgba(30,100,220,0.22)',
-    lineWidth: 6,
+    lineWidth: 2,
   })
   drawImageLabel(ctx, currentSelect, layout, bufW, bufH, 'Selection')
 }
