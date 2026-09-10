@@ -1,7 +1,9 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
+import { EditToolPicker } from '@/app/components/EditToolPicker'
 import { Icons } from '@/app/components/icons'
+import { isFreeformPath, type EditSelectTool } from '@/app/lib/editMask'
 import { PlanOptionCycler } from '@/app/components/Modals'
 import {
   INPAINT_VARIANT_COUNT,
@@ -20,6 +22,8 @@ import {
 
 export interface EditPanelProps {
   inpaintState: InpaintState
+  editTool: EditSelectTool
+  onSelectTool: (tool: EditSelectTool) => void
   onGenerate: (editPrompt: string, referenceImages: ReferenceImage[]) => void
   /**
    * Re-run all four plan options with the given description (clears tiles),
@@ -332,6 +336,8 @@ function TileGrid({
  */
 export function EditPanel({
   inpaintState,
+  editTool,
+  onSelectTool,
   onGenerate,
   onRerunPlan,
   onRerunTile,
@@ -407,6 +413,16 @@ export function EditPanel({
       {/* ── Scrollable body ───────────────────────────────────────────────── */}
       <div ref={bodyRef} className="flex min-h-0 flex-1 flex-col overflow-y-auto">
 
+        {/* ── Tool switch (clears the area while still in input) ─────────── */}
+        <div className="flex flex-col gap-2 p-4 pb-0">
+          <EditToolPicker
+            tool={editTool}
+            onSelect={onSelectTool}
+            disabled={pastInput}
+            size="compact"
+          />
+        </div>
+
         {/* ── Section 1: Context preview ─────────────────────────────────── */}
         <div className="flex flex-col gap-3 p-4">
           <SectionLabel>Selection preview</SectionLabel>
@@ -424,7 +440,11 @@ export function EditPanel({
             className="flex flex-col gap-0.5 font-mono text-[11px] tabular-nums"
             style={{ color: 'var(--text-muted)' }}
           >
-            <span>{`Selection ${selectionW} × ${selectionH} px`}</span>
+            <span>
+              {isFreeformPath(region.selectionPath)
+                ? `Freeform ${selectionW} × ${selectionH} px`
+                : `Selection ${selectionW} × ${selectionH} px`}
+            </span>
             <span>{`Context ${contextW} × ${contextH} px`}</span>
           </div>
         </div>

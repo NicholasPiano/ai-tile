@@ -1,4 +1,15 @@
-import type { InpaintTileSpec, InpaintTilePlan } from '@/app/lib/app'
+import { EDIT_STRIP_PX, type InpaintTileSpec, type InpaintTilePlan } from '@/app/lib/app'
+import {
+  applyMaskToCanvas,
+  isFreeformPath,
+  rasterizeDilatedMask,
+  rasterizeSelectionMask,
+  scalePath,
+  tileHasMaskPixels,
+  traceClosedPath,
+  translatePath,
+  type EditPathPoint,
+} from '@/app/lib/editMask'
 import type { AspectPadLayout } from '@/app/lib/imageBuckets'
 import { planImageBucket } from '@/app/lib/imageBuckets'
 
@@ -5976,6 +5987,11 @@ export function planInpaintTiles(
   maskRect: { x: number; y: number; w: number; h: number },
   maxDimension: number = 1536,
   overlapPx: number = 384,
+  /**
+   * Closed lasso in context-local coordinates. When set, tiles whose AABB
+   * hits the selection box but miss the path are skipped.
+   */
+  selectionPath: EditPathPoint[] = [],
 ): InpaintTilePlan {
   const width = Math.max(1, Math.round(contextW))
   const height = Math.max(1, Math.round(contextH))
@@ -5983,6 +5999,9 @@ export function planInpaintTiles(
   const rowPlan = planTilingAxis(height, maxDimension, overlapPx)
 
   const tiles: InpaintTileSpec[] = []
+  const pathMask = isFreeformPath(selectionPath)
+    ? rasterizeSelectionMask(selectionPath, width, height)
+    : null
 
   for (let row = 0; row < rowPlan.count; row++) {
     for (let col = 0; col < colPlan.count; col++) {
@@ -6006,10 +6025,13 @@ export function planInpaintTiles(
       const iY2 = Math.min(Math.round(maskRect.y + maskRect.h), y + h)
 
       // Convert intersection to tile-local coordinates.
-      const maskSubRect: InpaintTileSpec['maskSubRect'] =
+      let maskSubRect: InpaintTileSpec['maskSubRect'] =
         iX2 > iX1 && iY2 > iY1
           ? { x: iX1 - x, y: iY1 - y, w: iX2 - iX1, h: iY2 - iY1 }
           : null
+      if (maskSubRect && pathMask && !tileHasMaskPixels(pathMask, { x, y, w, h })) {
+        maskSubRect = null
+      }
 
       tiles.push({
         row, col,
@@ -6215,6 +6237,7 @@ export async function buildGlobalInpaintComposite(
   contextRect: { x: number; y: number; w: number; h: number },
   planImageUrl: string,
   selectionRect: { x: number; y: number; w: number; h: number },
+  selectionPath: EditPathPoint[] = [],
 ): Promise<HTMLCanvasElement> {
   const [sourceImg, planImg] = await Promise.all([
     loadImageElement(sourceImageUrl),
@@ -6240,10 +6263,15 @@ export async function buildGlobalInpaintComposite(
   const selY = Math.round(selectionRect.y - contextRect.y)
   const selW = Math.max(1, Math.round(selectionRect.w))
   const selH = Math.max(1, Math.round(selectionRect.h))
+  const localPath = translatePath(selectionPath, -contextRect.x, -contextRect.y)
 
   cctx.save()
   cctx.beginPath()
-  cctx.rect(selX, selY, selW, selH)
+  if (isFreeformPath(localPath)) {
+    traceClosedPath(cctx, localPath)
+  } else {
+    cctx.rect(selX, selY, selW, selH)
+  }
   cctx.clip()
   cctx.imageSmoothingEnabled = true
   cctx.imageSmoothingQuality = 'high'
@@ -6479,6 +6507,7 @@ export async function buildGlobalPlanInput(
   sourceImageUrl: string,
   contextRect: { x: number; y: number; w: number; h: number },
   selectionRect: { x: number; y: number; w: number; h: number },
+  selectionPath: EditPathPoint[] = [],
 ): Promise<{ dataUrl: string; scale: number }> {
   const img = await loadImageElement(sourceImageUrl)
   const scale = Math.min(1, GLOBAL_PLAN_MAX_DIM / Math.max(contextRect.w, contextRect.h))
@@ -6499,21 +6528,31 @@ export async function buildGlobalPlanInput(
   const selY = Math.round((selectionRect.y - contextRect.y) * scale)
   const selW = Math.max(1, Math.round(selectionRect.w * scale))
   const selH = Math.max(1, Math.round(selectionRect.h * scale))
+  const scaledPath = scalePath(
+    translatePath(selectionPath, -contextRect.x, -contextRect.y),
+    scale,
+    scale,
+  )
 
   // Grey-fill the selection so the model has a clear zone to fill.
   ctx.fillStyle = EXTENSION_BLANK_COLOR
-  ctx.fillRect(selX, selY, selW, selH)
-
-  // Red border — unambiguous boundary marker; prompt says only inside may change.
-  const borderPx = Math.max(3, Math.round(Math.min(outW, outH) * 0.008))
   ctx.strokeStyle = '#FF0000'
+  const borderPx = Math.max(3, Math.round(Math.min(outW, outH) * 0.008))
   ctx.lineWidth = borderPx
-  ctx.strokeRect(
-    selX + borderPx / 2,
-    selY + borderPx / 2,
-    selW - borderPx,
-    selH - borderPx,
-  )
+  if (isFreeformPath(scaledPath)) {
+    ctx.beginPath()
+    traceClosedPath(ctx, scaledPath)
+    ctx.fill()
+    ctx.stroke()
+  } else {
+    ctx.fillRect(selX, selY, selW, selH)
+    ctx.strokeRect(
+      selX + borderPx / 2,
+      selY + borderPx / 2,
+      selW - borderPx,
+      selH - borderPx,
+    )
+  }
 
   return { dataUrl: canvas.toDataURL('image/png'), scale }
 }
@@ -6590,6 +6629,7 @@ export async function compositeInpaintFinal(
   sourceImageUrl: string,
   inpaintCanvas: HTMLCanvasElement,
   contextRect: { x: number; y: number; w: number; h: number },
+  selectionPath: EditPathPoint[] = [],
 ): Promise<string> {
   const img = await loadImageElement(sourceImageUrl)
   const canvas = document.createElement('canvas')
@@ -6615,6 +6655,31 @@ export async function compositeInpaintFinal(
     return canvas.toDataURL('image/png')
   }
   stampCtx.drawImage(inpaintCanvas, 0, 0)
+
+  const localPath = translatePath(selectionPath, -contextRect.x, -contextRect.y)
+  const dilated = isFreeformPath(localPath)
+    ? rasterizeDilatedMask(localPath, destW, destH, EDIT_STRIP_PX)
+    : null
+  if (dilated) {
+    const masked = document.createElement('canvas')
+    masked.width = destW
+    masked.height = destH
+    if (applyMaskToCanvas(masked, stamp, dilated)) {
+      const maskedCtx = masked.getContext('2d')
+      if (maskedCtx) {
+        const data = maskedCtx.getImageData(0, 0, destW, destH)
+        for (let i = 3; i < data.data.length; i += 4) {
+          if (data.data[i] > 0) {
+            data.data[i] = 255
+          }
+        }
+        maskedCtx.putImageData(data, 0, 0)
+      }
+      ctx.drawImage(masked, destX, destY)
+      return canvas.toDataURL('image/png')
+    }
+  }
+
   const opaqueStamp = stampCtx.getImageData(0, 0, destW, destH)
   forceImageDataOpaque(opaqueStamp)
   ctx.putImageData(opaqueStamp, destX, destY)
@@ -6630,6 +6695,7 @@ export async function stampPlanIntoContextCanvas(
   sourceImageUrl: string,
   contextRect: { x: number; y: number; w: number; h: number },
   planImageUrl: string,
+  selectionPath: EditPathPoint[] = [],
 ): Promise<HTMLCanvasElement> {
   const [sourceImg, planImg] = await Promise.all([
     loadImageElement(sourceImageUrl),
@@ -6659,7 +6725,25 @@ export async function stampPlanIntoContextCanvas(
   )
   ctx.imageSmoothingEnabled = true
   ctx.imageSmoothingQuality = 'high'
-  ctx.drawImage(planImg, 0, 0, destW, destH)
+
+  const localPath = translatePath(selectionPath, -contextRect.x, -contextRect.y)
+  const dilated = isFreeformPath(localPath)
+    ? rasterizeDilatedMask(localPath, destW, destH, EDIT_STRIP_PX)
+    : null
+  if (dilated) {
+    const planLayer = document.createElement('canvas')
+    planLayer.width = destW
+    planLayer.height = destH
+    const planCtx = planLayer.getContext('2d')
+    if (planCtx) {
+      planCtx.drawImage(planImg, 0, 0, destW, destH)
+      planCtx.globalCompositeOperation = 'destination-in'
+      planCtx.drawImage(dilated, 0, 0)
+      ctx.drawImage(planLayer, 0, 0)
+    }
+  } else {
+    ctx.drawImage(planImg, 0, 0, destW, destH)
+  }
 
   const opaqueStamp = ctx.getImageData(0, 0, destW, destH)
   forceImageDataOpaque(opaqueStamp)
@@ -6677,12 +6761,14 @@ export async function stampPlanIntoSource(
   sourceImageUrl: string,
   contextRect: { x: number; y: number; w: number; h: number },
   planImageUrl: string,
+  selectionPath: EditPathPoint[] = [],
 ): Promise<string> {
   const sourceImg = await loadImageElement(sourceImageUrl)
   const stampedContext = await stampPlanIntoContextCanvas(
     sourceImageUrl,
     contextRect,
     planImageUrl,
+    selectionPath,
   )
   const canvas = document.createElement('canvas')
   canvas.width = sourceImg.naturalWidth

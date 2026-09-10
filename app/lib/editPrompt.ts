@@ -20,7 +20,7 @@ export function buildGlobalPlanPrompt(editDescription: string): string {
   return [
     'You are an expert image inpainting artist.',
     '',
-    'You are given an image. Inside the image there is a RED-BORDERED rectangle.',
+    'You are given an image. Inside the image there is a RED-BORDERED region.',
     'The area inside that red border has been filled with a solid grey placeholder',
     '(#B0B0B0). Everything outside the red border is the original image context.',
     '',

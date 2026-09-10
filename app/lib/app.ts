@@ -221,6 +221,11 @@ export interface InpaintRegion {
   selectionRect: { x: number; y: number; w: number; h: number }
   /** Context perimeter bounding rect in image-pixel coordinates. */
   contextRect: { x: number; y: number; w: number; h: number }
+  /**
+   * Closed lasso in image-pixel coordinates. Empty means the selection is
+   * the rectangle in `selectionRect`.
+   */
+  selectionPath: { x: number; y: number }[]
 }
 
 /** Phases of the tiled inpaint workflow managed by EditStudio. */

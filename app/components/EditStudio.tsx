@@ -20,9 +20,20 @@ import {
   type ReferenceImage,
 } from '@/app/lib/app'
 import { EditPanel } from '@/app/components/EditPanel'
+import { EditToolPicker } from '@/app/components/EditToolPicker'
 import { Icons } from '@/app/components/icons'
 import { ReferenceGridOverlay } from '@/app/components/ReferenceGridOverlay'
 import { bakeReferenceGrid } from '@/app/lib/referenceGrid'
+import {
+  appendLassoPoint,
+  isFreeformPath,
+  MIN_LASSO_LENGTH_PX,
+  pathBounds,
+  pathLength,
+  scalePath,
+  translatePath,
+  type EditSelectTool,
+} from '@/app/lib/editMask'
 import {
   buildLowResContextCrop,
   buildGlobalPlanInput,
@@ -48,14 +59,12 @@ type ImagePoint = { x: number; y: number }
 type ImageRect = { x: number; y: number; w: number; h: number }
 
 /**
- * Active drag state. `start` and `current` are in image-pixel coordinates.
+ * Active drag. Rectangle uses opposite corners; lasso uses sampled points.
  * `committed` is true once the user releases the mouse button.
  */
-type DragState = {
-  start: ImagePoint
-  current: ImagePoint
-  committed: boolean
-}
+type DragState =
+  | { kind: 'rect'; start: ImagePoint; current: ImagePoint; committed: boolean }
+  | { kind: 'lasso'; points: ImagePoint[]; committed: boolean }
 
 /** Ignore click-without-drag so a miss does not keep a 1×1 selection. */
 const MIN_DRAW_PX = 8
@@ -339,15 +348,47 @@ function zoomViewAt(
 
 /** Normalise and clamp an in-progress or committed drag to the image bounds. */
 function selectionFromDrag(drag: DragState, imageBounds: ImageRect): ImageRect {
+  if (drag.kind === 'lasso') {
+    const bounds = pathBounds(drag.points)
+    if (!bounds) {
+      return { x: 0, y: 0, w: 0, h: 0 }
+    }
+    return clampRect(bounds, imageBounds)
+  }
   return clampRect(normaliseRect(drag.start, drag.current), imageBounds)
 }
 
-/** Snap drag corners to the clamped selection so overlay and preview stay aligned. */
-function committedDragFromSelection(
-  drag: DragState,
-  sel: ImageRect,
-): DragState {
+/** Closed lasso points, or `[]` for a rectangle marquee. */
+function pathFromDrag(drag: DragState): ImagePoint[] {
+  if (drag.kind === 'lasso') {
+    return drag.points
+  }
+  return []
+}
+
+/**
+ * True when the gesture is large enough to keep (not a click-to-deselect).
+ */
+function selectionIsKeepable(drag: DragState, imageBounds: ImageRect): boolean {
+  const sel = selectionFromDrag(drag, imageBounds)
+  if (sel.w < MIN_DRAW_PX || sel.h < MIN_DRAW_PX) {
+    return false
+  }
+  if (drag.kind === 'lasso') {
+    if (drag.points.length < 3) {
+      return false
+    }
+    if (pathLength(drag.points) < MIN_LASSO_LENGTH_PX) {
+      return false
+    }
+  }
+  return true
+}
+
+/** Snap rectangle corners to the clamped selection so overlay and preview stay aligned. */
+function committedRectFromSelection(sel: ImageRect): DragState {
   return {
+    kind: 'rect',
     start: { x: sel.x, y: sel.y },
     current: { x: sel.x + sel.w, y: sel.y + sel.h },
     committed: true,
@@ -435,6 +476,176 @@ function drawImageLabel(
 }
 
 /**
+ * Map an image-space polyline into overlay-buffer coordinates.
+ */
+function pathToBuffer(
+  points: ImagePoint[],
+  layout: ObjectContainLayout,
+  bufW: number,
+  bufH: number,
+): ImagePoint[] {
+  return points.map((p) => imageToBufferCoord(p.x, p.y, layout, bufW, bufH))
+}
+
+/**
+ * Image-pixel length expressed in overlay-buffer pixels (x-axis).
+ */
+function imagePxToBuffer(
+  px: number,
+  layout: ObjectContainLayout,
+  bufW: number,
+  bufH: number,
+): number {
+  const origin = imageToBufferCoord(0, 0, layout, bufW, bufH)
+  const along = imageToBufferCoord(px, 0, layout, bufW, bufH)
+  return Math.abs(along.x - origin.x)
+}
+
+/**
+ * Stroke (and optionally fill/close) a polyline in image space.
+ */
+function drawImagePath(
+  ctx: CanvasRenderingContext2D,
+  points: ImagePoint[],
+  layout: ObjectContainLayout,
+  bufW: number,
+  bufH: number,
+  options: {
+    strokeStyle: string
+    fillStyle?: string
+    lineWidth?: number
+    dash?: number[]
+    close?: boolean
+  },
+): void {
+  if (points.length < 2) {
+    return
+  }
+  const buf = pathToBuffer(points, layout, bufW, bufH)
+  const first = buf[0]
+  if (!first) {
+    return
+  }
+  const cssToBuf = layout.containerH > 0 ? bufH / layout.containerH : 1
+  ctx.save()
+  ctx.beginPath()
+  ctx.moveTo(first.x, first.y)
+  for (let i = 1; i < buf.length; i++) {
+    ctx.lineTo(buf[i].x, buf[i].y)
+  }
+  if (options.close) {
+    ctx.closePath()
+  }
+  if (options.fillStyle) {
+    ctx.fillStyle = options.fillStyle
+    ctx.fill()
+  }
+  ctx.strokeStyle = options.strokeStyle
+  ctx.lineWidth = (options.lineWidth ?? 1.5) * cssToBuf
+  ctx.setLineDash((options.dash ?? []).map((n) => n * cssToBuf))
+  ctx.lineJoin = 'round'
+  ctx.lineCap = 'round'
+  ctx.stroke()
+  ctx.restore()
+}
+
+/**
+ * Fill the lasso and its constant-width context ring, then outline both.
+ */
+function drawLassoOverlay(
+  ctx: CanvasRenderingContext2D,
+  points: ImagePoint[],
+  layout: ObjectContainLayout,
+  bufW: number,
+  bufH: number,
+  committed: boolean,
+): void {
+  if (points.length < 2) {
+    return
+  }
+  const cssToBuf = layout.containerH > 0 ? bufH / layout.containerH : 1
+  const bufRadius = imagePxToBuffer(EDIT_STRIP_PX, layout, bufW, bufH)
+  const buf = pathToBuffer(points, layout, bufW, bufH)
+  const first = buf[0]
+  const last = buf[buf.length - 1]
+  if (!first || !last) {
+    return
+  }
+
+  if (!committed) {
+    drawImagePath(ctx, points, layout, bufW, bufH, {
+      strokeStyle: 'rgba(255,255,255,0.95)',
+      lineWidth: 2,
+    })
+    ctx.save()
+    ctx.beginPath()
+    ctx.moveTo(last.x, last.y)
+    ctx.lineTo(first.x, first.y)
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)'
+    ctx.lineWidth = 2 * cssToBuf
+    ctx.setLineDash([6 * cssToBuf, 4 * cssToBuf])
+    ctx.stroke()
+    ctx.restore()
+    return
+  }
+
+  const traceBuf = (target: CanvasRenderingContext2D) => {
+    target.beginPath()
+    target.moveTo(first.x, first.y)
+    for (let i = 1; i < buf.length; i++) {
+      target.lineTo(buf[i].x, buf[i].y)
+    }
+    target.closePath()
+  }
+
+  ctx.save()
+  ctx.lineJoin = 'round'
+  ctx.lineCap = 'round'
+
+  // Context ring — same wash as the rectangle outset (over the photo, not white).
+  ctx.fillStyle = 'rgba(60,140,255,0.18)'
+  ctx.strokeStyle = 'rgba(60,140,255,0.18)'
+  ctx.lineWidth = bufRadius * 2
+  traceBuf(ctx)
+  ctx.fill()
+  ctx.stroke()
+
+  // Selection interior — same wash as the rectangle marquee.
+  ctx.fillStyle = 'rgba(30,100,220,0.22)'
+  traceBuf(ctx)
+  ctx.fill()
+
+  ctx.strokeStyle = 'rgba(255,255,255,1)'
+  ctx.lineWidth = 6 * cssToBuf
+  ctx.stroke()
+  ctx.restore()
+
+  // Thin white halo around the dilated context, punched so it does not
+  // sit under the blue tints.
+  const halo = document.createElement('canvas')
+  halo.width = bufW
+  halo.height = bufH
+  const haloCtx = halo.getContext('2d')
+  if (!haloCtx) {
+    return
+  }
+  haloCtx.lineJoin = 'round'
+  haloCtx.lineCap = 'round'
+  haloCtx.fillStyle = '#ffffff'
+  haloCtx.strokeStyle = '#ffffff'
+  traceBuf(haloCtx)
+  haloCtx.fill()
+  haloCtx.lineWidth = bufRadius * 2 + 6 * cssToBuf
+  haloCtx.stroke()
+  haloCtx.globalCompositeOperation = 'destination-out'
+  traceBuf(haloCtx)
+  haloCtx.fill()
+  haloCtx.lineWidth = bufRadius * 2
+  haloCtx.stroke()
+  ctx.drawImage(halo, 0, 0)
+}
+
+/**
  * True once at least one plan URL exists, or the session has left the
  * input / in-flight planning phases. Used to hide the selection box so
  * the merge seam is visible.
@@ -489,11 +700,26 @@ function renderOverlay(
     return
   }
 
-  // Live redraw replaces the committed box; otherwise prefer the region.
+  // Live redraw replaces the committed shape; otherwise prefer the region.
+  const livePath = pathFromDrag(drag)
+  const currentPath =
+    !drag.committed
+      ? livePath
+      : (inpaintState?.region.selectionPath ?? livePath)
   const currentSelect =
     !drag.committed
       ? selectionFromDrag(drag, imageBounds)
       : (inpaintState?.region.selectionRect ?? selectionFromDrag(drag, imageBounds))
+
+  if (isFreeformPath(currentPath) || (drag.kind === 'lasso' && !drag.committed)) {
+    drawLassoOverlay(ctx, currentPath, layout, bufW, bufH, drag.committed)
+    if (drag.committed && currentSelect.w >= 2 && currentSelect.h >= 2) {
+      const currentStrip = outsetRect(currentSelect, EDIT_STRIP_PX, imageBounds)
+      drawImageLabel(ctx, currentStrip, layout, bufW, bufH, 'Context')
+      drawImageLabel(ctx, currentSelect, layout, bufW, bufH, 'Selection')
+    }
+    return
+  }
 
   if (currentSelect.w < 2 || currentSelect.h < 2) {
     return
@@ -649,6 +875,7 @@ async function buildVariantFromPlan(args: {
   image: string
   contextRect: { x: number; y: number; w: number; h: number }
   selectionRect: { x: number; y: number; w: number; h: number }
+  selectionPath: { x: number; y: number }[]
   lowResContextUrl: string | null
   globalPlanUrl: string
   globalPlanScale: number
@@ -679,6 +906,7 @@ async function buildVariantFromPlan(args: {
     args.contextRect,
     args.globalPlanUrl,
     args.selectionRect,
+    args.selectionPath,
   )
 
   // Display / Accept merge: the plan crop pasted into the source. The
@@ -687,11 +915,13 @@ async function buildVariantFromPlan(args: {
     args.image,
     args.contextRect,
     args.globalPlanUrl,
+    args.selectionPath,
   )
   const stitchedPreviewUrl = await stampPlanIntoSource(
     args.image,
     args.contextRect,
     args.globalPlanUrl,
+    args.selectionPath,
   )
 
   return {
@@ -760,6 +990,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     Array.from({ length: INPAINT_VARIANT_COUNT }, () => null),
   )
 
+  const [editTool, setEditTool] = useState<EditSelectTool>('rect')
   const [drag, setDrag] = useState<DragState | null>(null)
   const dragRef = useRef<DragState | null>(null)
   dragRef.current = drag
@@ -971,15 +1202,34 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
           // Map through the crop's actual output size (handles rounding in buildLowResContextCrop).
           const scaleX = img.naturalWidth / contextRect.w
           const scaleY = img.naturalHeight / contextRect.h
-          const lrX = selInCtx.x * scaleX
-          const lrY = selInCtx.y * scaleY
-          const lrW = selInCtx.w * scaleX
-          const lrH = selInCtx.h * scaleY
+          const previewPath = scalePath(
+            translatePath(pathFromDrag(drag), -contextRect.x, -contextRect.y),
+            scaleX,
+            scaleY,
+          )
           ctx.fillStyle = 'rgba(30,100,220,0.18)'
-          ctx.fillRect(lrX, lrY, lrW, lrH)
           ctx.strokeStyle = 'rgba(255,255,255,0.9)'
           ctx.lineWidth = Math.max(1.5, Math.min(scaleX, scaleY) * 2)
-          ctx.strokeRect(lrX, lrY, lrW, lrH)
+          if (isFreeformPath(previewPath)) {
+            ctx.beginPath()
+            const first = previewPath[0]
+            if (first) {
+              ctx.moveTo(first.x, first.y)
+              for (let i = 1; i < previewPath.length; i++) {
+                ctx.lineTo(previewPath[i].x, previewPath[i].y)
+              }
+              ctx.closePath()
+              ctx.fill()
+              ctx.stroke()
+            }
+          } else {
+            const lrX = selInCtx.x * scaleX
+            const lrY = selInCtx.y * scaleY
+            const lrW = selInCtx.w * scaleX
+            const lrH = selInCtx.h * scaleY
+            ctx.fillRect(lrX, lrY, lrW, lrH)
+            ctx.strokeRect(lrX, lrY, lrW, lrH)
+          }
         }
         const previewUrl = canvas.toDataURL('image/jpeg', 0.92)
         setInpaintState((prev) =>
@@ -1018,11 +1268,14 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       isDraggingRef.current = true
       canvas.setPointerCapture(e.pointerId)
       const pt = toImageCoord(e, canvas, dimensions.width, dimensions.height)
-      const nextDrag: DragState = { start: pt, current: pt, committed: false }
+      const nextDrag: DragState =
+        editTool === 'lasso'
+          ? { kind: 'lasso', points: [pt], committed: false }
+          : { kind: 'rect', start: pt, current: pt, committed: false }
       dragRef.current = nextDrag
       setDrag(nextDrag)
     },
-    [dimensions, inpaintState],
+    [dimensions, inpaintState, editTool],
   )
 
   /**
@@ -1039,7 +1292,23 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
         return
       }
       const pt = toImageCoord(e, canvas, dimensions.width, dimensions.height)
-      setDrag((prev) => (prev ? { ...prev, current: pt } : null))
+      setDrag((prev) => {
+        if (!prev) {
+          return null
+        }
+        if (prev.kind === 'lasso') {
+          const next: DragState = {
+            kind: 'lasso',
+            points: appendLassoPoint(prev.points, pt),
+            committed: false,
+          }
+          dragRef.current = next
+          return next
+        }
+        const next: DragState = { ...prev, current: pt }
+        dragRef.current = next
+        return next
+      })
     },
     [dimensions],
   )
@@ -1068,22 +1337,26 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       if (!prev) {
         return
       }
-      const next = { ...prev, current: pt }
-      const sel = selectionFromDrag(next, imageBounds)
-      // Click (or a miss shorter than MIN_DRAW_PX): drop the area when
-      // nothing has been generated yet.
-      if (sel.w < MIN_DRAW_PX || sel.h < MIN_DRAW_PX) {
+      const next: DragState =
+        prev.kind === 'lasso'
+          ? { kind: 'lasso', points: appendLassoPoint(prev.points, pt), committed: false }
+          : { ...prev, current: pt }
+      if (!selectionIsKeepable(next, imageBounds)) {
         dragRef.current = null
         setDrag(null)
         setInpaintState(null)
         return
       }
-      // New rectangle replaces a pre-generate session so the init effect
+      // New shape replaces a pre-generate session so the init effect
       // rebuilds InpaintState for the new region.
       if (inpaintState && inpaintState.phase === 'input') {
         setInpaintState(null)
       }
-      const committed = committedDragFromSelection(next, sel)
+      const sel = selectionFromDrag(next, imageBounds)
+      const committed: DragState =
+        next.kind === 'lasso'
+          ? { kind: 'lasso', points: next.points, committed: true }
+          : committedRectFromSelection(sel)
       dragRef.current = committed
       setDrag(committed)
     },
@@ -1212,6 +1485,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     const region: InpaintRegion = {
       selectionRect: sel,
       contextRect,
+      selectionPath: pathFromDrag(drag),
     }
 
     setInpaintState({
@@ -1269,7 +1543,12 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       await compositeInpaintTileResult(working, sourceImage, resultUrl, tile, contextRect)
     }
     inpaintCanvasByVariantRef.current[variantIdx] = working
-    return compositeInpaintFinal(sourceImage, working, contextRect)
+    return compositeInpaintFinal(
+      sourceImage,
+      working,
+      contextRect,
+      inpaintStateRef.current?.region.selectionPath ?? [],
+    )
   }
 
   /**
@@ -1290,6 +1569,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
           image,
           contextRect,
           region.selectionRect,
+          region.selectionPath,
         )
 
         const isFastPath =
@@ -1300,9 +1580,14 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
           w: region.selectionRect.w,
           h: region.selectionRect.h,
         }
+        const pathInCtx = translatePath(
+          region.selectionPath,
+          -contextRect.x,
+          -contextRect.y,
+        )
         const tilePlan = isFastPath
           ? null
-          : planInpaintTiles(contextRect.w, contextRect.h, selInCtx)
+          : planInpaintTiles(contextRect.w, contextRect.h, selInCtx, 1536, 384, pathInCtx)
         const tileCount = tilePlan?.tiles.length ?? 0
 
         const planResults = await Promise.all(
@@ -1330,6 +1615,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
               image,
               contextRect,
               selectionRect: region.selectionRect,
+              selectionPath: region.selectionPath,
               lowResContextUrl,
               globalPlanUrl: plan.globalPlanUrl,
               globalPlanScale: plan.globalPlanScale,
@@ -1706,6 +1992,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
           image,
           inpaintCanvas,
           inpaintState.region.contextRect,
+          inpaintState.region.selectionPath,
         )
       }
 
@@ -1745,6 +2032,26 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     setInpaintState(null)
     setDrag(null)
   }, [])
+
+  /**
+   * Switch Rect / Lasso. Clears a pre-generate selection so the new tool
+   * starts from an empty canvas.
+   */
+  const handleSelectTool = useCallback(
+    (next: EditSelectTool) => {
+      if (editSessionLocked(inpaintState)) {
+        return
+      }
+      if (next === editTool) {
+        return
+      }
+      setEditTool(next)
+      dragRef.current = null
+      setDrag(null)
+      setInpaintState(null)
+    },
+    [editTool, inpaintState],
+  )
 
   /**
    * Download the current edit source as PNG. When the reference grid is on,
@@ -1952,6 +2259,8 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
         {inpaintState ? (
           <EditPanel
             inpaintState={inpaintState}
+            editTool={editTool}
+            onSelectTool={handleSelectTool}
             onGenerate={(prompt, refs) => { void handleGenerate(prompt, refs) }}
             onRerunPlan={(editPrompt) => { void handleRerunPlan(editPrompt) }}
             onRerunTile={(idx) => { void generateTile(idx) }}
@@ -1963,34 +2272,21 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
             onClose={handleClose}
           />
         ) : (
-          <div className="flex flex-1 flex-col items-center justify-center gap-4 px-6 text-center">
-            <div
-              style={{
-                width: 48,
-                height: 48,
-                borderRadius: '50%',
-                background: 'var(--bg-elev)',
-                border: '1px solid var(--border)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-              }}
-            >
-              <Icons.Pencil size={20} className="opacity-40" />
-            </div>
-            <div>
-              <p className="text-[13px] font-medium" style={{ color: 'var(--text-primary)' }}>
-                Make a selection
+          <div className="flex flex-1 flex-col justify-center gap-4 px-4">
+            <p className="text-[13px] font-semibold" style={{ color: 'var(--text-primary)' }}>
+              Make a selection
+            </p>
+            <EditToolPicker tool={editTool} onSelect={handleSelectTool} size="large" />
+            <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
+              {editTool === 'lasso'
+                ? 'Draw around the area; release closes with a straight line.'
+                : 'Click and drag a rectangle on the image.'}
+            </p>
+            {exportError ? (
+              <p className="text-[12px]" style={{ color: 'var(--danger)' }}>
+                {exportError}
               </p>
-              <p className="mt-1 text-[12px]" style={{ color: 'var(--text-muted)' }}>
-                Click and drag on the image to select the area you want to edit.
-              </p>
-              {exportError ? (
-                <p className="mt-2 text-[12px]" style={{ color: 'var(--danger)' }}>
-                  {exportError}
-                </p>
-              ) : null}
-            </div>
+            ) : null}
           </div>
         )}
       </div>
@@ -2044,7 +2340,9 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
         </div>
         {drag && !drag.committed && (
           <span className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
-            Release to confirm selection
+            {drag.kind === 'lasso'
+              ? 'Release to close with a straight line'
+              : 'Release to confirm selection'}
           </span>
         )}
         {inpaintState?.phase === 'input' && drag?.committed ? (

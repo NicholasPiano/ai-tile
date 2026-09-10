@@ -213,6 +213,10 @@ export const Icons = {
       <path d="M3 9h18M3 15h18M9 3v18M15 3v18" />
     </>
   ),
+  /** Freehand lasso loop. */
+  Lasso: svg(
+    <path d="M4 15c2-6 7-10 12-9 4 1 6 5 5 9-1 3-4 5-7 5-2 0-3-1-4-3l-1.5 4.5" />,
+  ),
   /** Pencil — used for the Edit / inpaint mode tab. */
   Pencil: svg(
     <>
