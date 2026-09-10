@@ -27,6 +27,7 @@ import { bakeReferenceGrid } from '@/app/lib/referenceGrid'
 import {
   appendLassoPoint,
   isFreeformPath,
+  isLassoTool,
   MIN_LASSO_LENGTH_PX,
   pathBounds,
   pathLength,
@@ -34,6 +35,7 @@ import {
   translatePath,
   type EditSelectTool,
 } from '@/app/lib/editMask'
+import { presetEditPrompt } from '@/app/lib/editPrompt'
 import {
   buildLowResContextCrop,
   buildGlobalPlanInput,
@@ -1269,7 +1271,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       canvas.setPointerCapture(e.pointerId)
       const pt = toImageCoord(e, canvas, dimensions.width, dimensions.height)
       const nextDrag: DragState =
-        editTool === 'lasso'
+        isLassoTool(editTool)
           ? { kind: 'lasso', points: [pt], committed: false }
           : { kind: 'rect', start: pt, current: pt, committed: false }
       dragRef.current = nextDrag
@@ -1491,7 +1493,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
     setInpaintState({
       phase: 'input',
       region,
-      editPrompt: '',
+      editPrompt: presetEditPrompt(editTool),
       referenceImages: [],
       lowResContextUrl: null,
       lowResPreviewUrl: null,
@@ -1502,7 +1504,7 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
       generatingTileIdx: null,
       error: null,
     })
-  }, [drag, dimensions, inpaintState])
+  }, [drag, dimensions, inpaintState, editTool])
 
   // ── Callback: user submits description — kick off the full pipeline ─────────
 
@@ -2280,7 +2282,9 @@ export function EditStudio({ image, dimensions, onPickFile, onDropFile, apiKey, 
             <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
               {editTool === 'lasso'
                 ? 'Draw around the area; release closes with a straight line.'
-                : 'Click and drag a rectangle on the image.'}
+                : editTool === 'seam'
+                  ? 'Drag a box over the seam. Generate is pre-filled to fix transitions.'
+                  : 'Click and drag a rectangle on the image.'}
             </p>
             {exportError ? (
               <p className="text-[12px]" style={{ color: 'var(--danger)' }}>

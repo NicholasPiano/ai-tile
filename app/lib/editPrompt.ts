@@ -1,9 +1,34 @@
+import type { EditSelectTool } from '@/app/lib/editMask'
+
 /**
  * Prompt builders for the Edit-tab inpainting workflow.
  *
  * Pure string-building functions — no 'use client' so they can be safely
  * imported by both API routes (server) and client components.
  */
+
+/**
+ * Pre-filled edit description for the Seam tool. Stitched / outpainted
+ * joins often show a hard line; this asks the model to hide that line
+ * without inventing new subjects.
+ */
+export const FIX_TRANSITIONS_PROMPT = [
+  'Fix visible seams and stitch transitions in this area.',
+  'Blend both sides so the join is invisible: match lighting, colour temperature,',
+  'texture, grain, and perspective.',
+  'Do not add new objects or change the scene — only clean up the transition.',
+  'Keep existing content on both sides of the seam.',
+].join(' ')
+
+/**
+ * Default textarea contents for a tool. Empty for freeform / rectangle.
+ */
+export function presetEditPrompt(tool: EditSelectTool): string {
+  if (tool === 'seam') {
+    return FIX_TRANSITIONS_PROMPT
+  }
+  return ''
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stage 1 — global low-res plan

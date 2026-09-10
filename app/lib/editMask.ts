@@ -5,7 +5,14 @@ export type EditPathPoint = { x: number; y: number }
 export type EditPathRect = { x: number; y: number; w: number; h: number }
 
 /** Which marquee the user is drawing with. */
-export type EditSelectTool = 'rect' | 'lasso'
+export type EditSelectTool = 'rect' | 'lasso' | 'seam'
+
+/**
+ * True when the tool draws a freehand lasso. Rectangle and Seam share a box.
+ */
+export function isLassoTool(tool: EditSelectTool): boolean {
+  return tool === 'lasso'
+}
 
 /** Skip lasso samples closer than this (image pixels) to the previous point. */
 export const LASSO_SAMPLE_MIN_PX = 3

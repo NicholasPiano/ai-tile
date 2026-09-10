@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react'
 import { EditToolPicker } from '@/app/components/EditToolPicker'
 import { Icons } from '@/app/components/icons'
 import { isFreeformPath, type EditSelectTool } from '@/app/lib/editMask'
+import { presetEditPrompt } from '@/app/lib/editPrompt'
 import { PlanOptionCycler } from '@/app/components/Modals'
 import {
   INPAINT_VARIANT_COUNT,
@@ -406,6 +407,10 @@ export function EditPanel({
   const selectionPreviewUrl = planReady
     ? (lowResContextUrl ?? lowResPreviewUrl)
     : lowResPreviewUrl
+  const hideDescription = editTool === 'seam'
+  const activePrompt = hideDescription
+    ? (inpaintState.editPrompt.trim() || presetEditPrompt('seam'))
+    : editPrompt
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -453,22 +458,30 @@ export function EditPanel({
 
         {/* ── Section 2: Description + refs ─────────────────────────────── */}
         <div className="flex flex-col gap-3 p-4">
-          <SectionLabel>Edit description</SectionLabel>
+          {!hideDescription ? (
+            <>
+              <SectionLabel>Edit description</SectionLabel>
 
-          {/* Editable both before the first generation and afterward — a
-              changed description takes effect the next time the plan (or a
-              tile) is (re-)generated. Disabled only while a call is in flight. */}
-          <textarea
-            className="w-full resize-none rounded-lg border bg-transparent px-3 py-2 text-[12px] outline-none transition-colors disabled:opacity-50"
-            style={{ borderColor: 'var(--border)', color: 'var(--text)', minHeight: 80 }}
-            placeholder="e.g. replace the tree with a stone tower, keep the lighting identical"
-            value={editPrompt}
-            onChange={(e) => setEditPrompt(e.target.value)}
-            onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--accent)' }}
-            onBlur={(e) => { e.currentTarget.style.borderColor = 'var(--border)' }}
-            rows={3}
-            disabled={isProcessing}
-          />
+              {/* Editable both before the first generation and afterward — a
+                  changed description takes effect the next time the plan (or a
+                  tile) is (re-)generated. Disabled only while a call is in flight. */}
+              <textarea
+                className="w-full resize-none rounded-lg border bg-transparent px-3 py-2 text-[12px] outline-none transition-colors disabled:opacity-50"
+                style={{
+                  borderColor: 'var(--border)',
+                  color: 'var(--text)',
+                  minHeight: 80,
+                }}
+                placeholder="e.g. replace the tree with a stone tower, keep the lighting identical"
+                value={editPrompt}
+                onChange={(e) => setEditPrompt(e.target.value)}
+                onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--accent)' }}
+                onBlur={(e) => { e.currentTarget.style.borderColor = 'var(--border)' }}
+                rows={3}
+                disabled={isProcessing}
+              />
+            </>
+          ) : null}
 
           {!pastInput && <ReferenceImageUploader images={referenceImages} onChange={setReferenceImages} />}
 
@@ -477,8 +490,8 @@ export function EditPanel({
           {!pastInput ? (
             <button
               className="btn btn-primary w-full"
-              disabled={!editPrompt.trim() || !lowResPreviewUrl}
-              onClick={() => onGenerate(editPrompt, referenceImages)}
+              disabled={!activePrompt.trim() || !lowResPreviewUrl}
+              onClick={() => onGenerate(activePrompt, referenceImages)}
             >
               <Icons.Play size={13} />
               Generate
@@ -486,12 +499,16 @@ export function EditPanel({
           ) : (
             <button
               className="btn btn-ghost w-full"
-              disabled={isProcessing || !editPrompt.trim()}
-              onClick={() => onRerunPlan(editPrompt)}
-              title="Re-generate all four plan options with this description (clears tiles)"
+              disabled={isProcessing || !activePrompt.trim()}
+              onClick={() => onRerunPlan(activePrompt)}
+              title={
+                hideDescription
+                  ? 'Re-generate all four plan options (clears tiles)'
+                  : 'Re-generate all four plan options with this description (clears tiles)'
+              }
             >
               <Icons.Refresh size={13} />
-              Re-run plan with this description
+              {hideDescription ? 'Re-run plan' : 'Re-run plan with this description'}
             </button>
           )}
         </div>
@@ -516,8 +533,8 @@ export function EditPanel({
                   <button
                     className="btn btn-ghost text-[11px]"
                     style={{ padding: '2px 8px', height: 24 }}
-                    onClick={() => onRerunPlan(editPrompt)}
-                    disabled={isProcessing || !editPrompt.trim()}
+                    onClick={() => onRerunPlan(activePrompt)}
+                    disabled={isProcessing || !activePrompt.trim()}
                     title="Re-generate all four plan options (clears tiles)"
                   >
                     <Icons.Refresh size={11} />

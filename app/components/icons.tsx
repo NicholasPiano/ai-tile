@@ -213,6 +213,13 @@ export const Icons = {
       <path d="M3 9h18M3 15h18M9 3v18M15 3v18" />
     </>
   ),
+  /** Frame with a jagged stitch — seam / fix-transitions tool. */
+  Seam: svg(
+    <>
+      <rect x="3" y="5" width="18" height="14" rx="2" />
+      <path d="M12 5v2.5l2 2-2 2 2 2-2 2V19" />
+    </>,
+  ),
   /** Freehand lasso loop. */
   Lasso: svg(
     <path d="M4 15c2-6 7-10 12-9 4 1 6 5 5 9-1 3-4 5-7 5-2 0-3-1-4-3l-1.5 4.5" />,
