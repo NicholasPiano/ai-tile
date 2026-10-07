@@ -333,7 +333,7 @@ function TileGrid({
  *   1. Context preview    (always visible)
  *   2. Description + refs (input phase — locks when Generate is clicked)
  *   3. Variant cycler + global plan / mask / tiles (planning → tiling → done)
- *   4. Accept / Re-run
+ *   4. Accept / Re-run (tiled edits may accept the plan without generating tiles)
  */
 export function EditPanel({
   inpaintState,
@@ -398,8 +398,9 @@ export function EditPanel({
   const allTilesDone = totalMasked > 0 && doneCount === totalMasked
   // Fast path: phase reaches 'done' with tilePlan null — plan composited directly.
   const isFastPath = phase === 'done' && tilePlan === null
-  const canAccept  = isFastPath || doneCount > 0
   const planReady  = globalPlanUrl !== null
+  // Tiled edits can accept the stamped global plan with zero tiles generated.
+  const canAccept  = planReady
   /**
    * After a plan exists, show the clean context crop so the baked-in
    * selection stroke does not hide the seam.
@@ -587,7 +588,9 @@ export function EditPanel({
                 </div>
               ) : (
                 <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
-                  {`${doneCount} of ${totalMasked} tiles generated. Run each tile below, or generate them all.`}
+                  {doneCount === 0
+                    ? `${totalMasked} tile${totalMasked !== 1 ? 's' : ''} needed for full-resolution detail. Generate them, or accept the plan as-is.`
+                    : `${doneCount} of ${totalMasked} tiles generated. Run each tile below, or generate them all.`}
                 </p>
               )}
 
@@ -599,6 +602,21 @@ export function EditPanel({
                 <Icons.Play size={13} />
                 {doneCount === 0 ? 'Generate all tiles' : 'Generate remaining tiles'}
               </button>
+
+              {doneCount === 0 && (
+                <button
+                  className="btn btn-ghost w-full"
+                  onClick={() => {
+                    console.log('[EditPanel] Accept plan as-is clicked — calling onAccept')
+                    onAccept()
+                  }}
+                  disabled={isProcessing}
+                  title="Skip tile generation — apply the global plan as the final result"
+                >
+                  <Icons.Check size={13} />
+                  Accept plan as-is
+                </button>
+              )}
 
               <TileGrid
                 tilePlan={tilePlan}
@@ -629,9 +647,11 @@ export function EditPanel({
                   <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
                     {isFastPath
                       ? 'Plan is ready — accept to apply the changes.'
-                      : allTilesDone
-                        ? `All ${doneCount} tile${doneCount !== 1 ? 's' : ''} generated.`
-                        : `${doneCount} of ${totalMasked} tiles generated — you can accept now or keep going.`}
+                      : doneCount === 0
+                        ? 'Accept the global plan as-is, or generate tiles first for more detail.'
+                        : allTilesDone
+                          ? `All ${doneCount} tile${doneCount !== 1 ? 's' : ''} generated.`
+                          : `${doneCount} of ${totalMasked} tiles generated — you can accept now or keep going.`}
                   </p>
                   <button
                     className="btn btn-primary w-full"
@@ -642,7 +662,7 @@ export function EditPanel({
                     disabled={isProcessing}
                   >
                     <Icons.Check size={14} />
-                    Accept
+                    {doneCount === 0 && !isFastPath ? 'Accept plan as-is' : 'Accept'}
                   </button>
                 </>
               )}

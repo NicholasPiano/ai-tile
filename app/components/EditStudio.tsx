@@ -824,6 +824,7 @@ export interface EditStudioProps {
  *     final result — no refine pass needed, jump straight to phase 'done'.
  *   Full path (context > MAX_AI_DIMENSION):
  *   3a.         → planInpaintTiles (phase → 'tiling', idle)
+ *   3b.         → user may Accept the stamped global plan without tiles
  *   4. Per tile (manual): cropInpaintTileInput (plain crop from the hard
  *        plan guide + earlier tiles) → /api/edit 'refine' → compositeInpaintTileResult
  *        (aligned overwrite of maskSubRect onto the hard plan stamp)
